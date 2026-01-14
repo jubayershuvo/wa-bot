@@ -1,4 +1,4 @@
-import mongoose, { Document, Schema, Types } from "mongoose";
+import mongoose, { Document, HydratedDocument, Schema, Types } from "mongoose";
 
 export interface IOrder extends Document {
   orderId: string;
@@ -153,11 +153,12 @@ OrderSchema.virtual("transaction", {
 });
 
 // Pre-save hook to generate orderId if not provided
-OrderSchema.pre("save", function (next) {
+OrderSchema.pre("save", async function (
+  this: HydratedDocument<IOrder>
+) {
   if (!this.orderId) {
     this.orderId = `ORD-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
   }
-  next();
 });
 
 // Method to update order status with timestamp
