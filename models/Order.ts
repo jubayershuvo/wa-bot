@@ -1,0 +1,194 @@
+import mongoose, { Document, Schema, Types } from "mongoose";
+
+export interface IOrder extends Document {
+  orderId: string;
+  userId: Types.ObjectId;
+  serviceId: Types.ObjectId;
+  quantity: number;
+  unitPrice: number;
+  totalPrice: number;
+  serviceData: Record<string, string>;
+  status:
+    | "pending"
+    | "processing"
+    | "completed"
+    | "failed"
+    | "refunded"
+    | "cancelled";
+  apiOrderId?: string;
+  apiResponse?: Record<string, unknown>;
+  transactionId: Types.ObjectId;
+  placedAt: Date;
+  processedAt?: Date;
+  completedAt?: Date;
+  failureReason?: string;
+  notes?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const OrderSchema = new Schema(
+  {
+    orderId: {
+      type: String,
+      required: true,
+      unique: true,
+      default: () => `ORD-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`,
+      index: true,
+    },
+    userId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+    serviceId: {
+      type: Schema.Types.ObjectId,
+      ref: "Service",
+      required: true,
+      index: true,
+    },
+    quantity: {
+      type: Number,
+      required: true,
+      min: 1,
+      default: 1,
+    },
+    unitPrice: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+    totalPrice: {
+      type: Number,
+      required: true,
+      min: 0,
+    },
+    serviceData: {
+      type: Schema.Types.Mixed,
+      default: {},
+    },
+    status: {
+      type: String,
+      enum: [
+        "pending",
+        "processing",
+        "completed",
+        "failed",
+        "refunded",
+        "cancelled",
+      ],
+      default: "pending",
+      index: true,
+    },
+    apiOrderId: {
+      type: String,
+      trim: true,
+    },
+    apiResponse: {
+      type: Schema.Types.Mixed,
+      default: {},
+    },
+    transactionId: {
+      type: Schema.Types.ObjectId,
+      ref: "Transaction",
+      required: true,
+      index: true,
+    },
+    placedAt: {
+      type: Date,
+      default: Date.now,
+    },
+    processedAt: {
+      type: Date,
+    },
+    completedAt: {
+      type: Date,
+    },
+    failureReason: {
+      type: String,
+      trim: true,
+    },
+    notes: {
+      type: String,
+      trim: true,
+    },
+  },
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
+);
+
+// Indexes for better query performance
+OrderSchema.index({ userId: 1, createdAt: -1 });
+OrderSchema.index({ serviceId: 1, status: 1 });
+OrderSchema.index({ transactionId: 1 });
+OrderSchema.index({ "serviceData._id": 1 });
+OrderSchema.index({ status: 1, placedAt: 1 });
+
+// Virtual for user details (if needed)
+OrderSchema.virtual("user", {
+  ref: "User",
+  localField: "userId",
+  foreignField: "_id",
+  justOne: true,
+});
+
+// Virtual for service details
+OrderSchema.virtual("service", {
+  ref: "Service",
+  localField: "serviceId",
+  foreignField: "_id",
+  justOne: true,
+});
+
+// Virtual for transaction details
+OrderSchema.virtual("transaction", {
+  ref: "Transaction",
+  localField: "transactionId",
+  foreignField: "_id",
+  justOne: true,
+});
+
+// Pre-save hook to generate orderId if not provided
+OrderSchema.pre("save", function (next) {
+  if (!this.orderId) {
+    this.orderId = `ORD-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
+  }
+  next();
+});
+
+// Method to update order status with timestamp
+OrderSchema.methods.updateStatus = async function (
+  newStatus: IOrder["status"],
+  notes?: string
+) {
+  this.status = newStatus;
+  const now = new Date();
+
+  switch (newStatus) {
+    case "processing":
+      this.processedAt = now;
+      break;
+    case "completed":
+      this.completedAt = now;
+      break;
+    case "failed":
+    case "cancelled":
+      if (notes) this.failureReason = notes;
+      break;
+  }
+
+  if (notes && newStatus !== "failed" && newStatus !== "cancelled") {
+    this.notes = notes;
+  }
+
+  return this.save();
+};
+
+const Order =
+  mongoose.models.Order || mongoose.model<IOrder>("Order", OrderSchema);
+
+export default Order;
