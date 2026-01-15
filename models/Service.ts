@@ -1,6 +1,7 @@
 import mongoose, { Document, Schema, Types } from "mongoose";
 
 export interface ServiceField {
+  id: string;
   name: string;
   label: string;
   type: "text" | "number" | "select" | "file";
@@ -10,6 +11,7 @@ export interface ServiceField {
 
 export interface IService extends Document {
   _id: Types.ObjectId;
+  id: string;//made by name
   name: string;
   description: string;
   price: number;
@@ -23,6 +25,12 @@ export interface IService extends Document {
 
 const ServiceFieldSchema = new Schema(
   {
+    id: {
+      type: String,
+      required: true,
+      trim: true,
+      unique: true,
+    },
     name: {
       type: String,
       required: true,

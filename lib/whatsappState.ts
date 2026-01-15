@@ -89,7 +89,7 @@ export class RedisStateManager {
     }
   }
 
-  async updateStateData(phone: string, data: Record<string, string | number | boolean | Date>): Promise<void> {
+  async updateStateData(phone: string, data: Record<string, string | number | boolean | Date | object | Array<unknown>>): Promise<void> {
     const state = await this.getUserState(phone);
     if (state) {
       state.data = { ...state.data, ...data };
