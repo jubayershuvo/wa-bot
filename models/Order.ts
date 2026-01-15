@@ -4,8 +4,6 @@ export interface IOrder extends Document {
   orderId: string;
   userId: Types.ObjectId;
   serviceId: Types.ObjectId;
-  quantity: number;
-  unitPrice: number;
   totalPrice: number;
   serviceData: Record<string, string>;
   status:
@@ -15,8 +13,6 @@ export interface IOrder extends Document {
     | "failed"
     | "refunded"
     | "cancelled";
-  apiOrderId?: string;
-  apiResponse?: Record<string, unknown>;
   transactionId: Types.ObjectId;
   placedAt: Date;
   processedAt?: Date;
@@ -48,12 +44,6 @@ const OrderSchema = new Schema(
       required: true,
       index: true,
     },
-    quantity: {
-      type: Number,
-      required: true,
-      min: 1,
-      default: 1,
-    },
     unitPrice: {
       type: Number,
       required: true,
@@ -81,19 +71,10 @@ const OrderSchema = new Schema(
       default: "pending",
       index: true,
     },
-    apiOrderId: {
-      type: String,
-      trim: true,
-    },
-    apiResponse: {
-      type: Schema.Types.Mixed,
-      default: {},
-    },
     transactionId: {
       type: Schema.Types.ObjectId,
       ref: "Transaction",
       required: true,
-      index: true,
     },
     placedAt: {
       type: Date,
