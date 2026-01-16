@@ -5,8 +5,11 @@ export interface ServiceField {
   name: string;
   label: string;
   type: "text" | "number" | "select" | "file";
+  description?: string;
   options?: string[];
   required: boolean;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export interface IService extends Document {

@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import User from "@/models/User";
 import Service, { IService, ServiceField } from "@/models/Service";
-import Order from "@/models/Order";
+import Order, { IOrder } from "@/models/Order";
 import Transaction from "@/models/Transaction";
 import stateManager from "@/lib/whatsappState";
 import { sessionMonitor } from "@/lib/sessionMonitor";
 import { connectDB } from "@/lib/mongodb-bot";
+import axios from "axios";
 
 // --- Logging Configuration ---
 const LOG_CONFIG = {
@@ -53,6 +54,10 @@ const CONFIG = {
   bkashNumber: process.env.BKASH_NUMBER || "017XXXXXXXX",
   supportNumber: process.env.SUPPORT_NUMBER || "+8801XXXXXXXXX",
   supportTelegram: process.env.SUPPORT_TELEGRAM || "t.me/signcopy",
+  ubrnApiUrl: process.env.UBRN_API_URL || "https://17.fortest.top/api/search",
+  ubrnServicePrice: 10, // 10 Taka for UBRN verification
+  fileUploadUrl: process.env.FILE_UPLOAD_URL || "/api/upload",
+  maxFileSize: 10 * 1024 * 1024, // 10MB
 };
 
 // --- TypeScript Interfaces ---
@@ -66,6 +71,15 @@ interface WhatsAppMessage {
     type: string;
     list_reply?: { id: string; title: string };
     button_reply?: { id: string; title: string };
+  };
+  image?: {
+    id: string;
+    caption?: string;
+  };
+  document?: {
+    id: string;
+    filename: string;
+    caption?: string;
   };
 }
 
@@ -91,6 +105,13 @@ interface ServiceOrderStateData {
   serviceId?: string;
   price?: number;
   serviceName?: string;
+  fieldIndex?: number;
+  collectedData?: Record<string, string | Buffer>;
+}
+
+interface UbrnStateData {
+  ubrn?: string;
+  attempt?: number;
 }
 
 interface AdminAddServiceStateData {
@@ -101,6 +122,7 @@ interface AdminAddServiceStateData {
     price?: number;
     instructions?: string;
     requiredFields?: ServiceField[];
+    isInstant?: boolean;
   };
 }
 
@@ -119,16 +141,32 @@ interface AdminDeleteServiceStateData {
   serviceName?: string;
 }
 
+interface AdminProcessOrderStateData {
+  orderId?: string;
+  order?: IOrder;
+  step?: number;
+  fileType?: string;
+  fileId?: string;
+  fileName?: string;
+}
+
+interface AdminFileDeliveryStateData {
+  orderId?: string;
+  fileType?: string;
+  fileId?: string;
+  fileName?: string;
+  caption?: string;
+}
+
 interface UserStateData {
-  // Recharge flow
   recharge?: RechargeStateData;
-  // Service order flow
   serviceOrder?: ServiceOrderStateData;
-  // Admin service management
+  ubrn?: UbrnStateData;
   adminAddService?: AdminAddServiceStateData;
   adminEditService?: AdminEditServiceStateData;
   adminDeleteService?: AdminDeleteServiceStateData;
-  // Generic fields
+  adminProcessOrder?: AdminProcessOrderStateData;
+  adminFileDelivery?: AdminFileDeliveryStateData;
   [key: string]: unknown;
 }
 
@@ -342,7 +380,7 @@ async function sendListMenu(
         text: body.substring(0, 1024),
       },
       footer: {
-        text: "Powered by BirthHelp AI",
+        text: "Powered by SignCopy",
       },
       action: {
         button: buttonText.substring(0, 20),
@@ -369,6 +407,60 @@ async function sendListMenu(
     });
     textMenu += `\nএকটি অপশন সিলেক্ট করতে সংখ্যা লিখুন (1-${rows.length})\n🚫 বাতিল করতে 'cancel' লিখুন`;
     await sendTextMessage(formattedTo, textMenu);
+    throw err;
+  }
+}
+
+async function sendImage(to: string, imageUrl: string, caption?: string) {
+  const formattedTo = formatPhoneNumber(to);
+  info(`Sending image to ${formattedTo}`, { imageUrl, caption });
+
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: formattedTo,
+    type: "image",
+    image: {
+      link: imageUrl,
+      caption: caption?.substring(0, 1024),
+    },
+  };
+
+  try {
+    const result = await callWhatsAppApi("messages", payload);
+    return result;
+  } catch (err) {
+    error(`Failed to send image to ${formattedTo}:`, err);
+    throw err;
+  }
+}
+
+async function sendDocument(
+  to: string,
+  documentUrl: string,
+  filename: string,
+  caption?: string
+) {
+  const formattedTo = formatPhoneNumber(to);
+  info(`Sending document to ${formattedTo}`, { filename, caption });
+
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: formattedTo,
+    type: "document",
+    document: {
+      link: documentUrl,
+      filename: filename.substring(0, 240),
+      caption: caption?.substring(0, 1024),
+    },
+  };
+
+  try {
+    const result = await callWhatsAppApi("messages", payload);
+    return result;
+  } catch (err) {
+    error(`Failed to send document to ${formattedTo}:`, err);
     throw err;
   }
 }
@@ -431,105 +523,113 @@ async function showMainMenu(phone: string, isAdmin: boolean) {
     await stateManager.clearUserState(formattedPhone);
 
     if (isAdmin) {
-      const adminMenuRows = [
-        {
-          id: "admin_services",
-          title: "📦 সার্ভিস ম্যানেজমেন্ট",
-          description: "সার্ভিস এডিট/এড/রিমুভ",
-        },
-        {
-          id: "admin_orders",
-          title: "📋 অর্ডার ম্যানেজমেন্ট",
-          description: "অর্ডার ভিউ ও আপডেট",
-        },
-        {
-          id: "admin_broadcast",
-          title: "📢 ব্রডকাস্ট মেসেজ",
-          description: "সকল ইউজারকে মেসেজ পাঠান",
-        },
-        {
-          id: "admin_stats",
-          title: "📊 সিস্টেম স্ট্যাটিসটিক্স",
-          description: "সিস্টেম তথ্য ও রিপোর্ট",
-        },
-        {
-          id: "admin_users",
-          title: "👥 ইউজার ম্যানেজমেন্ট",
-          description: "ইউজার তালিকা ও ম্যানেজ",
-        },
-        {
-          id: "admin_settings",
-          title: "⚙️ সিস্টেম সেটিংস",
-          description: "সিস্টেম কনফিগারেশন",
-        },
-      ];
-
-      await sendListMenu(
-        formattedPhone,
-        "⚙️ অ্যাডমিন প্যানেল",
-        "অ্যাডমিন অপশনগুলো থেকে সিলেক্ট করুন:",
-        adminMenuRows,
-        "অ্যাডমিন মেনু",
-        "অ্যাডমিন অপশন"
-      );
+      await showAdminMainMenu(formattedPhone);
     } else {
-      const userMenuRows = [
-        {
-          id: "user_recharge",
-          title: "💵 ব্যালেন্স রিচার্জ",
-          description: "ব্যালেন্স রিচার্জ করুন বিকাশের মাধ্যমে",
-        },
-        {
-          id: "user_services",
-          title: "🛒 সার্ভিস কিনুন",
-          description: "আমাদের সব সার্ভিস দেখুন ও কিনুন",
-        },
-        {
-          id: "user_orders",
-          title: "📦 আমার অর্ডারসমূহ",
-          description: "আপনার সকল অর্ডারের তালিকা",
-        },
-        {
-          id: "user_history",
-          title: "📜 ট্রান্সাকশন হিস্টরি",
-          description: "সমস্ত ট্রান্সাকশনের ইতিহাস",
-        },
-        {
-          id: "user_account",
-          title: "👤 আমার অ্যাকাউন্ট",
-          description: "আপনার অ্যাকাউন্টের তথ্য ও ডিটেইলস",
-        },
-        {
-          id: "user_support",
-          title: "🎧 সাপোর্ট / হেল্প",
-          description: "সাপোর্ট টিমের সাথে যোগাযোগ করুন",
-        },
-      ];
-
-      await sendListMenu(
-        formattedPhone,
-        "🏠 BirthHelp - Main Menu",
-        "আপনার প্রয়োজন অনুযায়ী নিচের অপশন সিলেক্ট করুন:",
-        userMenuRows,
-        "মেনু অপশনসমূহ",
-        "মেনু দেখুন"
-      );
+      await showUserMainMenu(formattedPhone);
     }
-    info(`Main menu sent successfully to ${formattedPhone}`);
   } catch (err) {
     error(`Failed to show main menu to ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       `🏠 *SignCopy Main Menu*\n\n` +
         `1. 💵 ব্যালেন্স রিচার্জ - 'রিচার্জ' লিখুন\n` +
-        `2. 🛒 সার্ভিস কিনুন - 'সার্ভিস' লিখুন\n` +
-        `3. 📦 আমার অর্ডারসমূহ - 'অর্ডার' লিখুন\n` +
-        `4. 📜 ট্রান্সাকশন হিস্টরি - 'হিস্টরি' লিখুন\n` +
-        `5. 👤 অ্যাকাউন্ট তথ্য - 'অ্যাকাউন্ট' লিখুন\n` +
-        `6. 🎧 সাপোর্ট / হেল্প - 'সাপোর্ট' লিখুন\n\n` +
+        `2. 🛒 রেগুলার সার্ভিস - 'সার্ভিস' লিখুন\n` +
+        `3. ⚡ ইন্সট্যান্ট সার্ভিস - 'ইন্সট্যান্ট' লিখুন\n` +
+        `4. 📦 আমার অর্ডারসমূহ - 'অর্ডার' লিখুন\n` +
+        `5. 📜 ট্রান্সাকশন হিস্টরি - 'হিস্টরি' লিখুন\n` +
+        `6. 👤 অ্যাকাউন্ট তথ্য - 'অ্যাকাউন্ট' লিখুন\n` +
+        `7. 🎧 সাপোর্ট / হেল্প - 'সাপোর্ট' লিখুন\n\n` +
         `অথবা 'Menu' লিখুন পুনরায় মেনু দেখার জন্য।`
     );
   }
+}
+
+async function showAdminMainMenu(phone: string) {
+  const adminMenuRows = [
+    {
+      id: "admin_services",
+      title: "📦 সার্ভিস ম্যানেজমেন্ট",
+      description: "সার্ভিস এডিট/এড/রিমুভ",
+    },
+    {
+      id: "admin_orders",
+      title: "📋 অর্ডার ম্যানেজমেন্ট",
+      description: "অর্ডার ভিউ ও প্রসেস",
+    },
+    {
+      id: "admin_deliveries",
+      title: "📤 ডেলিভারি ম্যানেজমেন্ট",
+      description: "ফাইল/টেক্সট ডেলিভারি",
+    },
+    {
+      id: "admin_broadcast",
+      title: "📢 ব্রডকাস্ট মেসেজ",
+      description: "সকল ইউজারকে মেসেজ পাঠান",
+    },
+    {
+      id: "admin_stats",
+      title: "📊 সিস্টেম স্ট্যাটিসটিক্স",
+      description: "সিস্টেম তথ্য ও রিপোর্ট",
+    },
+    {
+      id: "admin_users",
+      title: "👥 ইউজার ম্যানেজমেন্ট",
+      description: "ইউজার তালিকা ও ম্যানেজ",
+    },
+  ];
+
+  await sendListMenu(
+    phone,
+    "⚙️ অ্যাডমিন প্যানেল",
+    "অ্যাডমিন অপশনগুলো থেকে সিলেক্ট করুন:",
+    adminMenuRows,
+    "অ্যাডমিন মেনু",
+    "অ্যাডমিন অপশন"
+  );
+}
+
+async function showUserMainMenu(phone: string) {
+  const userMenuRows = [
+    {
+      id: "user_recharge",
+      title: "💵 ব্যালেন্স রিচার্জ",
+      description: "ব্যালেন্স রিচার্জ করুন বিকাশের মাধ্যমে",
+    },
+    {
+      id: "user_services",
+      title: "🛒 রেগুলার সার্ভিস",
+      description: "সাধারণ সার্ভিস দেখুন ও কিনুন",
+    },
+    {
+      id: "user_instant",
+      title: "⚡ ইন্সট্যান্ট সার্ভিস",
+      description: "তাত্ক্ষণিক সার্ভিসসমূহ",
+    },
+    {
+      id: "user_orders",
+      title: "📦 আমার অর্ডারসমূহ",
+      description: "আপনার সকল অর্ডারের তালিকা",
+    },
+    {
+      id: "user_history",
+      title: "📜 ট্রান্সাকশন হিস্টরি",
+      description: "সমস্ত ট্রান্সাকশনের ইতিহাস",
+    },
+    {
+      id: "user_account",
+      title: "👤 আমার অ্যাকাউন্ট",
+      description: "আপনার অ্যাকাউন্টের তথ্য ও ডিটেইলস",
+    },
+  ];
+
+  await sendListMenu(
+    phone,
+    "🏠 SignCopy - Main Menu",
+    "আপনার প্রয়োজন অনুযায়ী নিচের অপশন সিলেক্ট করুন:",
+    userMenuRows,
+    "মেনু অপশনসমূহ",
+    "মেনু দেখুন"
+  );
 }
 
 // --- Cancel Flow Handler ---
@@ -561,7 +661,7 @@ async function handleRechargeStart(phone: string) {
       flowType: "recharge",
     });
 
-    const message = `💳 *রিচার্জ করুন (Under Constuction don't use)*\n\n📱 আমাদের বিকাশ নম্বর (Payment): *${CONFIG.bkashNumber}*\nবিকাশে পেমেন্ট করার পর *Transaction ID* পাঠান:\n\`TRX_ID\`\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন:`;
+    const message = `💳 *রিচার্জ করুন*\n\n📱 আমাদের বিকাশ নম্বর: *${CONFIG.bkashNumber}*\n\nবিকাশে পেমেন্ট করার পর *Transaction ID* পাঠান:\n\`TRX_ID\`\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন:`;
 
     await sendTextWithCancelButton(formattedPhone, message);
     info(`Recharge instructions sent to ${formattedPhone}`);
@@ -623,29 +723,33 @@ async function handleTrxIdInput(phone: string, trxId: string) {
 
     await connectDB();
     const user = await User.findOne({ whatsapp: formattedPhone });
-    if (user) {
-      user.balance += verifiedAmount;
-      await user.save();
-
-      await Transaction.create({
-        trxId: trxId,
-        amount: verifiedAmount,
-        method: "bkash",
-        status: "SUCCESS",
-        number: formattedPhone,
-        user: user._id,
-        createdAt: new Date(),
-      });
-
-      await sendTextMessage(
-        formattedPhone,
-        `💰 *রিচার্জ সফল*\n\nনতুন ব্যালেন্স: ৳${user.balance}\n\nধন্যবাদ!`
-      );
-
-      await notifyAdmin(
-        `💰 নতুন রিচার্জ\n\nব্যবহারকারী: ${formattedPhone}\nপরিমাণ: ৳${verifiedAmount}\nটিআরএক্স: ${trxId}`
-      );
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
     }
+
+    user.balance += verifiedAmount;
+    await user.save();
+
+    await Transaction.create({
+      trxId: trxId,
+      amount: verifiedAmount,
+      method: "bkash",
+      status: "SUCCESS",
+      number: formattedPhone,
+      user: user._id,
+      createdAt: new Date(),
+    });
+
+    await sendTextMessage(
+      formattedPhone,
+      `💰 *রিচার্জ সফল*\n\nনতুন ব্যালেন্স: ৳${user.balance}\n\nধন্যবাদ!`
+    );
+
+    await notifyAdmin(
+      `💰 নতুন রিচার্জ\n\nব্যবহারকারী: ${formattedPhone}\nপরিমাণ: ৳${verifiedAmount}\nটিআরএক্স: ${trxId}`
+    );
 
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
@@ -660,19 +764,533 @@ async function handleTrxIdInput(phone: string, trxId: string) {
   }
 }
 
-// --- Services Flow ---
-async function showServices(phone: string) {
+// --- Instant Services Section ---
+async function showInstantServices(phone: string) {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing services to ${formattedPhone}`);
+  info(`Showing instant services to ${formattedPhone}`);
 
   try {
     await connectDB();
-    const services = await Service.find({ isActive: true }).limit(10);
+    const instantServices = await Service.find({ 
+      isActive: true, 
+      isInstant: true 
+    }).limit(10);
+
+    // Always include UBRN verification as an instant service
+    const serviceRows = [
+      {
+        id: "instant_ubrn_verification",
+        title: "🔍 UBRN ভেরিফিকেশন - ৳10",
+        description: "UBRN নাম্বার দিয়ে তথ্য যাচাই করুন",
+      },
+      ...instantServices.map((service) => ({
+        id: `instant_${service._id}`,
+        title: `${service.name} - ৳${service.price}`,
+        description: service.description.substring(0, 50) + "...",
+      })),
+    ];
+
+    if (serviceRows.length === 0) {
+      await sendTextMessage(
+        formattedPhone,
+        "⚡ *ইন্সট্যান্ট সার্ভিস*\n\nদুঃখিত, এখন কোন ইন্সট্যান্ট সার্ভিস উপলব্ধ নেই।\n\nরেগুলার সার্ভিস দেখতে 'সার্ভিস' লিখুন।"
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await sendListMenu(
+      formattedPhone,
+      "⚡ ইন্সট্যান্ট সার্ভিস",
+      "তাত্ক্ষণিক রেজাল্ট পাওয়ার জন্য সার্ভিস সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+      serviceRows,
+      "ইন্সট্যান্ট সার্ভিস",
+      "সার্ভিস দেখুন"
+    );
+    info(`Instant services list sent to ${formattedPhone}`, { 
+      count: serviceRows.length 
+    });
+  } catch (err) {
+    error(`Failed to show instant services to ${formattedPhone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ ইন্সট্যান্ট সার্ভিস লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+async function handleInstantServiceSelection(phone: string, serviceId: string) {
+  const formattedPhone = formatPhoneNumber(phone);
+  info(`Handling instant service selection for ${formattedPhone}`, { serviceId });
+
+  try {
+    if (serviceId === "instant_ubrn_verification") {
+      // Handle UBRN verification
+      await handleUbrnVerificationStart(phone);
+      return;
+    }
+
+    // Handle other instant services from database
+    const actualServiceId = serviceId.replace("instant_", "");
+    await connectDB();
+    const service = await Service.findById(actualServiceId);
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!service || !user) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ সার্ভিস বা ইউজার পাওয়া যায়নি!"
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "awaiting_instant_service_data",
+      flowType: "instant_service",
+      data: {
+        serviceOrder: {
+          serviceId: actualServiceId,
+          price: service.price,
+          serviceName: service.name,
+          fieldIndex: 0,
+          collectedData: {},
+        },
+      },
+    });
+
+    // Check if service has required fields
+    if (service.requiredFields && service.requiredFields.length > 0) {
+      await askForServiceField(formattedPhone, service, 0);
+    } else {
+      // No fields required, process immediately
+      await processInstantService(phone);
+    }
+  } catch (err) {
+    error(`Failed to handle instant service selection for ${formattedPhone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ সার্ভিস সিলেক্ট করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+async function handleUbrnVerificationStart(phone: string) {
+  const formattedPhone = formatPhoneNumber(phone);
+  info(`Starting UBRN verification for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < CONFIG.ubrnServicePrice) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "awaiting_ubrn_number",
+      flowType: "ubrn_verification",
+      data: {
+        ubrn: {
+          attempt: 0,
+        },
+      },
+    });
+
+    const message = `🔍 *UBRN ভেরিফিকেশন*\n\n💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n\nদয়া করে UBRN নম্বরটি পাঠান:\n(উদাহরণ: 19862692537094068)\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
+
+    await sendTextWithCancelButton(formattedPhone, message);
+    info(`UBRN verification started for ${formattedPhone}`);
+  } catch (err) {
+    error(`Failed to start UBRN verification for ${phone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ UBRN সার্ভিস শুরু করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+async function handleUbrnInput(phone: string, ubrn: string) {
+  const formattedPhone = formatPhoneNumber(phone);
+  info(`Processing UBRN for ${formattedPhone}`, { ubrn });
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const ubrnData = state?.data?.ubrn as UbrnStateData | undefined;
+    const attempt = (ubrnData?.attempt || 0) + 1;
+
+    await stateManager.updateStateData(formattedPhone, {
+      ubrn: {
+        ubrn: ubrn.trim(),
+        attempt: attempt,
+      },
+    });
+
+    await sendTextMessage(
+      formattedPhone,
+      `⏳ UBRN তথ্য যাচাই করা হচ্ছে...\n\nUBRN: ${ubrn}\nপ্রয়াস: ${attempt}`
+    );
+
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < CONFIG.ubrnServicePrice) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}`
+      );
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    // Call UBRN API
+    let ubrnDataResult;
+    try {
+      const response = await axios.get(CONFIG.ubrnApiUrl, {
+        params: { ubrn: ubrn.trim() },
+        timeout: 30000,
+      });
+      ubrnDataResult = response.data;
+    } catch (apiError) {
+      error(`UBRN API error for ${ubrn}:`, apiError);
+      await sendTextMessage(
+        formattedPhone,
+        `❌ UBRN API তে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\nইরর: ${'Unknown error'}`
+      );
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    // Deduct balance
+    user.balance -= CONFIG.ubrnServicePrice;
+    await user.save();
+
+    // Create transaction record only (NO ORDER CREATION)
+    await Transaction.create({
+      trxId: `UBRN-${Date.now()}`,
+      amount: CONFIG.ubrnServicePrice,
+      method: "balance",
+      status: "SUCCESS",
+      number: formattedPhone,
+      user: user._id,
+      metadata: {
+        ubrn: ubrn.trim(),
+        apiResponse: ubrnDataResult,
+      },
+      createdAt: new Date(),
+    });
+
+    // Format and send result - NO ORDER ID INCLUDED
+    let resultMessage = `✅ *UBRN ভেরিফিকেশন সম্পন্ন*\n\n`;
+    resultMessage += `🔢 UBRN: ${ubrn}\n`;
+    resultMessage += `💰 খরচ: ৳${CONFIG.ubrnServicePrice}\n`;
+    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n\n`;
+
+    if (ubrnDataResult && typeof ubrnDataResult === 'object') {
+      resultMessage += `📊 *রেজাল্ট:*\n`;
+      Object.entries(ubrnDataResult).forEach(([key, value]) => {
+        if (value && typeof value === 'object') {
+          resultMessage += `${key}:\n`;
+          Object.entries(value).forEach(([subKey, subValue]) => {
+            resultMessage += `  ${subKey}: ${subValue}\n`;
+          });
+        } else {
+          resultMessage += `${key}: ${value}\n`;
+        }
+      });
+    } else {
+      resultMessage += `📊 রেজাল্ট: ${JSON.stringify(ubrnDataResult, null, 2)}\n`;
+    }
+
+    resultMessage += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(formattedPhone, resultMessage);
+
+    // Notify admin
+    await notifyAdmin(
+      `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nUBRN: ${ubrn}\nমূল্য: ৳${CONFIG.ubrnServicePrice}`
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    info(`UBRN verification completed for ${formattedPhone}`, {
+      ubrn: ubrn,
+    });
+  } catch (err) {
+    error(`Failed to process UBRN for ${formattedPhone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ UBRN ভেরিফিকেশন করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+    );
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+async function askForServiceField(phone: string, service: IService, fieldIndex: number) {
+  const formattedPhone = formatPhoneNumber(phone);
+  
+  if (!service.requiredFields || fieldIndex >= service.requiredFields.length) {
+    // All fields collected, process service
+    await processInstantService(phone);
+    return;
+  }
+
+  const field = service.requiredFields[fieldIndex];
+  let message = `📝 *${field.label}*\n\n`;
+
+  if (field.required) {
+    message += `(প্রয়োজনীয়)\n`;
+  }
+
+  if (field.description) {
+    message += `${field.description}\n\n`;
+  }
+
+  if (field.options && field.options.length > 0) {
+    message += `অপশনসমূহ:\n`;
+    field.options.forEach((option, index) => {
+      message += `${index + 1}. ${option}\n`;
+    });
+    message += `\nঅপশন নম্বর লিখুন বা সরাসরি মান লিখুন:\n`;
+  } else {
+    message += `মান লিখুন:\n`;
+  }
+
+  message += `\n🚫 বাতিল করতে 'cancel' লিখুন`;
+
+  await sendTextWithCancelButton(formattedPhone, message);
+}
+
+async function handleInstantServiceFieldInput(phone: string, input: string) {
+  const formattedPhone = formatPhoneNumber(phone);
+  info(`Processing instant service field input for ${formattedPhone}`, { input });
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    if (!state || state.flowType !== "instant_service") {
+      await sendTextMessage(formattedPhone, "❌ কোন একটিভ সার্ভিস পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const serviceOrderData = state.data?.serviceOrder as ServiceOrderStateData;
+    const serviceId = serviceOrderData?.serviceId;
+    let fieldIndex = serviceOrderData?.fieldIndex || 0;
+
+    if (!serviceId) {
+      await sendTextMessage(formattedPhone, "❌ সার্ভিস তথ্য পাওয়া যায়নি!");
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await connectDB();
+    const service = await Service.findById(serviceId);
+
+    if (!service || !service.requiredFields) {
+      await sendTextMessage(formattedPhone, "❌ সার্ভিস বা ফিল্ড পাওয়া যায়নি!");
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const field = service.requiredFields[fieldIndex];
+    let fieldValue = input.trim();
+
+    // Handle option selection
+    if (field.options && field.options.length > 0) {
+      const optionIndex = parseInt(fieldValue) - 1;
+      if (optionIndex >= 0 && optionIndex < field.options.length) {
+        fieldValue = field.options[optionIndex];
+      }
+    }
+
+    // Store collected data
+    const collectedData = serviceOrderData.collectedData || {};
+    collectedData[field.name] = fieldValue;
+
+    // Update state
+    fieldIndex++;
+    await stateManager.updateStateData(formattedPhone, {
+      serviceOrder: {
+        ...serviceOrderData,
+        fieldIndex: fieldIndex,
+        collectedData: collectedData,
+      },
+    });
+
+    if (fieldIndex < service.requiredFields.length) {
+      // Ask for next field
+      await askForServiceField(phone, service, fieldIndex);
+    } else {
+      // All fields collected, process service
+      await processInstantService(phone);
+    }
+  } catch (err) {
+    error(`Failed to process instant service field input for ${formattedPhone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ ইনপুট প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+async function processInstantService(phone: string) {
+  const formattedPhone = formatPhoneNumber(phone);
+  info(`Processing instant service for ${formattedPhone}`);
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    if (!state || state.flowType !== "instant_service") {
+      await sendTextMessage(formattedPhone, "❌ কোন একটিভ সার্ভিস পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const serviceOrderData = state.data?.serviceOrder as ServiceOrderStateData;
+    const serviceId = serviceOrderData?.serviceId;
+    const price = serviceOrderData?.price;
+    const serviceName = serviceOrderData?.serviceName;
+    const collectedData = serviceOrderData?.collectedData || {};
+
+    if (!serviceId || !price) {
+      await sendTextMessage(formattedPhone, "❌ সার্ভিস তথ্য অসম্পূর্ণ!");
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await connectDB();
+    const service = await Service.findById(serviceId);
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!service || !user) {
+      await sendTextMessage(formattedPhone, "❌ সার্ভিস বা ইউজার পাওয়া যায়নি!");
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${price}\nআপনার ব্যালেন্স: ৳${user.balance}`
+      );
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    // Deduct balance
+    user.balance -= price;
+    await user.save();
+
+    // Create transaction record only (NO ORDER CREATION)
+    await Transaction.create({
+      trxId: `INST-${Date.now()}`,
+      amount: price,
+      method: "balance",
+      status: "SUCCESS",
+      number: formattedPhone,
+      user: user._id,
+      metadata: {
+        serviceId: serviceId,
+        serviceName: serviceName,
+        collectedData: collectedData,
+      },
+      createdAt: new Date(),
+    });
+
+    // Process the instant service based on service type
+    let resultMessage = `✅ *${serviceName} সম্পন্ন*\n\n`;
+    resultMessage += `💰 খরচ: ৳${price}\n`;
+    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n\n`;
+
+    // Add collected data to result
+    if (Object.keys(collectedData).length > 0) {
+      resultMessage += `📝 প্রোভাইডেড ডেটা:\n`;
+      Object.entries(collectedData).forEach(([key, value]) => {
+        resultMessage += `• ${key}: ${value}\n`;
+      });
+      resultMessage += `\n`;
+    }
+
+    // TODO: Add specific instant service processing logic here
+    // For now, just send success message
+    resultMessage += `✅ আপনার রিকোয়েস্ট প্রসেস করা হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(formattedPhone, resultMessage);
+
+    // Notify admin
+    await notifyAdmin(
+      `⚡ ইন্সট্যান্ট সার্ভিস সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nসার্ভিস: ${serviceName}\nমূল্য: ৳${price}`
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    info(`Instant service completed for ${formattedPhone}`, {
+      serviceName: serviceName,
+      price: price,
+    });
+  } catch (err) {
+    error(`Failed to process instant service for ${formattedPhone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ ইন্সট্যান্ট সার্ভিস প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+    );
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+// --- Regular Services Flow ---
+async function showRegularServices(phone: string) {
+  const formattedPhone = formatPhoneNumber(phone);
+  info(`Showing regular services to ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const services = await Service.find({ 
+      isActive: true, 
+      isInstant: { $ne: true } 
+    }).limit(10);
 
     if (services.length === 0) {
       await sendTextMessage(
         formattedPhone,
-        "📭 কোন সার্ভিস পাওয়া যায়নি। দয়া পরে চেষ্টা করুন।"
+        "📭 কোন রেগুলার সার্ভিস পাওয়া যায়নি।\n\n⚡ ইন্সট্যান্ট সার্ভিস দেখতে 'ইন্সট্যান্ট' লিখুন।"
       );
       return;
     }
@@ -685,15 +1303,15 @@ async function showServices(phone: string) {
 
     await sendListMenu(
       formattedPhone,
-      "🛍️ সার্ভিসসমূহ",
+      "🛍️ রেগুলার সার্ভিসসমূহ",
       "সার্ভিস সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
       serviceRows,
       "সার্ভিস লিস্ট",
       "সার্ভিস দেখুন"
     );
-    info(`Services list sent to ${formattedPhone}`, { count: services.length });
+    info(`Regular services list sent to ${formattedPhone}`, { count: services.length });
   } catch (err) {
-    error(`Failed to show services to ${formattedPhone}:`, err);
+    error(`Failed to show regular services to ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ সার্ভিস লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -702,9 +1320,9 @@ async function showServices(phone: string) {
   }
 }
 
-async function handleServiceSelection(phone: string, serviceId: string) {
+async function handleRegularServiceSelection(phone: string, serviceId: string) {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Handling service selection for ${formattedPhone}`, { serviceId });
+  info(`Handling regular service selection for ${formattedPhone}`, { serviceId });
 
   try {
     await connectDB();
@@ -752,7 +1370,7 @@ async function handleServiceSelection(phone: string, serviceId: string) {
     await sendTextWithCancelButton(formattedPhone, message);
     info(`Service order confirmation sent to ${formattedPhone}`);
   } catch (err) {
-    error(`Failed to handle service selection for ${formattedPhone}:`, err);
+    error(`Failed to handle regular service selection for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ সার্ভিস সিলেক্ট করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -776,9 +1394,7 @@ async function confirmServiceOrder(phone: string) {
       return;
     }
 
-    const serviceOrderData = state.data?.serviceOrder as
-      | ServiceOrderStateData
-      | undefined;
+    const serviceOrderData = state.data?.serviceOrder as ServiceOrderStateData;
 
     if (!serviceOrderData?.serviceId || !serviceOrderData.price) {
       await sendTextMessage(formattedPhone, "❌ সার্ভিস তথ্য পাওয়া যায়নি!");
@@ -821,10 +1437,12 @@ async function confirmServiceOrder(phone: string) {
       createdAt: new Date(),
     });
 
+    // CREATE ORDER FOR REGULAR SERVICE
     const order = await Order.create({
       orderId: `ORD-${Date.now()}`,
       userId: user._id,
       serviceId: service._id,
+      serviceName: service.name,
       quantity: 1,
       unitPrice: serviceOrderData.price,
       totalPrice: serviceOrderData.price,
@@ -837,7 +1455,7 @@ async function confirmServiceOrder(phone: string) {
 
     await sendTextMessage(
       formattedPhone,
-      `✅ *অর্ডার সফল*\n\n📦 অর্ডার আইডি: ${order.orderId}\n💰 খরচ: ৳${serviceOrderData.price}\n🆕 ব্যালেন্স: ৳${user.balance}\n\nআমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।`
+      `✅ *অর্ডার সফল*\n\n📦 সার্ভিস: ${service.name}\n🆔 অর্ডার আইডি: ${order.orderId}\n💰 খরচ: ৳${serviceOrderData.price}\n🆕 ব্যালেন্স: ৳${user.balance}\n\nআমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।`
     );
 
     await notifyAdmin(
@@ -876,8 +1494,7 @@ async function showOrderHistory(phone: string) {
 
     const orders = await Order.find({ userId: user._id })
       .sort({ createdAt: -1 })
-      .limit(5)
-      .populate("service");
+      .limit(5);
 
     if (orders.length === 0) {
       await sendTextMessage(formattedPhone, "📭 আপনার কোন অর্ডার নেই।");
@@ -888,7 +1505,7 @@ async function showOrderHistory(phone: string) {
     let message = "📦 *আপনার অর্ডারসমূহ:*\n\n";
 
     orders.forEach((order, index) => {
-      const serviceName = order.service?.name || "Unknown Service";
+      const serviceName = order.serviceName || "Unknown Service";
       const statusMap = {
         pending: "⏳",
         processing: "🔄",
@@ -896,14 +1513,9 @@ async function showOrderHistory(phone: string) {
         failed: "❌",
         cancelled: "🚫",
       };
-      const statusEmoji =
-        statusMap[order.status as keyof typeof statusMap] || "📝";
+      const statusEmoji = statusMap[order.status as keyof typeof statusMap] || "📝";
 
-      message += `${index + 1}. ${statusEmoji} ${serviceName}\n   🆔: ${
-        order.orderId
-      }\n   💰: ৳${order.totalPrice}\n   📅: ${new Date(
-        order.placedAt
-      ).toLocaleDateString()}\n\n`;
+      message += `${index + 1}. ${statusEmoji} ${serviceName}\n   🆔: ${order.orderId}\n   💰: ৳${order.totalPrice}\n   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
     });
 
     message += `\n📊 মোট অর্ডার: ${orders.length}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
@@ -935,15 +1547,7 @@ async function showAccountInfo(phone: string) {
       return;
     }
 
-    const message = `👤 *আপনার অ্যাকাউন্ট তথ্য*\n\n📛 নাম: ${
-      user.name
-    }\n📱 নম্বর: ${user.whatsapp}\n💰 ব্যালেন্স: ৳${
-      user.balance
-    }\n📅 যোগদান: ${new Date(
-      user.createdAt
-    ).toLocaleDateString()}\n📊 মোট মেসেজ: ${
-      user.whatsappMessageCount
-    }\n\n📞 সাপোর্ট: ${CONFIG.supportNumber}`;
+    const message = `👤 *আপনার অ্যাকাউন্ট তথ্য*\n\n📛 নাম: ${user.name}\n📱 নম্বর: ${user.whatsapp}\n💰 ব্যালেন্স: ৳${user.balance}\n📅 যোগদান: ${new Date(user.createdAt).toLocaleDateString()}\n📊 মোট মেসেজ: ${user.whatsappMessageCount}\n\n📞 সাপোর্ট: ${CONFIG.supportNumber}`;
 
     await sendTextMessage(formattedPhone, message);
     await showMainMenu(formattedPhone, false);
@@ -1005,9 +1609,7 @@ async function showTransactionHistory(phone: string) {
     transactions.forEach((trx, index) => {
       const type = trx.method === "balance" ? "🛒 সার্ভিস" : "💵 রিচার্জ";
       const sign = trx.method === "balance" ? "-" : "+";
-      message += `${index + 1}. ${type}\n   💰: ${sign}৳${trx.amount}\n   🆔: ${
-        trx.trxId
-      }\n   📅: ${new Date(trx.createdAt).toLocaleDateString()}\n\n`;
+      message += `${index + 1}. ${type}\n   💰: ${sign}৳${trx.amount}\n   🆔: ${trx.trxId}\n   📅: ${new Date(trx.createdAt).toLocaleDateString()}\n\n`;
     });
 
     await sendTextMessage(formattedPhone, message);
@@ -1025,1728 +1627,6 @@ async function showTransactionHistory(phone: string) {
   }
 }
 
-// ============================================================
-// ADMIN SERVICE MANAGEMENT - COMPLETE IMPLEMENTATION
-// ============================================================
-
-// --- Admin Service List ---
-async function showAllServices(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing all services to admin ${formattedPhone}`);
-
-  try {
-    await connectDB();
-    const services = await Service.find().limit(10).sort({ createdAt: -1 });
-
-    if (services.length === 0) {
-      await sendTextMessage(formattedPhone, "📭 কোন সার্ভিস নেই।");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const serviceRows = services.map((service, index) => ({
-      id: `admin_service_detail_${service._id}`,
-      title: `${index + 1}. ${service.name}`,
-      description: `৳${service.price} | ${service.isActive ? "✅" : "❌"} | ${
-        service.requiredFields?.length || 0
-      } ফিল্ড`,
-    }));
-
-    await sendListMenu(
-      formattedPhone,
-      "📋 সকল সার্ভিস",
-      `মোট সার্ভিস: ${services.length}\nসক্রিয়: ${
-        services.filter((s) => s.isActive).length
-      }\n\nএকটি সার্ভিস সিলেক্ট করুন:`,
-      serviceRows,
-      "সার্ভিস তালিকা",
-      "সার্ভিস দেখুন"
-    );
-  } catch (err) {
-    error(`Failed to show all services to admin ${formattedPhone}:`, err);
-    await sendTextMessage(formattedPhone, "❌ সার্ভিস লোড করতে সমস্যা হয়েছে।");
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-// --- Add New Service - Step by Step ---
-async function addNewService(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Starting add new service flow for admin ${formattedPhone}`);
-
-  try {
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_service_name",
-      flowType: "admin_add_service",
-      data: {
-        adminAddService: {
-          step: 1,
-          serviceData: {},
-        },
-      },
-    });
-
-    const message =
-      "➕ *নতুন সার্ভিস যোগ করুন*\n\nস্টেপ 1/5: সার্ভিসের নাম লিখুন\n\nউদাহরণ: Facebook Page Creation\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন";
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(
-      `Failed to start add new service flow for admin ${formattedPhone}:`,
-      err
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleServiceNameInput(phone: string, name: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing service name for admin ${formattedPhone}`, { name });
-
-  try {
-    await stateManager.updateStateData(formattedPhone, {
-      adminAddService: {
-        serviceData: { name: name.trim() },
-        step: 2,
-      },
-    });
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_service_description",
-      flowType: "admin_add_service",
-    });
-
-    const message =
-      "➕ *নতুন সার্ভিস যোগ করুন*\n\nস্টেপ 2/5: সার্ভিসের বিস্তারিত বর্ণনা লিখুন\n\nউদাহরণ: আমরা আপনার জন্য প্রফেশনাল Facebook Page তৈরি করে দেবো।\n\n🚫 বাতিল করতে 'cancel' লিখুন";
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(`Failed to process service name for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ নাম প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleServiceDescriptionInput(
-  phone: string,
-  description: string
-) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing service description for admin ${formattedPhone}`);
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) throw new Error("No state found");
-
-    const adminAddServiceData = state.data?.adminAddService as
-      | AdminAddServiceStateData
-      | undefined;
-
-    await stateManager.updateStateData(formattedPhone, {
-      adminAddService: {
-        ...adminAddServiceData,
-        serviceData: {
-          ...adminAddServiceData?.serviceData,
-          description: description.trim(),
-        },
-        step: 3,
-      },
-    });
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_service_price",
-      flowType: "admin_add_service",
-    });
-
-    const message =
-      "➕ *নতুন সার্ভিস যোগ করুন*\n\nস্টেপ 3/5: সার্ভিসের মূল্য লিখুন (টাকায়)\n\nউদাহরণ: 500\n\n🚫 বাতিল করতে 'cancel' লিখুন";
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(
-      `Failed to process service description for admin ${formattedPhone}:`,
-      err
-    );
-    await sendTextMessage(
-      formattedPhone,
-      "❌ বর্ণনা প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleServicePriceInput(phone: string, priceText: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing service price for admin ${formattedPhone}`, { priceText });
-
-  try {
-    const price = parseFloat(priceText.trim());
-    if (isNaN(price) || price <= 0) {
-      await sendTextMessage(
-        formattedPhone,
-        "❌ অবৈধ মূল্য। দয়া করে সঠিক সংখ্যা লিখুন (যেমন: 500)"
-      );
-      return;
-    }
-
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) throw new Error("No state found");
-
-    const adminAddServiceData = state.data?.adminAddService as
-      | AdminAddServiceStateData
-      | undefined;
-
-    await stateManager.updateStateData(formattedPhone, {
-      adminAddService: {
-        ...adminAddServiceData,
-        serviceData: {
-          ...adminAddServiceData?.serviceData,
-          price: price,
-        },
-        step: 4,
-      },
-    });
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_service_instructions",
-      flowType: "admin_add_service",
-    });
-
-    const message =
-      "➕ *নতুন সার্ভিস যোগ করুন*\n\nস্টেপ 4/5: সার্ভিসের নির্দেশনা লিখুন (ঐচ্ছিক)\n\nউদাহরণ: অর্ডার দেওয়ার পর আপনার Facebook login details প্রয়োজন হবে।\n\n📝 নির্দেশনা ছাড়া এগিয়ে যেতে 'skip' লিখুন\n🚫 বাতিল করতে 'cancel' লিখুন";
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(`Failed to process service price for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ মূল্য প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleServiceInstructionsInput(
-  phone: string,
-  instructions: string
-) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing service instructions for admin ${formattedPhone}`);
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) throw new Error("No state found");
-
-    const adminAddServiceData = state.data?.adminAddService as
-      | AdminAddServiceStateData
-      | undefined;
-    const serviceData = adminAddServiceData?.serviceData || {};
-
-    // Update instructions if not skipping
-    if (instructions.toLowerCase() !== "skip") {
-      serviceData.instructions = instructions.trim();
-    }
-
-    await stateManager.updateStateData(formattedPhone, {
-      adminAddService: {
-        ...adminAddServiceData,
-        serviceData: serviceData,
-        step: 5,
-      },
-    });
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_service_fields_confirmation",
-      flowType: "admin_add_service",
-    });
-
-    const message = `➕ *নতুন সার্ভিস যোগ করুন*\n\nস্টেপ 5/5: সার্ভিস ডেটা প্রস্তুত\n\n📛 নাম: ${
-      serviceData.name
-    }\n📝 বর্ণনা: ${serviceData.description?.substring(
-      0,
-      100
-    )}...\n💰 মূল্য: ৳${serviceData.price}\n📋 নির্দেশনা: ${
-      serviceData.instructions || "না"
-    }\n\n✅ সার্ভিস তৈরি করতে 'confirm' লিখুন\n🔧 ফিল্ড যোগ করতে 'add fields' লিখুন\n🚫 বাতিল করতে 'cancel' লিখুন`;
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(
-      `Failed to process service instructions for admin ${formattedPhone}:`,
-      err
-    );
-    await sendTextMessage(
-      formattedPhone,
-      "❌ নির্দেশনা প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function confirmServiceCreation(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Confirming service creation for admin ${formattedPhone}`);
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস ডেটা পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const adminAddServiceData = state.data?.adminAddService as
-      | AdminAddServiceStateData
-      | undefined;
-    const serviceData = adminAddServiceData?.serviceData;
-
-    if (!serviceData?.name || !serviceData.description || !serviceData.price) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস ডেটা অসম্পূর্ণ!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    await connectDB();
-
-    // Generate service ID from name
-    const serviceId = serviceData.name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)/g, "");
-
-    const newService = new Service({
-      id: serviceId,
-      name: serviceData.name,
-      description: serviceData.description,
-      price: serviceData.price,
-      instructions: serviceData.instructions || undefined,
-      requiredFields: serviceData.requiredFields || [],
-      isActive: true,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
-
-    await newService.save();
-
-    await sendTextMessage(
-      formattedPhone,
-      `✅ *সার্ভিস তৈরি সফল*\n\n📛 নাম: ${newService.name}\n💰 মূল্য: ৳${newService.price}\n🆔 সার্ভিস আইডি: ${newService._id}\n\nসার্ভিসটি সফলভাবে তৈরি হয়েছে এবং ইউজারদের জন্য উপলব্ধ।`
-    );
-
-    await notifyAdmin(
-      `➕ নতুন সার্ভিস তৈরি\n\nসার্ভিস: ${newService.name}\nমূল্য: ৳${newService.price}\nতৈরিকারী: ${formattedPhone}`
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, true);
-    info(`Service created successfully by admin ${formattedPhone}`, {
-      serviceId: newService._id,
-    });
-  } catch (err) {
-    error(`Failed to create service for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ সার্ভিস তৈরি করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-// --- Edit Service ---
-async function handleAdminServiceEdit(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Starting service edit flow for admin ${formattedPhone}`);
-
-  try {
-    await connectDB();
-    const services = await Service.find().limit(10).sort({ name: 1 });
-
-    if (services.length === 0) {
-      await sendTextMessage(formattedPhone, "📭 কোন সার্ভিস নেই।");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const serviceRows = services.map((service) => ({
-      id: `admin_edit_service_${service._id}`,
-      title: service.name,
-      description: `৳${service.price} | ${service.isActive ? "✅" : "❌"}`,
-    }));
-
-    await sendListMenu(
-      formattedPhone,
-      "✏️ সার্ভিস এডিট করুন",
-      "এডিট করতে চান এমন সার্ভিস সিলেক্ট করুন:",
-      serviceRows,
-      "সার্ভিস তালিকা",
-      "সার্ভিস সিলেক্ট করুন"
-    );
-  } catch (err) {
-    error(
-      `Failed to start service edit flow for admin ${formattedPhone}:`,
-      err
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleServiceSelectionForEdit(phone: string, serviceId: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Handling service selection for edit by admin ${formattedPhone}`, {
-    serviceId,
-  });
-
-  try {
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_edit_option",
-      flowType: "admin_edit_service",
-      data: {
-        adminEditService: {
-          serviceId: serviceId,
-          serviceData: service.toObject(),
-        },
-      },
-    });
-
-    const editRows = [
-      {
-        id: "edit_service_name",
-        title: "📛 নাম পরিবর্তন",
-        description: "সার্ভিসের নাম পরিবর্তন করুন",
-      },
-      {
-        id: "edit_service_description",
-        title: "📝 বর্ণনা পরিবর্তন",
-        description: "সার্ভিস বর্ণনা পরিবর্তন করুন",
-      },
-      {
-        id: "edit_service_price",
-        title: "💰 মূল্য পরিবর্তন",
-        description: "সার্ভিস মূল্য পরিবর্তন করুন",
-      },
-      {
-        id: "edit_service_instructions",
-        title: "📋 নির্দেশনা পরিবর্তন",
-        description: "সার্ভিস নির্দেশনা পরিবর্তন করুন",
-      },
-      {
-        id: "edit_service_status",
-        title: "⚡ স্ট্যাটাস পরিবর্তন",
-        description: "সক্রিয়/নিষ্ক্রিয় করুন",
-      },
-      {
-        id: "edit_service_fields",
-        title: "🔧 ফিল্ড ম্যানেজমেন্ট",
-        description: "সার্ভিস ফিল্ড যোগ/এডিট করুন",
-      },
-    ];
-
-    await sendListMenu(
-      formattedPhone,
-      `✏️ এডিট: ${service.name}`,
-      `বর্তমান তথ্য:\n💰 মূল্য: ৳${service.price}\n📊 স্ট্যাটাস: ${
-        service.isActive ? "✅ সক্রিয়" : "❌ নিষ্ক্রিয়"
-      }\n\nকি পরিবর্তন করতে চান?`,
-      editRows,
-      "এডিট অপশন",
-      "এডিট অপশন"
-    );
-  } catch (err) {
-    error(
-      `Failed to handle service selection for edit by admin ${formattedPhone}:`,
-      err
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleServiceEditOption(
-  phone: string,
-  option: string,
-  serviceId: string
-) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Handling service edit option for admin ${formattedPhone}`, {
-    option,
-    serviceId,
-  });
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) throw new Error("No state found");
-
-    await stateManager.updateStateData(formattedPhone, {
-      adminEditService: {
-        ...(state.data?.adminEditService || {}),
-        editOption: option,
-      },
-    });
-
-    let nextState = "";
-    let message = "";
-
-    switch (option) {
-      case "edit_service_name":
-        nextState = "awaiting_new_service_name";
-        message =
-          "✏️ *সার্ভিস নাম পরিবর্তন*\n\nনতুন নাম লিখুন:\n\n🚫 বাতিল করতে 'cancel' লিখুন";
-        break;
-      case "edit_service_description":
-        nextState = "awaiting_new_service_description";
-        message =
-          "✏️ *সার্ভিস বর্ণনা পরিবর্তন*\n\nনতুন বর্ণনা লিখুন:\n\n🚫 বাতিল করতে 'cancel' লিখুন";
-        break;
-      case "edit_service_price":
-        nextState = "awaiting_new_service_price";
-        message =
-          "✏️ *সার্ভিস মূল্য পরিবর্তন*\n\nনতুন মূল্য লিখুন (টাকায়):\n\n🚫 বাতিল করতে 'cancel' লিখুন";
-        break;
-      case "edit_service_instructions":
-        nextState = "awaiting_new_service_instructions";
-        message =
-          "✏️ *সার্ভিস নির্দেশনা পরিবর্তন*\n\nনতুন নির্দেশনা লিখুন:\n\n📝 নির্দেশনা মুছে ফেলতে 'remove' লিখুন\n🚫 বাতিল করতে 'cancel' লিখুন";
-        break;
-      case "edit_service_status":
-        await toggleServiceStatusNow(phone, serviceId);
-        return;
-      case "edit_service_fields":
-        await manageServiceFields(phone, serviceId);
-        return;
-      default:
-        await sendTextMessage(formattedPhone, "❌ অজানা অপশন।");
-        await showMainMenu(formattedPhone, true);
-        return;
-    }
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: nextState,
-      flowType: "admin_edit_service",
-    });
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(
-      `Failed to handle service edit option for admin ${formattedPhone}:`,
-      err
-    );
-    await sendTextMessage(formattedPhone, "❌ অপশন প্রসেস করতে সমস্যা হয়েছে।");
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function toggleServiceStatusNow(phone: string, serviceId: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Toggling service status for admin ${formattedPhone}`, { serviceId });
-
-  try {
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    service.isActive = !service.isActive;
-    await service.save();
-
-    await sendTextMessage(
-      formattedPhone,
-      `✅ *সার্ভিস স্ট্যাটাস পরিবর্তন সফল*\n\n📛 সার্ভিস: ${
-        service.name
-      }\n🔄 নতুন স্ট্যাটাস: ${
-        service.isActive ? "✅ সক্রিয়" : "❌ নিষ্ক্রিয়"
-      }\n\nসার্ভিসটি এখন ${
-        service.isActive ? "ইউজারদের জন্য উপলব্ধ" : "অপ্রাপ্য"
-      }`
-    );
-
-    await notifyAdmin(
-      `⚡ সার্ভিস স্ট্যাটাস পরিবর্তন\n\nসার্ভিস: ${
-        service.name
-      }\nনতুন স্ট্যাটাস: ${
-        service.isActive ? "সক্রিয়" : "নিষ্ক্রিয়"
-      }\nতৈরিকারী: ${formattedPhone}`
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, true);
-  } catch (err) {
-    error(`Failed to toggle service status for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ স্ট্যাটাস পরিবর্তন করতে সমস্যা হয়েছে।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function updateServiceField(
-  phone: string,
-  fieldName: string,
-  newValue: string
-) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Updating service field for admin ${formattedPhone}`, {
-    fieldName,
-    newValue,
-  });
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস তথ্য পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const adminEditServiceData = state.data?.adminEditService as
-      | AdminEditServiceStateData
-      | undefined;
-    const serviceId = adminEditServiceData?.serviceId;
-    const editOption = adminEditServiceData?.editOption;
-
-    if (!serviceId) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস আইডি পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    let updateField = "";
-    let updateValue: string | number = newValue.trim();
-
-    switch (editOption) {
-      case "edit_service_name":
-        updateField = "নাম";
-        service.name = updateValue;
-        break;
-      case "edit_service_description":
-        updateField = "বর্ণনা";
-        service.description = updateValue;
-        break;
-      case "edit_service_price":
-        const price = parseFloat(updateValue);
-        if (isNaN(price) || price <= 0) {
-          await sendTextMessage(
-            formattedPhone,
-            "❌ অবৈধ মূল্য। দয়া করে সঠিক সংখ্যা লিখুন।"
-          );
-          return;
-        }
-        updateField = "মূল্য";
-        service.price = price;
-        updateValue = `৳${price}`;
-        break;
-      case "edit_service_instructions":
-        updateField = "নির্দেশনা";
-        if (newValue.toLowerCase() === "remove") {
-          service.instructions = undefined;
-          updateValue = "মুছে ফেলা হয়েছে";
-        } else {
-          service.instructions = updateValue;
-        }
-        break;
-      default:
-        await sendTextMessage(formattedPhone, "❌ অজানা ফিল্ড।");
-        await showMainMenu(formattedPhone, true);
-        return;
-    }
-
-    service.updatedAt = new Date();
-    await service.save();
-
-    await sendTextMessage(
-      formattedPhone,
-      `✅ *সার্ভিস আপডেট সফল*\n\n📛 সার্ভিস: ${service.name}\n🔄 ${updateField}: ${updateValue}\n\nসার্ভিস তথ্য সফলভাবে আপডেট হয়েছে।`
-    );
-
-    await notifyAdmin(
-      `✏️ সার্ভিস আপডেট\n\nসার্ভিস: ${service.name}\n${updateField}: ${updateValue}\nতৈরিকারী: ${formattedPhone}`
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, true);
-  } catch (err) {
-    error(`Failed to update service field for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ সার্ভিস আপডেট করতে সমস্যা হয়েছে।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-// --- Manage Service Fields ---
-async function manageServiceFields(phone: string, serviceId: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Managing service fields for admin ${formattedPhone}`, { serviceId });
-
-  try {
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_fields_action",
-      flowType: "admin_manage_fields",
-      data: {
-        adminEditService: {
-          serviceId: serviceId,
-        },
-      },
-    });
-
-    const fieldRows = [
-      {
-        id: "add_new_field",
-        title: "➕ নতুন ফিল্ড যোগ",
-        description: "সার্ভিসে নতুন ফিল্ড যোগ করুন",
-      },
-      {
-        id: "view_fields",
-        title: "👁️ ফিল্ডসমূহ দেখুন",
-        description: "সকল ফিল্ডের তালিকা",
-      },
-      {
-        id: "edit_field",
-        title: "✏️ ফিল্ড এডিট",
-        description: "বিদ্যমান ফিল্ড এডিট করুন",
-      },
-      {
-        id: "delete_field",
-        title: "🗑️ ফিল্ড ডিলিট",
-        description: "ফিল্ড মুছে ফেলুন",
-      },
-    ];
-
-    await sendListMenu(
-      formattedPhone,
-      `🔧 ফিল্ড ম্যানেজমেন্ট: ${service.name}`,
-      `বর্তমান ফিল্ড: ${service.requiredFields?.length || 0}টি\n\nকি করতে চান?`,
-      fieldRows,
-      "ফিল্ড অপশন",
-      "অপশন সিলেক্ট"
-    );
-  } catch (err) {
-    error(`Failed to manage service fields for admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleFieldsAction(phone: string, action: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Handling fields action for admin ${formattedPhone}`, { action });
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস তথ্য পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const adminEditServiceData = state.data?.adminEditService as
-      | AdminEditServiceStateData
-      | undefined;
-    const serviceId = adminEditServiceData?.serviceId;
-
-    if (!serviceId) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস আইডি পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    await stateManager.updateStateData(formattedPhone, {
-      adminEditService: {
-        ...adminEditServiceData,
-        fieldsAction: action,
-      },
-    });
-
-    let message = "";
-
-    switch (action) {
-      case "add_new_field":
-        await stateManager.setUserState(formattedPhone, {
-          currentState: "awaiting_field_name",
-          flowType: "admin_manage_fields",
-        });
-        message =
-          "➕ *নতুন ফিল্ড যোগ করুন*\n\nস্টেপ 1/4: ফিল্ডের নাম লিখুন (ইংরেজিতে)\n\nউদাহরণ: page_name\n\n🚫 বাতিল করতে 'cancel' লিখুন";
-        break;
-      case "view_fields":
-        await viewServiceFields(formattedPhone, serviceId);
-        return;
-      case "edit_field":
-        await showFieldsForEdit(formattedPhone, serviceId);
-        return;
-      case "delete_field":
-        await showFieldsForDelete(formattedPhone, serviceId);
-        return;
-      default:
-        await sendTextMessage(formattedPhone, "❌ অজানা অপশন।");
-        await showMainMenu(formattedPhone, true);
-        return;
-    }
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(`Failed to handle fields action for admin ${formattedPhone}:`, err);
-    await sendTextMessage(formattedPhone, "❌ অপশন প্রসেস করতে সমস্যা হয়েছে।");
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function viewServiceFields(phone: string, serviceId: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Viewing service fields for admin ${formattedPhone}`, { serviceId });
-
-  try {
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const fields = service.requiredFields || [];
-
-    if (fields.length === 0) {
-      await sendTextMessage(
-        formattedPhone,
-        `📭 '${service.name}' সার্ভিসে কোন ফিল্ড নেই।`
-      );
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    let message = `📋 *ফিল্ড তালিকা: ${service.name}*\n\n`;
-
-    fields.forEach((field: ServiceField, index: number) => {
-      const typeMap = {
-        text: "📝 টেক্সট",
-        number: "🔢 নাম্বার",
-        select: "📑 সিলেক্ট",
-        file: "📁 ফাইল",
-      };
-
-      message += `${index + 1}. ${field.name}\n`;
-      message += `   লেবেল: ${field.label}\n`;
-      message += `   টাইপ: ${
-        typeMap[field.type as keyof typeof typeMap] || field.type
-      }\n`;
-      message += `   প্রয়োজনীয়: ${field.required ? "✅ হ্যাঁ" : "❌ না"}\n`;
-
-      if (field.options && field.options.length > 0) {
-        message += `   অপশন: ${field.options.slice(0, 3).join(", ")}${
-          field.options.length > 3 ? "..." : ""
-        }\n`;
-      }
-
-      message += `\n`;
-    });
-
-    message += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-    await sendTextMessage(formattedPhone, message);
-    await showMainMenu(formattedPhone, true);
-  } catch (err) {
-    error(`Failed to view service fields for admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleFieldNameInput(phone: string, fieldName: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing field name for admin ${formattedPhone}`, { fieldName });
-
-  try {
-    await stateManager.updateStateData(formattedPhone, {
-      adminEditService: {
-        newField: {
-          name: fieldName.toLowerCase().replace(/\s+/g, "_"),
-          type: "text",
-          required: true,
-        },
-      },
-    });
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_field_label",
-      flowType: "admin_manage_fields",
-    });
-
-    const message =
-      "➕ *নতুন ফিল্ড যোগ করুন*\n\nস্টেপ 2/4: ফিল্ডের লেবেল লিখুন (বাংলায়)\n\nউদাহরণ: পেজের নাম\n\n🚫 বাতিল করতে 'cancel' লিখুন";
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(`Failed to process field name for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ ফিল্ড নাম প্রসেস করতে সমস্যা হয়েছে।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleFieldLabelInput(phone: string, label: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing field label for admin ${formattedPhone}`, { label });
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) throw new Error("No state found");
-
-    const adminEditServiceData = state.data?.adminEditService as
-      | AdminEditServiceStateData
-      | undefined;
-
-    await stateManager.updateStateData(formattedPhone, {
-      adminEditService: {
-        ...adminEditServiceData,
-        newField: {
-          ...adminEditServiceData?.newField,
-          label: label.trim(),
-        },
-      },
-    });
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_field_type",
-      flowType: "admin_manage_fields",
-    });
-
-    const typeRows = [
-      {
-        id: "field_type_text",
-        title: "📝 টেক্সট",
-        description: "সাধারণ টেক্সট ইনপুট",
-      },
-      {
-        id: "field_type_number",
-        title: "🔢 নাম্বার",
-        description: "সংখ্যা ইনপুট",
-      },
-      {
-        id: "field_type_select",
-        title: "📑 সিলেক্ট",
-        description: "ড্রপডাউন অপশন",
-      },
-      { id: "field_type_file", title: "📁 ফাইল", description: "ফাইল আপলোড" },
-    ];
-
-    await sendListMenu(
-      formattedPhone,
-      "➕ *নতুন ফিল্ড যোগ করুন*",
-      "স্টেপ 3/4: ফিল্ড টাইপ সিলেক্ট করুন\n\nবর্তমান ফিল্ড:\nনাম: " +
-        (adminEditServiceData?.newField?.name || "") +
-        "\nলেবেল: " +
-        label,
-      typeRows,
-      "ফিল্ড টাইপ",
-      "টাইপ সিলেক্ট"
-    );
-  } catch (err) {
-    error(`Failed to process field label for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ ফিল্ড লেবেল প্রসেস করতে সমস্যা হয়েছে।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleFieldTypeSelection(phone: string, fieldType: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing field type for admin ${formattedPhone}`, { fieldType });
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) throw new Error("No state found");
-
-    const adminEditServiceData = state.data?.adminEditService as
-      | AdminEditServiceStateData
-      | undefined;
-
-    const typeMap: Record<string, string> = {
-      field_type_text: "text",
-      field_type_number: "number",
-      field_type_select: "select",
-      field_type_file: "file",
-    };
-
-    const actualType = typeMap[fieldType] || "text";
-
-    await stateManager.updateStateData(formattedPhone, {
-      adminEditService: {
-        ...adminEditServiceData,
-        newField: {
-          ...adminEditServiceData?.newField,
-          type: actualType,
-        },
-      },
-    });
-
-    if (actualType === "select") {
-      await stateManager.setUserState(formattedPhone, {
-        currentState: "awaiting_field_options",
-        flowType: "admin_manage_fields",
-      });
-
-      const message =
-        "➕ *নতুন ফিল্ড যোগ করুন*\n\nস্টেপ 4/4: সিলেক্ট অপশনসমূহ লিখুন\n\nফরম্যাট: অপশন1, অপশন2, অপশন3\nউদাহরণ: ছোট, মাঝারি, বড়\n\n🚫 বাতিল করতে 'cancel' লিখুন";
-
-      await sendTextWithCancelButton(formattedPhone, message);
-    } else {
-      await confirmNewField(phone);
-    }
-  } catch (err) {
-    error(`Failed to process field type for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ ফিল্ড টাইপ প্রসেস করতে সমস্যা হয়েছে।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function handleFieldOptionsInput(phone: string, optionsText: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing field options for admin ${formattedPhone}`, { optionsText });
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) throw new Error("No state found");
-
-    const adminEditServiceData = state.data?.adminEditService as
-      | AdminEditServiceStateData
-      | undefined;
-
-    const options = optionsText
-      .split(",")
-      .map((opt) => opt.trim())
-      .filter((opt) => opt.length > 0);
-
-    await stateManager.updateStateData(formattedPhone, {
-      adminEditService: {
-        ...adminEditServiceData,
-        newField: {
-          ...adminEditServiceData?.newField,
-          options: options,
-        },
-      },
-    });
-
-    await confirmNewField(phone);
-  } catch (err) {
-    error(`Failed to process field options for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ ফিল্ড অপশন প্রসেস করতে সমস্যা হয়েছে।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function confirmNewField(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Confirming new field for admin ${formattedPhone}`);
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) {
-      await sendTextMessage(formattedPhone, "❌ ফিল্ড তথ্য পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const adminEditServiceData = state.data?.adminEditService as
-      | AdminEditServiceStateData
-      | undefined;
-    const newField = adminEditServiceData?.newField;
-    const serviceId = adminEditServiceData?.serviceId;
-
-    if (!newField?.name || !newField.label || !serviceId) {
-      await sendTextMessage(formattedPhone, "❌ ফিল্ড তথ্য অসম্পূর্ণ!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const typeMap: Record<string, string> = {
-      text: "📝 টেক্সট",
-      number: "🔢 নাম্বার",
-      select: "📑 সিলেক্ট",
-      file: "📁 ফাইল",
-    };
-
-    let message = `✅ *নতুন ফিল্ড কনফার্মেশন*\n\n`;
-    message += `📛 নাম: ${newField.name}\n`;
-    message += `🏷️ লেবেল: ${newField.label}\n`;
-    message += `📋 টাইপ: ${
-      typeMap[newField.type as string] || newField.type
-    }\n`;
-    message += `⚠️ প্রয়োজনীয়: ${newField.required ? "✅ হ্যাঁ" : "❌ না"}\n`;
-
-    if (newField.options && newField.options.length > 0) {
-      message += `📑 অপশন: ${newField.options.join(", ")}\n`;
-    }
-
-    message += `\n✅ ফিল্ড যোগ করতে 'confirm' লিখুন\n🚫 বাতিল করতে 'cancel' লিখুন`;
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_field_confirmation",
-      flowType: "admin_manage_fields",
-    });
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(`Failed to confirm new field for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ ফিল্ড কনফার্মেশন দেখাতে সমস্যা হয়েছে।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function saveNewField(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Saving new field for admin ${formattedPhone}`);
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) {
-      await sendTextMessage(formattedPhone, "❌ ফিল্ড তথ্য পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const adminEditServiceData = state.data?.adminEditService as
-      | AdminEditServiceStateData
-      | undefined;
-    const newField = adminEditServiceData?.newField;
-    const serviceId = adminEditServiceData?.serviceId;
-
-    if (!newField?.name || !newField.label || !serviceId) {
-      await sendTextMessage(formattedPhone, "❌ ফিল্ড তথ্য অসম্পূর্ণ!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const fieldToAdd: ServiceField = {
-      id: `field_${Date.now()}`,
-      name: newField.name,
-      label: newField.label,
-      type: newField.type as "text" | "number" | "select" | "file",
-      required: newField.required ?? true,
-      options: newField.options,
-    };
-
-    if (!service.requiredFields) {
-      service.requiredFields = [];
-    }
-
-    service.requiredFields.push(fieldToAdd);
-    service.updatedAt = new Date();
-    await service.save();
-
-    await sendTextMessage(
-      formattedPhone,
-      `✅ *ফিল্ড যোগ সফল*\n\n📛 ফিল্ড: ${fieldToAdd.label}\n📋 টাইপ: ${fieldToAdd.type}\n📦 সার্ভিস: ${service.name}\n\nফিল্ডটি সফলভাবে যোগ করা হয়েছে।`
-    );
-
-    await notifyAdmin(
-      `🔧 নতুন ফিল্ড যোগ\n\nসার্ভিস: ${service.name}\nফিল্ড: ${fieldToAdd.label}\nতৈরিকারী: ${formattedPhone}`
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, true);
-  } catch (err) {
-    error(`Failed to save new field for admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ ফিল্ড সংরক্ষণ করতে সমস্যা হয়েছে।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function showFieldsForEdit(phone: string, serviceId: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing fields for edit for admin ${formattedPhone}`, { serviceId });
-
-  try {
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const fields = service.requiredFields || [];
-
-    if (fields.length === 0) {
-      await sendTextMessage(
-        formattedPhone,
-        `📭 '${service.name}' সার্ভিসে কোন ফিল্ড নেই।`
-      );
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const fieldRows = fields.map((field: ServiceField, index: number) => ({
-      id: `edit_field_${index}`,
-      title: field.label,
-      description: `${field.type} | ${
-        field.required ? "প্রয়োজনীয়" : "ঐচ্ছিক"
-      }`,
-    }));
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_field_selection_for_edit",
-      flowType: "admin_edit_field",
-      data: {
-        adminEditService: {
-          serviceId: serviceId,
-          fields: fields,
-        },
-      },
-    });
-
-    await sendListMenu(
-      formattedPhone,
-      `✏️ ফিল্ড এডিট: ${service.name}`,
-      `মোট ফিল্ড: ${fields.length}টি\n\nএডিট করতে চান এমন ফিল্ড সিলেক্ট করুন:`,
-      fieldRows,
-      "ফিল্ড তালিকা",
-      "ফিল্ড সিলেক্ট"
-    );
-  } catch (err) {
-    error(`Failed to show fields for edit for admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function showFieldsForDelete(phone: string, serviceId: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing fields for delete for admin ${formattedPhone}`, { serviceId });
-
-  try {
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const fields = service.requiredFields || [];
-
-    if (fields.length === 0) {
-      await sendTextMessage(
-        formattedPhone,
-        `📭 '${service.name}' সার্ভিসে কোন ফিল্ড নেই।`
-      );
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const fieldRows = fields.map((field: ServiceField, index: number) => ({
-      id: `delete_field_${index}`,
-      title: field.label,
-      description: `${field.type} | ${
-        field.required ? "প্রয়োজনীয়" : "ঐচ্ছিক"
-      }`,
-    }));
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_field_selection_for_delete",
-      flowType: "admin_delete_field",
-      data: {
-        adminEditService: {
-          serviceId: serviceId,
-          fields: fields,
-        },
-      },
-    });
-
-    await sendListMenu(
-      formattedPhone,
-      `🗑️ ফিল্ড ডিলিট: ${service.name}`,
-      `মোট ফিল্ড: ${fields.length}টি\n\nমুছতে চান এমন ফিল্ড সিলেক্ট করুন:`,
-      fieldRows,
-      "ফিল্ড তালিকা",
-      "ফিল্ড সিলেক্ট"
-    );
-  } catch (err) {
-    error(`Failed to show fields for delete for admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function deleteField(phone: string, fieldIndex: number) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Deleting field for admin ${formattedPhone}`, { fieldIndex });
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) {
-      await sendTextMessage(formattedPhone, "❌ ফিল্ড তথ্য পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const adminEditServiceData = state.data?.adminEditService as
-      | AdminEditServiceStateData
-      | undefined;
-    const fields = adminEditServiceData?.fields;
-    const serviceId = adminEditServiceData?.serviceId;
-
-    if (!fields || !serviceId) {
-      await sendTextMessage(formattedPhone, "❌ ফিল্ড তথ্য অসম্পূর্ণ!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    if (fieldIndex < 0 || fieldIndex >= fields.length) {
-      await sendTextMessage(formattedPhone, "❌ অবৈধ ফিল্ড সিলেকশন!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const fieldToDelete = fields[fieldIndex];
-
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    if (!service.requiredFields) {
-      service.requiredFields = [];
-    }
-
-    service.requiredFields = service.requiredFields.filter(
-      (_: unknown, index: number) => index !== fieldIndex
-    );
-    service.updatedAt = new Date();
-    await service.save();
-
-    await sendTextMessage(
-      formattedPhone,
-      `✅ *ফিল্ড ডিলিট সফল*\n\n🗑️ ফিল্ড: ${fieldToDelete.label}\n📦 সার্ভিস: ${service.name}\n\nফিল্ডটি সফলভাবে মুছে ফেলা হয়েছে।`
-    );
-
-    await notifyAdmin(
-      `🗑️ ফিল্ড ডিলিট\n\nসার্ভিস: ${service.name}\nফিল্ড: ${fieldToDelete.label}\nতৈরিকারী: ${formattedPhone}`
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, true);
-  } catch (err) {
-    error(`Failed to delete field for admin ${formattedPhone}:`, err);
-    await sendTextMessage(formattedPhone, "❌ ফিল্ড মুছতে সমস্যা হয়েছে।");
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-// --- Toggle Service Status ---
-async function toggleServiceStatus(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Starting toggle service status flow for admin ${formattedPhone}`);
-
-  try {
-    await connectDB();
-    const services = await Service.find().limit(10).sort({ name: 1 });
-
-    if (services.length === 0) {
-      await sendTextMessage(formattedPhone, "📭 কোন সার্ভিস নেই।");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const serviceRows = services.map((service) => ({
-      id: `toggle_service_${service._id}`,
-      title: service.name,
-      description: `৳${service.price} | ${
-        service.isActive ? "✅ সক্রিয়" : "❌ নিষ্ক্রিয়"
-      }`,
-    }));
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_service_selection_for_toggle",
-      flowType: "admin_toggle_service",
-    });
-
-    await sendListMenu(
-      formattedPhone,
-      "⚡ সার্ভিস স্ট্যাটাস পরিবর্তন",
-      "স্ট্যাটাস পরিবর্তন করতে চান এমন সার্ভিস সিলেক্ট করুন:",
-      serviceRows,
-      "সার্ভিস তালিকা",
-      "সার্ভিস সিলেক্ট"
-    );
-  } catch (err) {
-    error(
-      `Failed to start toggle service status flow for admin ${formattedPhone}:`,
-      err
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-// --- Delete Service ---
-async function deleteService(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Starting delete service flow for admin ${formattedPhone}`);
-
-  try {
-    await connectDB();
-    const services = await Service.find().limit(10).sort({ name: 1 });
-
-    if (services.length === 0) {
-      await sendTextMessage(formattedPhone, "📭 কোন সার্ভিস নেই।");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const serviceRows = services.map((service) => ({
-      id: `delete_service_${service._id}`,
-      title: service.name,
-      description: `৳${service.price} | ${service.isActive ? "✅" : "❌"} | ${
-        service.requiredFields?.length || 0
-      } ফিল্ড`,
-    }));
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_service_selection_for_delete",
-      flowType: "admin_delete_service",
-      data: {
-        adminDeleteService: {},
-      },
-    });
-
-    await sendListMenu(
-      formattedPhone,
-      "🗑️ সার্ভিস ডিলিট করুন",
-      "⚠️ সতর্কতা: সার্ভিস ডিলিট করলে সমস্ত সংশ্লিষ্ট ডেটা মুছে যাবে!\n\nডিলিট করতে চান এমন সার্ভিস সিলেক্ট করুন:",
-      serviceRows,
-      "সার্ভিস তালিকা",
-      "সার্ভিস সিলেক্ট"
-    );
-  } catch (err) {
-    error(
-      `Failed to start delete service flow for admin ${formattedPhone}:`,
-      err
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function confirmDeleteService(phone: string, serviceId: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Confirming delete service for admin ${formattedPhone}`, { serviceId });
-
-  try {
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_delete_confirmation",
-      flowType: "admin_delete_service",
-      data: {
-        adminDeleteService: {
-          serviceId: serviceId,
-          serviceName: service.name,
-        },
-      },
-    });
-
-    const message = `🗑️ *সার্ভিস ডিলিট কনফার্মেশন*\n\n⚠️ সতর্কতা: আপনি নিচের সার্ভিসটি মুছতে যাচ্ছেন:\n\n📛 নাম: ${
-      service.name
-    }\n💰 মূল্য: ৳${service.price}\n📊 স্ট্যাটাস: ${
-      service.isActive ? "✅ সক্রিয়" : "❌ নিষ্ক্রিয়"
-    }\n🔧 ফিল্ড: ${
-      service.requiredFields?.length || 0
-    }টি\n\n❌ এই সার্ভিস মুছে ফেললে:\n• সকল অর্ডার থেকে সার্ভিস তথ্য হারিয়ে যাবে\n• রিপোর্টে অসঙ্গতি দেখা দিতে পারে\n• এই একশনটি পূর্বাবস্থায় ফেরানো যাবে না\n\n✅ ডিলিট করতে 'confirm delete' লিখুন\n🚫 বাতিল করতে 'cancel' লিখুন`;
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(`Failed to confirm delete service for admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function executeDeleteService(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Executing delete service for admin ${formattedPhone}`);
-
-  try {
-    const state = await stateManager.getUserState(formattedPhone);
-    if (!state) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস তথ্য পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const adminDeleteServiceData = state.data?.adminDeleteService as
-      | AdminDeleteServiceStateData
-      | undefined;
-    const serviceId = adminDeleteServiceData?.serviceId;
-
-    if (!serviceId) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস আইডি পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const serviceName = service.name;
-
-    await Service.findByIdAndDelete(serviceId);
-
-    await sendTextMessage(
-      formattedPhone,
-      `✅ *সার্ভিস ডিলিট সফল*\n\n🗑️ সার্ভিস: ${serviceName}\n\nসার্ভিসটি সফলভাবে মুছে ফেলা হয়েছে।`
-    );
-
-    await notifyAdmin(
-      `🗑️ সার্ভিস ডিলিট\n\nসার্ভিস: ${serviceName}\nতৈরিকারী: ${formattedPhone}`
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, true);
-  } catch (err) {
-    error(`Failed to execute delete service for admin ${formattedPhone}:`, err);
-    await sendTextMessage(formattedPhone, "❌ সার্ভিস মুছতে সমস্যা হয়েছে।");
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-// --- Admin Orders Management ---
-async function handleAdminOrders(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing admin orders menu to ${formattedPhone}`);
-
-  try {
-    await connectDB();
-    const pendingOrders = await Order.countDocuments({ status: "pending" });
-    const totalOrders = await Order.countDocuments();
-
-    const orderMenuRows = [
-      {
-        id: "admin_order_pending",
-        title: "⏳ পেন্ডিং অর্ডার",
-        description: `অপেক্ষমান: ${pendingOrders}`,
-      },
-      {
-        id: "admin_order_processing",
-        title: "🔄 প্রসেসিং অর্ডার",
-        description: "চলমান অর্ডারসমূহ",
-      },
-      {
-        id: "admin_order_completed",
-        title: "✅ কমপ্লিটেড অর্ডার",
-        description: "সম্পন্ন অর্ডারসমূহ",
-      },
-      {
-        id: "admin_order_all",
-        title: "📊 সকল অর্ডার",
-        description: `মোট অর্ডার: ${totalOrders}`,
-      },
-      {
-        id: "admin_order_update",
-        title: "🔄 অর্ডার স্ট্যাটাস",
-        description: "অর্ডার স্ট্যাটাস পরিবর্তন",
-      },
-      {
-        id: "admin_order_search",
-        title: "🔍 অর্ডার সার্চ",
-        description: "অর্ডার আইডি বা ইউজার অনুসন্ধান",
-      },
-    ];
-
-    await sendListMenu(
-      formattedPhone,
-      "📋 অর্ডার ম্যানেজমেন্ট",
-      `অপেক্ষমান অর্ডার: ${pendingOrders}\nমোট অর্ডার: ${totalOrders}\n\n🚫 বাতিল করতে 'cancel' লিখুন`,
-      orderMenuRows,
-      "অর্ডার অপশন",
-      "অর্ডার অপশন"
-    );
-  } catch (err) {
-    error(`Failed to show admin orders menu to ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function showPendingOrders(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing pending orders to admin ${formattedPhone}`);
-
-  try {
-    await connectDB();
-    const orders = await Order.find({ status: "pending" })
-      .populate("user")
-      .populate("service")
-      .limit(5);
-
-    if (orders.length === 0) {
-      await sendTextMessage(formattedPhone, "✅ কোন পেন্ডিং অর্ডার নেই!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    let message = "⏳ *পেন্ডিং অর্ডারসমূহ:*\n\n";
-
-    orders.forEach((order, index) => {
-      message += `${index + 1}. 🆔: ${order.orderId}\n   👤: ${
-        order.user?.whatsapp || "N/A"
-      }\n   📦: ${order.service?.name || "N/A"}\n   💰: ৳${
-        order.totalPrice
-      }\n\n`;
-    });
-
-    message += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-    await sendTextMessage(formattedPhone, message);
-  } catch (err) {
-    error(`Failed to show pending orders to admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-// --- Broadcast ---
-async function handleBroadcast(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Starting broadcast flow for admin ${formattedPhone}`);
-
-  try {
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_broadcast_message",
-      flowType: "admin_broadcast",
-    });
-
-    const message =
-      "📢 *ব্রডকাস্ট মেসেজ*\n\nসকল ইউজারকে পাঠাতে চান এমন মেসেজ টাইপ করুন:\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন";
-
-    await sendTextWithCancelButton(formattedPhone, message);
-  } catch (err) {
-    error(`Failed to start broadcast flow for admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function sendBroadcast(phone: string, message: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Sending broadcast from admin ${formattedPhone}`, {
-    messageLength: message.length,
-  });
-
-  try {
-    await connectDB();
-    const users = await User.find({}).select("whatsapp");
-    const totalUsers = users.length;
-
-    await sendTextMessage(
-      formattedPhone,
-      `📢 ব্রডকাস্ট শুরু হচ্ছে...\n\nইউজার: ${totalUsers} জন`
-    );
-
-    let success = 0;
-    let failed = 0;
-
-    const BATCH_SIZE = 5;
-    for (let i = 0; i < users.length; i += BATCH_SIZE) {
-      const batch = users.slice(i, i + BATCH_SIZE);
-      const promises = batch.map((user) =>
-        sendTextMessage(user.whatsapp, `📢 *ব্রডকাস্ট মেসেজ*\n\n${message}`)
-          .then(() => success++)
-          .catch(() => failed++)
-      );
-
-      await Promise.all(promises);
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
-
-    await sendTextMessage(
-      formattedPhone,
-      `✅ ব্রডকাস্ট সম্পন্ন\n\nসফল: ${success}\nব্যর্থ: ${failed}`
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, true);
-    info(`Broadcast completed from admin ${formattedPhone}`, {
-      success,
-      failed,
-    });
-  } catch (err) {
-    error(`Failed to send broadcast from admin ${formattedPhone}:`, err);
-    await sendTextMessage(formattedPhone, "❌ ব্রডকাস্ট পাঠাতে সমস্যা হয়েছে।");
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
 // --- Message Handler ---
 async function handleUserMessage(
   phone: string,
@@ -2754,8 +1634,7 @@ async function handleUserMessage(
   isAdmin: boolean
 ) {
   const formattedPhone = formatPhoneNumber(phone);
-  const requestId =
-    Date.now().toString(36) + Math.random().toString(36).substr(2);
+  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
 
   info(`[${requestId}] Handling message from ${formattedPhone}`, {
     type: message.type,
@@ -2788,119 +1667,21 @@ async function handleUserMessage(
       }
 
       // ========================================
-      // ADMIN SERVICE MANAGEMENT STATE HANDLERS
+      // INSTANT SERVICES STATE HANDLERS
       // ========================================
 
-      // Add Service Flow
-      if (currentState === "awaiting_service_name") {
-        await handleServiceNameInput(formattedPhone, message.text?.body || "");
+      if (currentState === "awaiting_ubrn_number") {
+        await handleUbrnInput(formattedPhone, userText);
         return;
       }
 
-      if (currentState === "awaiting_service_description") {
-        await handleServiceDescriptionInput(
-          formattedPhone,
-          message.text?.body || ""
-        );
-        return;
-      }
-
-      if (currentState === "awaiting_service_price") {
-        await handleServicePriceInput(formattedPhone, message.text?.body || "");
-        return;
-      }
-
-      if (currentState === "awaiting_service_instructions") {
-        await handleServiceInstructionsInput(
-          formattedPhone,
-          message.text?.body || ""
-        );
-        return;
-      }
-
-      if (currentState === "awaiting_service_fields_confirmation") {
-        if (userText === "confirm") {
-          await confirmServiceCreation(formattedPhone);
-          return;
-        } else if (userText === "add fields" || userText === "add field") {
-          // Skip fields for now, can be implemented later
-          await confirmServiceCreation(formattedPhone);
-          return;
-        }
-      }
-
-      // Edit Service Flow
-      if (currentState === "awaiting_new_service_name") {
-        await updateServiceField(
-          formattedPhone,
-          "name",
-          message.text?.body || ""
-        );
-        return;
-      }
-
-      if (currentState === "awaiting_new_service_description") {
-        await updateServiceField(
-          formattedPhone,
-          "description",
-          message.text?.body || ""
-        );
-        return;
-      }
-
-      if (currentState === "awaiting_new_service_price") {
-        await updateServiceField(
-          formattedPhone,
-          "price",
-          message.text?.body || ""
-        );
-        return;
-      }
-
-      if (currentState === "awaiting_new_service_instructions") {
-        await updateServiceField(
-          formattedPhone,
-          "instructions",
-          message.text?.body || ""
-        );
-        return;
-      }
-
-      // Field Management Flow
-      if (currentState === "awaiting_field_name") {
-        await handleFieldNameInput(formattedPhone, message.text?.body || "");
-        return;
-      }
-
-      if (currentState === "awaiting_field_label") {
-        await handleFieldLabelInput(formattedPhone, message.text?.body || "");
-        return;
-      }
-
-      if (currentState === "awaiting_field_options") {
-        await handleFieldOptionsInput(formattedPhone, message.text?.body || "");
-        return;
-      }
-
-      if (
-        currentState === "awaiting_field_confirmation" &&
-        userText === "confirm"
-      ) {
-        await saveNewField(formattedPhone);
-        return;
-      }
-
-      // Delete Service Flow
-      if (
-        currentState === "awaiting_delete_confirmation" &&
-        userText === "confirm delete"
-      ) {
-        await executeDeleteService(formattedPhone);
+      if (currentState === "awaiting_instant_service_data") {
+        await handleInstantServiceFieldInput(formattedPhone, userText);
         return;
       }
 
       // ========================================
-      // EXISTING STATE HANDLERS
+      // REGULAR SERVICES STATE HANDLERS
       // ========================================
 
       if (currentState === "awaiting_trx_id") {
@@ -2921,11 +1702,6 @@ async function handleUserMessage(
         userText === "confirm"
       ) {
         await confirmServiceOrder(formattedPhone);
-        return;
-      }
-
-      if (currentState === "awaiting_broadcast_message") {
-        await sendBroadcast(formattedPhone, message.text?.body || "");
         return;
       }
 
@@ -2961,7 +1737,16 @@ async function handleUserMessage(
           userText === "services" ||
           userText === "service"
         ) {
-          await showServices(formattedPhone);
+          await showRegularServices(formattedPhone);
+          return;
+        }
+
+        if (
+          userText.includes("ইন্সট্যান্ট") ||
+          userText === "instant" ||
+          userText === "instantservice"
+        ) {
+          await showInstantServices(formattedPhone);
           return;
         }
 
@@ -3032,160 +1817,12 @@ async function handleUserMessage(
           ![
             "awaiting_trx_id",
             "awaiting_service_confirmation",
-            "awaiting_broadcast_message",
+            "awaiting_ubrn_number",
+            "awaiting_instant_service_data",
           ].includes(currentState)
         ) {
           await stateManager.clearUserState(formattedPhone);
         }
-
-        // ========================================
-        // ADMIN SERVICE MANAGEMENT LIST HANDLERS
-        // ========================================
-
-        // Admin Service Management Menu
-        if (selectedId === "admin_services") {
-          const adminServiceRows = [
-            {
-              id: "admin_service_list",
-              title: "📋 সার্ভিস তালিকা",
-              description: "সমস্ত সার্ভিস দেখুন",
-            },
-            {
-              id: "admin_service_add",
-              title: "➕ নতুন সার্ভিস যোগ",
-              description: "নতুন সার্ভিস তৈরি করুন",
-            },
-            {
-              id: "admin_service_edit",
-              title: "✏️ সার্ভিস এডিট",
-              description: "সার্ভিস তথ্য পরিবর্তন করুন",
-            },
-            {
-              id: "admin_service_toggle",
-              title: "⚡ স্ট্যাটাস পরিবর্তন",
-              description: "সার্ভিস সক্রিয়/নিষ্ক্রিয় করুন",
-            },
-            {
-              id: "admin_service_delete",
-              title: "🗑️ সার্ভিস ডিলিট",
-              description: "সার্ভিস মুছে ফেলুন",
-            },
-          ];
-
-          await sendListMenu(
-            formattedPhone,
-            "📦 সার্ভিস ম্যানেজমেন্ট",
-            "সার্ভিস ম্যানেজমেন্ট অপশন সিলেক্ট করুন:\n\n🚫 বাতিল করতে 'cancel' লিখুন",
-            adminServiceRows,
-            "সার্ভিস অপশন",
-            "সার্ভিস অপশন"
-          );
-          return;
-        }
-
-        if (selectedId === "admin_service_list") {
-          await showAllServices(formattedPhone);
-          return;
-        }
-
-        if (selectedId === "admin_service_add") {
-          await addNewService(formattedPhone);
-          return;
-        }
-
-        if (selectedId === "admin_service_edit") {
-          await handleAdminServiceEdit(formattedPhone);
-          return;
-        }
-
-        if (selectedId === "admin_service_toggle") {
-          await toggleServiceStatus(formattedPhone);
-          return;
-        }
-
-        if (selectedId === "admin_service_delete") {
-          await deleteService(formattedPhone);
-          return;
-        }
-
-        // Service Detail Selection
-        if (selectedId.startsWith("admin_service_detail_")) {
-          const serviceId = selectedId.replace("admin_service_detail_", "");
-          await showServiceDetails(formattedPhone, serviceId);
-          return;
-        }
-
-        // Edit Service Options
-        if (selectedId.startsWith("admin_edit_service_")) {
-          const serviceId = selectedId.replace("admin_edit_service_", "");
-          await handleServiceSelectionForEdit(formattedPhone, serviceId);
-          return;
-        }
-
-        if (selectedId.startsWith("edit_service_")) {
-          const state = await stateManager.getUserState(formattedPhone);
-          const adminEditServiceData = state?.data?.adminEditService as
-            | AdminEditServiceStateData
-            | undefined;
-          if (adminEditServiceData?.serviceId) {
-            await handleServiceEditOption(
-              formattedPhone,
-              selectedId,
-              adminEditServiceData.serviceId
-            );
-          }
-          return;
-        }
-
-        // Toggle Service Status
-        if (selectedId.startsWith("toggle_service_")) {
-          const serviceId = selectedId.replace("toggle_service_", "");
-          await toggleServiceStatusNow(formattedPhone, serviceId);
-          return;
-        }
-
-        // Delete Service
-        if (selectedId.startsWith("delete_service_")) {
-          const serviceId = selectedId.replace("delete_service_", "");
-          await confirmDeleteService(formattedPhone, serviceId);
-          return;
-        }
-
-        // Field Type Selection
-        if (selectedId.startsWith("field_type_")) {
-          await handleFieldTypeSelection(formattedPhone, selectedId);
-          return;
-        }
-
-        // Fields Action
-        if (
-          selectedId === "add_new_field" ||
-          selectedId === "view_fields" ||
-          selectedId === "edit_field" ||
-          selectedId === "delete_field"
-        ) {
-          await handleFieldsAction(formattedPhone, selectedId);
-          return;
-        }
-
-        // Edit Field Selection
-        if (selectedId.startsWith("edit_field_")) {
-          const fieldIndex = parseInt(selectedId.replace("edit_field_", ""));
-          await sendTextMessage(formattedPhone, "✏️ ফিল্ড এডিট শীঘ্রই আসছে...");
-          await showMainMenu(formattedPhone, true);
-          return;
-        }
-
-        // Delete Field Selection
-        if (selectedId.startsWith("delete_field_")) {
-          const fieldIndex = parseInt(selectedId.replace("delete_field_", ""));
-          await deleteField(formattedPhone, fieldIndex);
-          return;
-        }
-
-        // ========================================
-        // EXISTING LIST HANDLERS
-        // ========================================
 
         // Handle user menu options
         switch (selectedId) {
@@ -3193,7 +1830,10 @@ async function handleUserMessage(
             await handleRechargeStart(formattedPhone);
             break;
           case "user_services":
-            await showServices(formattedPhone);
+            await showRegularServices(formattedPhone);
+            break;
+          case "user_instant":
+            await showInstantServices(formattedPhone);
             break;
           case "user_orders":
             await showOrderHistory(formattedPhone);
@@ -3204,33 +1844,21 @@ async function handleUserMessage(
           case "user_account":
             await showAccountInfo(formattedPhone);
             break;
-          case "user_support":
-            await showSupport(formattedPhone);
-            break;
-          // Admin menu options
-          case "admin_orders":
-            await handleAdminOrders(formattedPhone);
-            break;
-          case "admin_order_pending":
-            await showPendingOrders(formattedPhone);
-            break;
-          case "admin_broadcast":
-            await handleBroadcast(formattedPhone);
-            break;
-          case "admin_stats":
-            await showSystemStats(formattedPhone);
-            break;
-          case "admin_users":
-            await showUserManagement(formattedPhone);
-            break;
-          case "admin_settings":
-            await showSystemSettings(formattedPhone);
+          // Admin menu options (simplified)
+          case "admin_services":
+            await sendTextMessage(
+              formattedPhone,
+              "📦 *সার্ভিস ম্যানেজমেন্ট*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
+            );
+            await showMainMenu(formattedPhone, true);
             break;
           // Service selection
           default:
-            if (selectedId.startsWith("service_")) {
+            if (selectedId.startsWith("instant_")) {
+              await handleInstantServiceSelection(formattedPhone, selectedId);
+            } else if (selectedId.startsWith("service_")) {
               const serviceId = selectedId.replace("service_", "");
-              await handleServiceSelection(formattedPhone, serviceId);
+              await handleRegularServiceSelection(formattedPhone, serviceId);
             } else if (selectedId === "cancel_flow") {
               await cancelFlow(formattedPhone, isAdmin);
             } else {
@@ -3278,146 +1906,9 @@ async function handleUserMessage(
   }
 }
 
-// --- Helper Functions ---
-async function showServiceDetails(phone: string, serviceId: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing service details to admin ${formattedPhone}`, { serviceId });
-
-  try {
-    await connectDB();
-    const service = await Service.findById(serviceId);
-
-    if (!service) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, true);
-      return;
-    }
-
-    const fieldsCount = service.requiredFields?.length || 0;
-    const activeOrders = await Order.countDocuments({
-      serviceId: service._id,
-      status: { $in: ["pending", "processing"] },
-    });
-    const totalOrders = await Order.countDocuments({ serviceId: service._id });
-
-    let message = `📋 *সার্ভিস ডিটেইলস*\n\n`;
-    message += `📛 নাম: ${service.name}\n`;
-    message += `💰 মূল্য: ৳${service.price}\n`;
-    message += `📊 স্ট্যাটাস: ${
-      service.isActive ? "✅ সক্রিয়" : "❌ নিষ্ক্রিয়"
-    }\n`;
-    message += `🔧 ফিল্ড: ${fieldsCount}টি\n`;
-    message += `📦 অর্ডার: ${activeOrders} সক্রিয় / ${totalOrders} মোট\n\n`;
-    message += `📝 বর্ণনা: ${service.description}\n\n`;
-
-    if (service.instructions) {
-      message += `📋 নির্দেশনা: ${service.instructions}\n\n`;
-    }
-
-    if (fieldsCount > 0) {
-      message += `📋 ফিল্ডসমূহ:\n`;
-      service.requiredFields?.forEach((field:ServiceField, index: number) => {
-        const typeMap = {
-          text: "📝 টেক্সট",
-          number: "🔢 নাম্বার",
-          select: "📑 সিলেক্ট",
-          file: "📁 ফাইল",
-        };
-        message += `${index + 1}. ${field.label} (${
-          typeMap[field.type as keyof typeof typeMap] || field.type
-        }) ${field.required ? "✅" : "❌"}\n`;
-      });
-    }
-
-    message += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-    await sendTextMessage(formattedPhone, message);
-    await showMainMenu(formattedPhone, true);
-  } catch (err) {
-    error(`Failed to show service details to admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-// --- Additional Admin Functions ---
-async function showSystemStats(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing system stats to admin ${formattedPhone}`);
-
-  try {
-    await connectDB();
-    const totalUsers = await User.countDocuments();
-    const totalOrders = await Order.countDocuments();
-    const totalServices = await Service.countDocuments();
-    const totalTransactions = await Transaction.countDocuments();
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const todayUsers = await User.countDocuments({
-      createdAt: { $gte: today },
-    });
-    const todayOrders = await Order.countDocuments({
-      createdAt: { $gte: today },
-    });
-
-    const message =
-      `📊 *সিস্টেম স্ট্যাটিসটিক্স*\n\n` +
-      `👥 মোট ইউজার: ${totalUsers}\n` +
-      `🛒 মোট অর্ডার: ${totalOrders}\n` +
-      `📦 মোট সার্ভিস: ${totalServices}\n` +
-      `💳 মোট ট্রান্সাকশন: ${totalTransactions}\n\n` +
-      `📅 আজকের তথ্য:\n` +
-      `• নতুন ইউজার: ${todayUsers}\n` +
-      `• নতুন অর্ডার: ${todayOrders}\n\n` +
-      `⏱️ সর্বশেষ আপডেট: ${new Date().toLocaleString()}\n\n` +
-      `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-    await sendTextMessage(formattedPhone, message);
-  } catch (err) {
-    error(`Failed to show system stats to admin ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ স্ট্যাটিসটিক্স লোড করতে সমস্যা হয়েছে।"
-    );
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function showUserManagement(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing user management to admin ${formattedPhone}`);
-
-  try {
-    await sendTextMessage(
-      formattedPhone,
-      "👥 *ইউজার ম্যানেজমেন্ট*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
-    );
-    await showMainMenu(formattedPhone, true);
-  } catch (err) {
-    error(`Failed to show user management to admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
-async function showSystemSettings(phone: string) {
-  const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing system settings to admin ${formattedPhone}`);
-
-  try {
-    await sendTextMessage(
-      formattedPhone,
-      "⚙️ *সিস্টেম সেটিংস*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
-    );
-    await showMainMenu(formattedPhone, true);
-  } catch (err) {
-    error(`Failed to show system settings to admin ${formattedPhone}:`, err);
-    await showMainMenu(formattedPhone, true);
-  }
-}
-
 // --- Main Webhook Handler ---
 export async function POST(req: NextRequest) {
-  const requestId =
-    Date.now().toString(36) + Math.random().toString(36).substr(2);
+  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
   info(`[${requestId}] Webhook POST request received`);
 
   try {
