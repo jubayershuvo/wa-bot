@@ -1,46 +1,73 @@
 import { NextRequest, NextResponse } from "next/server";
-import User from "@/models/User";
+import User, { IUser } from "@/models/User";
 import Service, { IService, ServiceField } from "@/models/Service";
-import Order, { IOrder } from "@/models/Order";
+import Order from "@/models/Order";
 import Transaction from "@/models/Transaction";
 import stateManager from "@/lib/whatsappState";
 import { sessionMonitor } from "@/lib/sessionMonitor";
 import { connectDB } from "@/lib/mongodb-bot";
 import axios from "axios";
 
-// --- Logging Configuration ---
+// --- Enhanced Logging Configuration ---
 const LOG_CONFIG = {
   debug: process.env.NODE_ENV === "development",
   logLevel: process.env.LOG_LEVEL || "INFO",
 };
 
-function log(level: string, message: string, data?: unknown) {
-  const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] [${level}] ${message}`;
-
-  if (data) {
-    console.log(logMessage, data);
-  } else {
-    console.log(logMessage);
+class Logger {
+  private static getTimestamp(): string {
+    return new Date().toISOString();
   }
-}
 
-function debug(message: string, data?: unknown) {
-  if (LOG_CONFIG.debug) {
-    log("DEBUG", message, data);
+  private static formatMessage(level: string, message: string, data?: unknown): string {
+    const timestamp = this.getTimestamp();
+    const formattedMessage = `[${timestamp}] [${level}] [WHATSAPP-WEBHOOK] ${message}`;
+    
+    if (data) {
+      try {
+        const dataStr = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+        return `${formattedMessage}\n${dataStr}`;
+      } catch {
+        return `${formattedMessage}\n${data}`;
+      }
+    }
+    
+    return formattedMessage;
   }
-}
 
-function info(message: string, data?: unknown) {
-  log("INFO", message, data);
-}
+  static debug(message: string, data?: unknown) {
+    if (LOG_CONFIG.debug) {
+      console.debug(this.formatMessage("DEBUG", message, data));
+    }
+  }
 
-function warn(message: string, data?: unknown) {
-  log("WARN", message, data);
-}
+  static info(message: string, data?: unknown) {
+    console.info(this.formatMessage("INFO", message, data));
+  }
 
-function error(message: string, data?: unknown) {
-  log("ERROR", message, data);
+  static warn(message: string, data?: unknown) {
+    console.warn(this.formatMessage("WARN", message, data));
+  }
+
+  static error(message: string, data?: unknown) {
+    console.error(this.formatMessage("ERROR", message, data));
+  }
+
+  static logRequest(phone: string, message: WhatsAppMessage, requestId: string) {
+    this.info(`[${requestId}] Message received from ${phone}`, {
+      type: message.type,
+      messageId: message.id,
+      text: message.text?.body?.substring(0, 100),
+      interactiveType: message.interactive?.type,
+    });
+  }
+
+  static logResponse(phone: string, response: any, requestId: string) {
+    this.debug(`[${requestId}] Response sent to ${phone}`, {
+      messageId: response?.messages?.[0]?.id,
+      success: true,
+    });
+  }
 }
 
 // --- Configuration ---
@@ -106,7 +133,7 @@ interface ServiceOrderStateData {
   price?: number;
   serviceName?: string;
   fieldIndex?: number;
-  collectedData?: Record<string, string | Buffer>;
+  collectedData?: Record<string, any>;
 }
 
 interface UbrnStateData {
@@ -143,7 +170,7 @@ interface AdminDeleteServiceStateData {
 
 interface AdminProcessOrderStateData {
   orderId?: string;
-  order?: IOrder;
+  order?: any;
   step?: number;
   fileType?: string;
   fileId?: string;
@@ -201,13 +228,15 @@ function formatPhoneNumber(phone: string): string {
   return cleaned;
 }
 
-async function callWhatsAppApi(endpoint: string, payload: object) {
+async function callWhatsAppApi(endpoint: string, payload: object): Promise<any> {
   const url = `${CONFIG.baseUrl}/${CONFIG.apiVersion}/${CONFIG.phoneNumberId}/${endpoint}`;
-  debug(`Calling WhatsApp API: ${endpoint}`, {
-    payload: JSON.stringify(payload).substring(0, 500),
+  Logger.debug(`Calling WhatsApp API: ${endpoint}`, {
+    url,
+    payloadSize: JSON.stringify(payload).length,
   });
 
   try {
+    const startTime = Date.now();
     const response = await fetch(url, {
       method: "POST",
       headers: {
@@ -217,42 +246,34 @@ async function callWhatsAppApi(endpoint: string, payload: object) {
       body: JSON.stringify(payload),
     });
 
+    const responseTime = Date.now() - startTime;
     const result = await response.json();
 
     if (!response.ok) {
-      error(`WhatsApp API error for ${endpoint}:`, {
+      Logger.error(`WhatsApp API error for ${endpoint}`, {
         status: response.status,
         statusText: response.statusText,
         error: result,
-        payload: JSON.stringify(payload),
+        responseTime: `${responseTime}ms`,
       });
-
-      if (result.error?.message) {
-        error(`WhatsApp API Error Message: ${result.error.message}`);
-      }
-      if (result.error?.error_data?.details) {
-        error(
-          `WhatsApp API Error Details: ${JSON.stringify(
-            result.error.error_data.details
-          )}`
-        );
-      }
+      throw new Error(`WhatsApp API error: ${response.status} ${response.statusText}`);
     } else {
-      debug(`WhatsApp API success for ${endpoint}:`, {
+      Logger.debug(`WhatsApp API success for ${endpoint}`, {
         messageId: result?.messages?.[0]?.id,
+        responseTime: `${responseTime}ms`,
       });
     }
 
     return result;
   } catch (apiError) {
-    error(`Network error calling ${endpoint}:`, apiError);
+    Logger.error(`Network error calling ${endpoint}:`, apiError);
     throw apiError;
   }
 }
 
-async function sendTextMessage(to: string, text: string) {
+async function sendTextMessage(to: string, text: string): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
-  info(`Sending text message to ${formattedTo}`, { textLength: text.length });
+  Logger.info(`Sending text message to ${formattedTo}`, { textLength: text.length });
 
   const payload = {
     messaging_product: "whatsapp",
@@ -265,13 +286,14 @@ async function sendTextMessage(to: string, text: string) {
     },
   };
 
-  debug(`Text message payload:`, payload);
-
   try {
     const result = await callWhatsAppApi("messages", payload);
+    Logger.debug(`Text message sent to ${formattedTo}`, {
+      messageId: result?.messages?.[0]?.id,
+    });
     return result;
   } catch (err) {
-    error(`Failed to send text message to ${formattedTo}:`, err);
+    Logger.error(`Failed to send text message to ${formattedTo}:`, err);
     throw err;
   }
 }
@@ -281,9 +303,9 @@ async function sendButtonMenu(
   headerText: string,
   bodyText: string,
   buttons: Array<{ id: string; title: string }>
-) {
+): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
-  info(`Sending button menu to ${formattedTo}`, {
+  Logger.info(`Sending button menu to ${formattedTo}`, {
     header: headerText,
     buttons: buttons.length,
   });
@@ -316,31 +338,29 @@ async function sendButtonMenu(
     },
   };
 
-  debug(`Button menu payload:`, payload);
-
   try {
     const result = await callWhatsAppApi("messages", payload);
+    Logger.debug(`Button menu sent to ${formattedTo}`, {
+      messageId: result?.messages?.[0]?.id,
+    });
     return result;
   } catch (err) {
-    error(`Failed to send button menu to ${formattedTo}:`, err);
-    await sendTextMessage(
-      formattedTo,
-      `${headerText}\n\n${bodyText}\n\nPlease use text commands or list menu.`
-    );
+    Logger.error(`Failed to send button menu to ${formattedTo}:`, err);
     throw err;
   }
 }
 
-async function sendTextWithCancelButton(to: string, text: string) {
+async function sendTextWithCancelButton(to: string, text: string): Promise<void> {
   const formattedTo = formatPhoneNumber(to);
-  info(`Sending text with cancel button to ${formattedTo}`);
+  Logger.info(`Sending text with cancel button to ${formattedTo}`);
 
   try {
     await sendButtonMenu(formattedTo, "Action Required", text, [
       { id: "cancel_flow", title: "❌ বাতিল করুন" },
     ]);
   } catch (err) {
-    error(`Failed to send text with cancel button to ${formattedTo}:`, err);
+    Logger.error(`Failed to send text with cancel button to ${formattedTo}:`, err);
+    // Fallback to regular text message
     await sendTextMessage(
       formattedTo,
       `${text}\n\n🚫 বাতিল করতে 'cancel' লিখুন।`
@@ -355,9 +375,9 @@ async function sendListMenu(
   rows: Array<{ id: string; title: string; description?: string }>,
   sectionTitle: string,
   buttonText: string = "অপশন দেখুন"
-) {
+): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
-  info(`Sending list menu to ${formattedTo}`, { header, rows: rows.length });
+  Logger.info(`Sending list menu to ${formattedTo}`, { header, rows: rows.length });
 
   const validatedRows = rows.slice(0, 10).map((row) => ({
     id: row.id.substring(0, 200),
@@ -394,13 +414,15 @@ async function sendListMenu(
     },
   };
 
-  debug(`List menu payload:`, payload);
-
   try {
     const result = await callWhatsAppApi("messages", payload);
+    Logger.debug(`List menu sent to ${formattedTo}`, {
+      messageId: result?.messages?.[0]?.id,
+    });
     return result;
   } catch (err) {
-    error(`Failed to send list menu to ${formattedTo}:`, err);
+    Logger.error(`Failed to send list menu to ${formattedTo}:`, err);
+    // Fallback to text menu
     let textMenu = `${header}\n\n${body}\n\n`;
     rows.forEach((row, index) => {
       textMenu += `${index + 1}. ${row.title}\n`;
@@ -411,71 +433,17 @@ async function sendListMenu(
   }
 }
 
-async function sendImage(to: string, imageUrl: string, caption?: string) {
-  const formattedTo = formatPhoneNumber(to);
-  info(`Sending image to ${formattedTo}`, { imageUrl, caption });
-
-  const payload = {
-    messaging_product: "whatsapp",
-    recipient_type: "individual",
-    to: formattedTo,
-    type: "image",
-    image: {
-      link: imageUrl,
-      caption: caption?.substring(0, 1024),
-    },
-  };
-
-  try {
-    const result = await callWhatsAppApi("messages", payload);
-    return result;
-  } catch (err) {
-    error(`Failed to send image to ${formattedTo}:`, err);
-    throw err;
-  }
-}
-
-async function sendDocument(
-  to: string,
-  documentUrl: string,
-  filename: string,
-  caption?: string
-) {
-  const formattedTo = formatPhoneNumber(to);
-  info(`Sending document to ${formattedTo}`, { filename, caption });
-
-  const payload = {
-    messaging_product: "whatsapp",
-    recipient_type: "individual",
-    to: formattedTo,
-    type: "document",
-    document: {
-      link: documentUrl,
-      filename: filename.substring(0, 240),
-      caption: caption?.substring(0, 1024),
-    },
-  };
-
-  try {
-    const result = await callWhatsAppApi("messages", payload);
-    return result;
-  } catch (err) {
-    error(`Failed to send document to ${formattedTo}:`, err);
-    throw err;
-  }
-}
-
 // --- User Management ---
-async function getOrCreateUser(phone: string, name?: string) {
+async function getOrCreateUser(phone: string, name?: string): Promise<IUser> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Getting/creating user for ${formattedPhone}`);
+  Logger.info(`Getting/creating user for ${formattedPhone}`);
 
   try {
     await connectDB();
 
     let user = await User.findOne({ whatsapp: formattedPhone });
     if (!user) {
-      info(`Creating new user for ${formattedPhone}`);
+      Logger.info(`Creating new user for ${formattedPhone}`);
       user = new User({
         name: name || "User",
         whatsapp: formattedPhone,
@@ -485,9 +453,9 @@ async function getOrCreateUser(phone: string, name?: string) {
         createdAt: new Date(),
       });
       await user.save();
-      info(`Created new user with ID: ${user._id}`);
+      Logger.info(`Created new user with ID: ${user._id}`);
     } else {
-      debug(`Found existing user: ${user._id}`);
+      Logger.debug(`Found existing user: ${user._id}`);
       user.whatsappLastActive = new Date();
       user.whatsappMessageCount += 1;
       await user.save();
@@ -495,29 +463,29 @@ async function getOrCreateUser(phone: string, name?: string) {
 
     return user;
   } catch (err) {
-    error(`Error in getOrCreateUser for ${formattedPhone}:`, err);
+    Logger.error(`Error in getOrCreateUser for ${formattedPhone}:`, err);
     throw err;
   }
 }
 
-async function notifyAdmin(message: string) {
+async function notifyAdmin(message: string): Promise<void> {
   if (CONFIG.adminId) {
-    info(`Sending admin notification to ${CONFIG.adminId}`);
+    Logger.info(`Sending admin notification to ${CONFIG.adminId}`);
     try {
       await sendTextMessage(
         CONFIG.adminId,
         `🔔 *ADMIN NOTIFICATION*\n\n${message}`
       );
     } catch (err) {
-      error(`Failed to send admin notification:`, err);
+      Logger.error(`Failed to send admin notification:`, err);
     }
   }
 }
 
 // --- Main Menu Handler ---
-async function showMainMenu(phone: string, isAdmin: boolean) {
+async function showMainMenu(phone: string, isAdmin: boolean): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing main menu to ${formattedPhone}`, { isAdmin });
+  Logger.info(`Showing main menu to ${formattedPhone}`, { isAdmin });
 
   try {
     await stateManager.clearUserState(formattedPhone);
@@ -528,7 +496,7 @@ async function showMainMenu(phone: string, isAdmin: boolean) {
       await showUserMainMenu(formattedPhone);
     }
   } catch (err) {
-    error(`Failed to show main menu to ${formattedPhone}:`, err);
+    Logger.error(`Failed to show main menu to ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       `🏠 *SignCopy Main Menu*\n\n` +
@@ -544,7 +512,7 @@ async function showMainMenu(phone: string, isAdmin: boolean) {
   }
 }
 
-async function showAdminMainMenu(phone: string) {
+async function showAdminMainMenu(phone: string): Promise<void> {
   const adminMenuRows = [
     {
       id: "admin_services",
@@ -588,7 +556,7 @@ async function showAdminMainMenu(phone: string) {
   );
 }
 
-async function showUserMainMenu(phone: string) {
+async function showUserMainMenu(phone: string): Promise<void> {
   const userMenuRows = [
     {
       id: "user_recharge",
@@ -633,16 +601,16 @@ async function showUserMainMenu(phone: string) {
 }
 
 // --- Cancel Flow Handler ---
-async function cancelFlow(phone: string, isAdmin: boolean = false) {
+async function cancelFlow(phone: string, isAdmin: boolean = false): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Canceling flow for ${formattedPhone}`);
+  Logger.info(`Canceling flow for ${formattedPhone}`);
 
   try {
     await stateManager.clearUserState(formattedPhone);
     await sendTextMessage(formattedPhone, "🚫 অপারেশন বাতিল করা হয়েছে।");
     await showMainMenu(formattedPhone, isAdmin);
   } catch (err) {
-    error(`Failed to cancel flow for ${formattedPhone}:`, err);
+    Logger.error(`Failed to cancel flow for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ বাতিল করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -651,9 +619,9 @@ async function cancelFlow(phone: string, isAdmin: boolean = false) {
 }
 
 // --- Recharge Flow ---
-async function handleRechargeStart(phone: string) {
+async function handleRechargeStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Starting recharge flow for ${formattedPhone}`);
+  Logger.info(`Starting recharge flow for ${formattedPhone}`);
 
   try {
     await stateManager.setUserState(formattedPhone, {
@@ -664,16 +632,16 @@ async function handleRechargeStart(phone: string) {
     const message = `💳 *রিচার্জ করুন*\n\n📱 আমাদের বিকাশ নম্বর: *${CONFIG.bkashNumber}*\n\nবিকাশে পেমেন্ট করার পর *Transaction ID* পাঠান:\n\`TRX_ID\`\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন:`;
 
     await sendTextWithCancelButton(formattedPhone, message);
-    info(`Recharge instructions sent to ${formattedPhone}`);
+    Logger.info(`Recharge instructions sent to ${formattedPhone}`);
   } catch (err) {
-    error(`Failed to start recharge flow for ${phone}:`, err);
+    Logger.error(`Failed to start recharge flow for ${phone}:`, err);
     throw err;
   }
 }
 
-async function handleTrxIdInput(phone: string, trxId: string) {
+async function handleTrxIdInput(phone: string, trxId: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing TRX ID for ${formattedPhone}`, { trxId });
+  Logger.info(`Processing TRX ID for ${formattedPhone}`, { trxId });
 
   try {
     await stateManager.updateStateData(formattedPhone, {
@@ -753,9 +721,9 @@ async function handleTrxIdInput(phone: string, trxId: string) {
 
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
-    info(`Recharge completed for ${formattedPhone}`);
+    Logger.info(`Recharge completed for ${formattedPhone}`);
   } catch (err) {
-    error(`Failed to process TRX ID for ${formattedPhone}:`, err);
+    Logger.error(`Failed to process TRX ID for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ রিচার্জ প্রক্রিয়া সম্পূর্ণ করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -765,9 +733,9 @@ async function handleTrxIdInput(phone: string, trxId: string) {
 }
 
 // --- Instant Services Section ---
-async function showInstantServices(phone: string) {
+async function showInstantServices(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing instant services to ${formattedPhone}`);
+  Logger.info(`Showing instant services to ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -807,11 +775,11 @@ async function showInstantServices(phone: string) {
       "ইন্সট্যান্ট সার্ভিস",
       "সার্ভিস দেখুন"
     );
-    info(`Instant services list sent to ${formattedPhone}`, { 
+    Logger.info(`Instant services list sent to ${formattedPhone}`, { 
       count: serviceRows.length 
     });
   } catch (err) {
-    error(`Failed to show instant services to ${formattedPhone}:`, err);
+    Logger.error(`Failed to show instant services to ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ ইন্সট্যান্ট সার্ভিস লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -820,9 +788,9 @@ async function showInstantServices(phone: string) {
   }
 }
 
-async function handleInstantServiceSelection(phone: string, serviceId: string) {
+async function handleInstantServiceSelection(phone: string, serviceId: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Handling instant service selection for ${formattedPhone}`, { serviceId });
+  Logger.info(`Handling instant service selection for ${formattedPhone}`, { serviceId });
 
   try {
     if (serviceId === "instant_ubrn_verification") {
@@ -877,7 +845,7 @@ async function handleInstantServiceSelection(phone: string, serviceId: string) {
       await processInstantService(phone);
     }
   } catch (err) {
-    error(`Failed to handle instant service selection for ${formattedPhone}:`, err);
+    Logger.error(`Failed to handle instant service selection for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ সার্ভিস সিলেক্ট করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -886,9 +854,9 @@ async function handleInstantServiceSelection(phone: string, serviceId: string) {
   }
 }
 
-async function handleUbrnVerificationStart(phone: string) {
+async function handleUbrnVerificationStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Starting UBRN verification for ${formattedPhone}`);
+  Logger.info(`Starting UBRN verification for ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -922,9 +890,9 @@ async function handleUbrnVerificationStart(phone: string) {
     const message = `🔍 *UBRN ভেরিফিকেশন*\n\n💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n\nদয়া করে UBRN নম্বরটি পাঠান:\n(উদাহরণ: 19862692537094068)\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
 
     await sendTextWithCancelButton(formattedPhone, message);
-    info(`UBRN verification started for ${formattedPhone}`);
+    Logger.info(`UBRN verification started for ${formattedPhone}`);
   } catch (err) {
-    error(`Failed to start UBRN verification for ${phone}:`, err);
+    Logger.error(`Failed to start UBRN verification for ${phone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ UBRN সার্ভিস শুরু করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -933,9 +901,9 @@ async function handleUbrnVerificationStart(phone: string) {
   }
 }
 
-async function handleUbrnInput(phone: string, ubrn: string) {
+async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing UBRN for ${formattedPhone}`, { ubrn });
+  Logger.info(`Processing UBRN for ${formattedPhone}`, { ubrn });
 
   try {
     const state = await stateManager.getUserState(formattedPhone);
@@ -977,16 +945,18 @@ async function handleUbrnInput(phone: string, ubrn: string) {
     // Call UBRN API
     let ubrnDataResult;
     try {
+      Logger.info(`Calling UBRN API for: ${ubrn}`);
       const response = await axios.get(CONFIG.ubrnApiUrl, {
         params: { ubrn: ubrn.trim() },
         timeout: 30000,
       });
       ubrnDataResult = response.data;
-    } catch (apiError) {
-      error(`UBRN API error for ${ubrn}:`, apiError);
+      Logger.info(`UBRN API response received`, { dataLength: JSON.stringify(ubrnDataResult).length });
+    } catch (apiError: unknown) {
+      Logger.error(`UBRN API error for ${ubrn}:`, apiError);
       await sendTextMessage(
         formattedPhone,
-        `❌ UBRN API তে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\nইরর: ${'Unknown error'}`
+        `❌ UBRN API তে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\nইরর: ${apiError instanceof Error ? apiError.message : 'Unknown error'}`
       );
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
@@ -998,7 +968,7 @@ async function handleUbrnInput(phone: string, ubrn: string) {
     await user.save();
 
     // Create transaction record only (NO ORDER CREATION)
-    await Transaction.create({
+    const transaction = await Transaction.create({
       trxId: `UBRN-${Date.now()}`,
       amount: CONFIG.ubrnServicePrice,
       method: "balance",
@@ -1016,7 +986,8 @@ async function handleUbrnInput(phone: string, ubrn: string) {
     let resultMessage = `✅ *UBRN ভেরিফিকেশন সম্পন্ন*\n\n`;
     resultMessage += `🔢 UBRN: ${ubrn}\n`;
     resultMessage += `💰 খরচ: ৳${CONFIG.ubrnServicePrice}\n`;
-    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n\n`;
+    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n`;
+    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
 
     if (ubrnDataResult && typeof ubrnDataResult === 'object') {
       resultMessage += `📊 *রেজাল্ট:*\n`;
@@ -1044,11 +1015,12 @@ async function handleUbrnInput(phone: string, ubrn: string) {
     );
 
     await stateManager.clearUserState(formattedPhone);
-    info(`UBRN verification completed for ${formattedPhone}`, {
+    Logger.info(`UBRN verification completed for ${formattedPhone}`, {
       ubrn: ubrn,
+      transactionId: transaction._id,
     });
   } catch (err) {
-    error(`Failed to process UBRN for ${formattedPhone}:`, err);
+    Logger.error(`Failed to process UBRN for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ UBRN ভেরিফিকেশন করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -1058,7 +1030,7 @@ async function handleUbrnInput(phone: string, ubrn: string) {
   }
 }
 
-async function askForServiceField(phone: string, service: IService, fieldIndex: number) {
+async function askForServiceField(phone: string, service: IService, fieldIndex: number): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   
   if (!service.requiredFields || fieldIndex >= service.requiredFields.length) {
@@ -1093,9 +1065,9 @@ async function askForServiceField(phone: string, service: IService, fieldIndex: 
   await sendTextWithCancelButton(formattedPhone, message);
 }
 
-async function handleInstantServiceFieldInput(phone: string, input: string) {
+async function handleInstantServiceFieldInput(phone: string, input: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing instant service field input for ${formattedPhone}`, { input });
+  Logger.info(`Processing instant service field input for ${formattedPhone}`, { input });
 
   try {
     const state = await stateManager.getUserState(formattedPhone);
@@ -1159,7 +1131,7 @@ async function handleInstantServiceFieldInput(phone: string, input: string) {
       await processInstantService(phone);
     }
   } catch (err) {
-    error(`Failed to process instant service field input for ${formattedPhone}:`, err);
+    Logger.error(`Failed to process instant service field input for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ ইনপুট প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -1168,9 +1140,9 @@ async function handleInstantServiceFieldInput(phone: string, input: string) {
   }
 }
 
-async function processInstantService(phone: string) {
+async function processInstantService(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Processing instant service for ${formattedPhone}`);
+  Logger.info(`Processing instant service for ${formattedPhone}`);
 
   try {
     const state = await stateManager.getUserState(formattedPhone);
@@ -1219,7 +1191,7 @@ async function processInstantService(phone: string) {
     await user.save();
 
     // Create transaction record only (NO ORDER CREATION)
-    await Transaction.create({
+    const transaction = await Transaction.create({
       trxId: `INST-${Date.now()}`,
       amount: price,
       method: "balance",
@@ -1237,7 +1209,8 @@ async function processInstantService(phone: string) {
     // Process the instant service based on service type
     let resultMessage = `✅ *${serviceName} সম্পন্ন*\n\n`;
     resultMessage += `💰 খরচ: ৳${price}\n`;
-    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n\n`;
+    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n`;
+    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
 
     // Add collected data to result
     if (Object.keys(collectedData).length > 0) {
@@ -1250,7 +1223,7 @@ async function processInstantService(phone: string) {
 
     // TODO: Add specific instant service processing logic here
     // For now, just send success message
-    resultMessage += `✅ আপনার রিকোয়েস্ট প্রসেস করা হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+    resultMessage += `✅ আপনার রিকোয়েস্ট প্রসেস করা হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(formattedPhone, resultMessage);
 
@@ -1260,12 +1233,13 @@ async function processInstantService(phone: string) {
     );
 
     await stateManager.clearUserState(formattedPhone);
-    info(`Instant service completed for ${formattedPhone}`, {
+    Logger.info(`Instant service completed for ${formattedPhone}`, {
       serviceName: serviceName,
       price: price,
+      transactionId: transaction._id,
     });
   } catch (err) {
-    error(`Failed to process instant service for ${formattedPhone}:`, err);
+    Logger.error(`Failed to process instant service for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ ইন্সট্যান্ট সার্ভিস প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -1276,9 +1250,9 @@ async function processInstantService(phone: string) {
 }
 
 // --- Regular Services Flow ---
-async function showRegularServices(phone: string) {
+async function showRegularServices(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing regular services to ${formattedPhone}`);
+  Logger.info(`Showing regular services to ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -1309,9 +1283,9 @@ async function showRegularServices(phone: string) {
       "সার্ভিস লিস্ট",
       "সার্ভিস দেখুন"
     );
-    info(`Regular services list sent to ${formattedPhone}`, { count: services.length });
+    Logger.info(`Regular services list sent to ${formattedPhone}`, { count: services.length });
   } catch (err) {
-    error(`Failed to show regular services to ${formattedPhone}:`, err);
+    Logger.error(`Failed to show regular services to ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ সার্ভিস লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -1320,9 +1294,9 @@ async function showRegularServices(phone: string) {
   }
 }
 
-async function handleRegularServiceSelection(phone: string, serviceId: string) {
+async function handleRegularServiceSelection(phone: string, serviceId: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Handling regular service selection for ${formattedPhone}`, { serviceId });
+  Logger.info(`Handling regular service selection for ${formattedPhone}`, { serviceId });
 
   try {
     await connectDB();
@@ -1368,9 +1342,9 @@ async function handleRegularServiceSelection(phone: string, serviceId: string) {
     message += `✅ অর্ডার কনফার্ম করতে 'confirm' লিখুন\n`;
 
     await sendTextWithCancelButton(formattedPhone, message);
-    info(`Service order confirmation sent to ${formattedPhone}`);
+    Logger.info(`Service order confirmation sent to ${formattedPhone}`);
   } catch (err) {
-    error(`Failed to handle regular service selection for ${formattedPhone}:`, err);
+    Logger.error(`Failed to handle regular service selection for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ সার্ভিস সিলেক্ট করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -1379,9 +1353,9 @@ async function handleRegularServiceSelection(phone: string, serviceId: string) {
   }
 }
 
-async function confirmServiceOrder(phone: string) {
+async function confirmServiceOrder(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Confirming service order for ${formattedPhone}`);
+  Logger.info(`Confirming service order for ${formattedPhone}`);
 
   try {
     const state = await stateManager.getUserState(formattedPhone);
@@ -1464,11 +1438,11 @@ async function confirmServiceOrder(phone: string) {
 
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
-    info(`Service order completed for ${formattedPhone}`, {
+    Logger.info(`Service order completed for ${formattedPhone}`, {
       orderId: order.orderId,
     });
   } catch (err) {
-    error(`Failed to confirm service order for ${formattedPhone}:`, err);
+    Logger.error(`Failed to confirm service order for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ অর্ডার কনফার্ম করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -1478,9 +1452,9 @@ async function confirmServiceOrder(phone: string) {
 }
 
 // --- Order History ---
-async function showOrderHistory(phone: string) {
+async function showOrderHistory(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing order history for ${formattedPhone}`);
+  Logger.info(`Showing order history for ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -1521,9 +1495,9 @@ async function showOrderHistory(phone: string) {
     message += `\n📊 মোট অর্ডার: ${orders.length}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(formattedPhone, message);
-    info(`Order history sent to ${formattedPhone}`, { count: orders.length });
+    Logger.info(`Order history sent to ${formattedPhone}`, { count: orders.length });
   } catch (err) {
-    error(`Failed to show order history for ${formattedPhone}:`, err);
+    Logger.error(`Failed to show order history for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ অর্ডার হিস্টরি লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -1533,9 +1507,9 @@ async function showOrderHistory(phone: string) {
 }
 
 // --- Account Info ---
-async function showAccountInfo(phone: string) {
+async function showAccountInfo(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing account info for ${formattedPhone}`);
+  Logger.info(`Showing account info for ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -1551,9 +1525,9 @@ async function showAccountInfo(phone: string) {
 
     await sendTextMessage(formattedPhone, message);
     await showMainMenu(formattedPhone, false);
-    info(`Account info sent to ${formattedPhone}`);
+    Logger.info(`Account info sent to ${formattedPhone}`);
   } catch (err) {
-    error(`Failed to show account info for ${formattedPhone}:`, err);
+    Logger.error(`Failed to show account info for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ অ্যাকাউন্ট তথ্য লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -1563,26 +1537,26 @@ async function showAccountInfo(phone: string) {
 }
 
 // --- Support ---
-async function showSupport(phone: string) {
+async function showSupport(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing support info to ${formattedPhone}`);
+  Logger.info(`Showing support info to ${formattedPhone}`);
 
   try {
     const message = `🎧 *সাপোর্ট ও হেল্প*\n\nআমরা আপনার সার্ভিস সম্পর্কিত যে কোন সমস্যায় সাহায্য করতে প্রস্তুত।\n\n📞 হোয়াটসঅ্যাপ: ${CONFIG.supportNumber}\n📱 টেলিগ্রাম: ${CONFIG.supportTelegram}\n⏰ সময়: সকাল ৯টা - রাত ১১টা\n\nপ্রয়োজনে সরাসরি মেসেজ করুন।`;
 
     await sendTextMessage(formattedPhone, message);
     await showMainMenu(formattedPhone, false);
-    info(`Support info sent to ${formattedPhone}`);
+    Logger.info(`Support info sent to ${formattedPhone}`);
   } catch (err) {
-    error(`Failed to show support info to ${formattedPhone}:`, err);
+    Logger.error(`Failed to show support info to ${formattedPhone}:`, err);
     await showMainMenu(formattedPhone, false);
   }
 }
 
 // --- Transaction History ---
-async function showTransactionHistory(phone: string) {
+async function showTransactionHistory(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  info(`Showing transaction history for ${formattedPhone}`);
+  Logger.info(`Showing transaction history for ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -1614,11 +1588,11 @@ async function showTransactionHistory(phone: string) {
 
     await sendTextMessage(formattedPhone, message);
     await showMainMenu(formattedPhone, false);
-    info(`Transaction history sent to ${formattedPhone}`, {
+    Logger.info(`Transaction history sent to ${formattedPhone}`, {
       count: transactions.length,
     });
   } catch (err) {
-    error(`Failed to show transaction history for ${formattedPhone}:`, err);
+    Logger.error(`Failed to show transaction history for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       "❌ ট্রান্সাকশন হিস্টরি লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
@@ -1632,29 +1606,25 @@ async function handleUserMessage(
   phone: string,
   message: WhatsAppMessage,
   isAdmin: boolean
-) {
+): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
 
-  info(`[${requestId}] Handling message from ${formattedPhone}`, {
-    type: message.type,
-    isAdmin,
-    messageId: message.id,
-  });
+  Logger.logRequest(formattedPhone, message, requestId);
 
   try {
     const user = await getOrCreateUser(formattedPhone);
-    info(`[${requestId}] User processed`, { userId: user._id, isAdmin });
+    Logger.info(`[${requestId}] User processed`, { userId: user._id, isAdmin, phone: formattedPhone });
 
     const userState = await stateManager.getUserState(formattedPhone);
     const currentState = userState?.currentState;
     const flowType = userState?.flowType;
 
-    debug(`[${requestId}] User state`, { currentState, flowType });
+    Logger.debug(`[${requestId}] User state`, { currentState, flowType });
 
     if (message.type === "text") {
       const userText = message.text?.body.trim().toLowerCase() || "";
-      info(`[${requestId}] Text message: "${userText}"`, { currentState });
+      Logger.info(`[${requestId}] Text message received: "${userText}"`, { currentState });
 
       if (
         userText === "cancel" ||
@@ -1662,6 +1632,7 @@ async function handleUserMessage(
         userText === "c" ||
         userText === "cancel all"
       ) {
+        Logger.info(`[${requestId}] Cancelling flow for user`);
         await cancelFlow(formattedPhone, isAdmin);
         return;
       }
@@ -1671,11 +1642,13 @@ async function handleUserMessage(
       // ========================================
 
       if (currentState === "awaiting_ubrn_number") {
+        Logger.info(`[${requestId}] Processing UBRN input`);
         await handleUbrnInput(formattedPhone, userText);
         return;
       }
 
       if (currentState === "awaiting_instant_service_data") {
+        Logger.info(`[${requestId}] Processing instant service field input`);
         await handleInstantServiceFieldInput(formattedPhone, userText);
         return;
       }
@@ -1687,6 +1660,7 @@ async function handleUserMessage(
       if (currentState === "awaiting_trx_id") {
         const trxId = userText.trim().toUpperCase();
         if (trxId) {
+          Logger.info(`[${requestId}] Processing TRX ID`);
           await handleTrxIdInput(formattedPhone, trxId);
         } else {
           await sendTextMessage(
@@ -1701,6 +1675,7 @@ async function handleUserMessage(
         currentState === "awaiting_service_confirmation" &&
         userText === "confirm"
       ) {
+        Logger.info(`[${requestId}] Confirming service order`);
         await confirmServiceOrder(formattedPhone);
         return;
       }
@@ -1721,6 +1696,7 @@ async function handleUserMessage(
           "মেইন",
         ].includes(userText)
       ) {
+        Logger.info(`[${requestId}] Showing main menu`);
         await showMainMenu(formattedPhone, isAdmin);
         return;
       }
@@ -1728,6 +1704,7 @@ async function handleUserMessage(
       // Handle main commands (only if not in a flow)
       if (!currentState) {
         if (userText.includes("রিচার্জ") || userText === "recharge") {
+          Logger.info(`[${requestId}] Starting recharge flow`);
           await handleRechargeStart(formattedPhone);
           return;
         }
@@ -1737,6 +1714,7 @@ async function handleUserMessage(
           userText === "services" ||
           userText === "service"
         ) {
+          Logger.info(`[${requestId}] Showing regular services`);
           await showRegularServices(formattedPhone);
           return;
         }
@@ -1746,6 +1724,7 @@ async function handleUserMessage(
           userText === "instant" ||
           userText === "instantservice"
         ) {
+          Logger.info(`[${requestId}] Showing instant services`);
           await showInstantServices(formattedPhone);
           return;
         }
@@ -1755,6 +1734,7 @@ async function handleUserMessage(
           userText === "orders" ||
           userText === "order"
         ) {
+          Logger.info(`[${requestId}] Showing order history`);
           await showOrderHistory(formattedPhone);
           return;
         }
@@ -1764,6 +1744,7 @@ async function handleUserMessage(
           userText === "history" ||
           userText === "transactions"
         ) {
+          Logger.info(`[${requestId}] Showing transaction history`);
           await showTransactionHistory(formattedPhone);
           return;
         }
@@ -1773,6 +1754,7 @@ async function handleUserMessage(
           userText === "account" ||
           userText === "info"
         ) {
+          Logger.info(`[${requestId}] Showing account info`);
           await showAccountInfo(formattedPhone);
           return;
         }
@@ -1783,11 +1765,13 @@ async function handleUserMessage(
           userText === "support" ||
           userText === "help"
         ) {
+          Logger.info(`[${requestId}] Showing support info`);
           await showSupport(formattedPhone);
           return;
         }
 
         // Default response for unrecognized messages
+        Logger.info(`[${requestId}] Sending default welcome message`);
         await sendTextMessage(
           formattedPhone,
           "👋 নমস্কার! SignCopy তে আপনাকে স্বাগতম!\n\nআমাদের সার্ভিস সম্পর্কে জানতে 'Menu' লিখুন।\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন"
@@ -1795,13 +1779,14 @@ async function handleUserMessage(
         await showMainMenu(formattedPhone, isAdmin);
       } else {
         // If in a flow but received unrecognized command
+        Logger.warn(`[${requestId}] Unrecognized command in flow state`, { currentState, userText });
         await sendTextMessage(
           formattedPhone,
           "❌ এই কমান্ড এখন গ্রহণযোগ্য নয়।\n\n🚫 বাতিল করতে 'cancel' লিখুন\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
         );
       }
     } else if (message.type === "interactive") {
-      info(`[${requestId}] Interactive message received`, {
+      Logger.info(`[${requestId}] Interactive message received`, {
         interactiveType: message.interactive?.type,
       });
 
@@ -1809,7 +1794,7 @@ async function handleUserMessage(
         const selectedId = message.interactive?.list_reply?.id || "";
         const selectedTitle = message.interactive?.list_reply?.title || "";
 
-        info(`[${requestId}] List reply: "${selectedTitle}" (${selectedId})`);
+        Logger.info(`[${requestId}] List reply received`, { selectedId, selectedTitle });
 
         // Clear any existing state for list interactions (unless we're in a flow)
         if (
@@ -1827,25 +1812,32 @@ async function handleUserMessage(
         // Handle user menu options
         switch (selectedId) {
           case "user_recharge":
+            Logger.info(`[${requestId}] User selected recharge`);
             await handleRechargeStart(formattedPhone);
             break;
           case "user_services":
+            Logger.info(`[${requestId}] User selected regular services`);
             await showRegularServices(formattedPhone);
             break;
           case "user_instant":
+            Logger.info(`[${requestId}] User selected instant services`);
             await showInstantServices(formattedPhone);
             break;
           case "user_orders":
+            Logger.info(`[${requestId}] User selected order history`);
             await showOrderHistory(formattedPhone);
             break;
           case "user_history":
+            Logger.info(`[${requestId}] User selected transaction history`);
             await showTransactionHistory(formattedPhone);
             break;
           case "user_account":
+            Logger.info(`[${requestId}] User selected account info`);
             await showAccountInfo(formattedPhone);
             break;
           // Admin menu options (simplified)
           case "admin_services":
+            Logger.info(`[${requestId}] Admin selected service management`);
             await sendTextMessage(
               formattedPhone,
               "📦 *সার্ভিস ম্যানেজমেন্ট*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
@@ -1855,13 +1847,17 @@ async function handleUserMessage(
           // Service selection
           default:
             if (selectedId.startsWith("instant_")) {
+              Logger.info(`[${requestId}] User selected instant service`, { selectedId });
               await handleInstantServiceSelection(formattedPhone, selectedId);
             } else if (selectedId.startsWith("service_")) {
               const serviceId = selectedId.replace("service_", "");
+              Logger.info(`[${requestId}] User selected regular service`, { serviceId });
               await handleRegularServiceSelection(formattedPhone, serviceId);
             } else if (selectedId === "cancel_flow") {
+              Logger.info(`[${requestId}] User cancelled flow`);
               await cancelFlow(formattedPhone, isAdmin);
             } else {
+              Logger.warn(`[${requestId}] Unknown option selected`, { selectedId });
               await sendTextMessage(
                 formattedPhone,
                 "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন।"
@@ -1872,11 +1868,13 @@ async function handleUserMessage(
       } else if (message.interactive?.type === "button_reply") {
         const selectedId = message.interactive?.button_reply?.id || "";
 
-        info(`[${requestId}] Button reply: "${selectedId}"`);
+        Logger.info(`[${requestId}] Button reply received`, { selectedId });
 
         if (selectedId === "cancel_flow") {
+          Logger.info(`[${requestId}] User cancelled flow via button`);
           await cancelFlow(formattedPhone, isAdmin);
         } else {
+          Logger.warn(`[${requestId}] Unknown button selected`, { selectedId });
           await sendTextMessage(
             formattedPhone,
             "ℹ️ দয়া করে লিস্ট মেনু ব্যবহার করুন। 'Menu' লিখুন।"
@@ -1885,7 +1883,7 @@ async function handleUserMessage(
         }
       }
     } else {
-      info(`[${requestId}] Unhandled message type: ${message.type}`);
+      Logger.warn(`[${requestId}] Unhandled message type`, { type: message.type });
       await sendTextMessage(
         formattedPhone,
         "❌ এই ধরনের মেসেজ সমর্থিত নয়। দয়া করে টেক্সট মেসেজ পাঠান।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
@@ -1893,7 +1891,7 @@ async function handleUserMessage(
       await showMainMenu(formattedPhone, isAdmin);
     }
   } catch (handlerError) {
-    error(
+    Logger.error(
       `[${requestId}] Error handling message from ${formattedPhone}:`,
       handlerError
     );
@@ -1907,15 +1905,18 @@ async function handleUserMessage(
 }
 
 // --- Main Webhook Handler ---
-export async function POST(req: NextRequest) {
+export async function POST(req: NextRequest): Promise<NextResponse> {
   const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-  info(`[${requestId}] Webhook POST request received`);
+  Logger.info(`[${requestId}] Webhook POST request received`, {
+    url: req.url,
+    method: "POST",
+  });
 
   try {
     sessionMonitor.start();
 
     if (!CONFIG.accessToken || !CONFIG.phoneNumberId) {
-      error(`[${requestId}] Missing WhatsApp configuration`, {
+      Logger.error(`[${requestId}] Missing WhatsApp configuration`, {
         hasAccessToken: !!CONFIG.accessToken,
         hasPhoneNumberId: !!CONFIG.phoneNumberId,
       });
@@ -1923,7 +1924,7 @@ export async function POST(req: NextRequest) {
     }
 
     const body: WebhookBody = await req.json();
-    debug(`[${requestId}] Webhook body received`, {
+    Logger.debug(`[${requestId}] Webhook body received`, {
       object: body.object,
       entryCount: body.entry?.length || 0,
     });
@@ -1938,41 +1939,60 @@ export async function POST(req: NextRequest) {
         const from = message.from;
         const isAdmin = from === CONFIG.adminId;
 
-        handleUserMessage(from, message, isAdmin).catch((err) => {
-          error(`[${requestId}] Async message handling error:`, err);
+        Logger.info(`[${requestId}] Processing message from ${from}`, {
+          isAdmin,
+          messageId: message.id,
+          messageType: message.type,
         });
-      } else if (value?.statuses) {
-        debug(`[${requestId}] Status update received`, value.statuses);
-      }
 
-      info(`[${requestId}] Webhook processed successfully`);
-      return NextResponse.json({ status: "EVENT_RECEIVED" });
+        // Handle message asynchronously but don't wait for it
+        handleUserMessage(from, message, isAdmin).catch((err) => {
+          Logger.error(`[${requestId}] Async message handling error:`, err);
+        });
+
+        // Return immediate response to WhatsApp
+        Logger.info(`[${requestId}] Webhook processed successfully, returning 200 OK`);
+        return NextResponse.json({ status: "EVENT_RECEIVED" });
+      } else if (value?.statuses) {
+        Logger.debug(`[${requestId}] Status update received`, value.statuses);
+        return NextResponse.json({ status: "STATUS_RECEIVED" });
+      } else {
+        Logger.warn(`[${requestId}] No messages or statuses in webhook`);
+        return NextResponse.json({ status: "NO_MESSAGES" });
+      }
     } else {
-      warn(`[${requestId}] Invalid object type in webhook: ${body.object}`);
+      Logger.warn(`[${requestId}] Invalid object type in webhook`, { object: body.object });
       return new NextResponse("Not Found", { status: 404 });
     }
-  } catch (e) {
-    error(`[${requestId}] Webhook processing error:`, e);
+  } catch (e: unknown) {
+    Logger.error(`[${requestId}] Webhook processing error:`, {
+      error: e instanceof Error ? e.message : "Unknown error",
+      stack: e instanceof Error ? e.stack : undefined,
+    });
     return new NextResponse("Internal Server Error", { status: 500 });
   }
 }
 
-export async function GET(req: NextRequest) {
-  info("Webhook verification request received");
+export async function GET(req: NextRequest): Promise<NextResponse> {
+  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+  Logger.info(`[${requestId}] Webhook verification request received`, {
+    url: req.url,
+    method: "GET",
+  });
 
   const searchParams = req.nextUrl.searchParams;
   const mode = searchParams.get("hub.mode");
   const token = searchParams.get("hub.verify_token");
   const challenge = searchParams.get("hub.challenge");
 
-  debug("Webhook verification parameters", { mode, token, challenge });
+  Logger.debug(`[${requestId}] Webhook verification parameters`, { mode, token, challenge });
 
   if (mode && token) {
     if (mode === "subscribe" && token === CONFIG.verifyToken) {
-      info("WEBHOOK_VERIFIED successfully");
+      Logger.info(`[${requestId}] WEBHOOK_VERIFIED successfully`);
       return new NextResponse(challenge);
     } else {
-      warn("Webhook verification failed", {
+      Logger.warn(`[${requestId}] Webhook verification failed`, {
         mode,
         token,
         expectedToken: CONFIG.verifyToken,
@@ -1981,6 +2001,6 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  warn("Invalid verification request", { mode, token });
+  Logger.warn(`[${requestId}] Invalid verification request`, { mode, token });
   return new NextResponse("Method Not Allowed", { status: 405 });
 }
