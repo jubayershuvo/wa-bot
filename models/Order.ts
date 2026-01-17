@@ -6,6 +6,7 @@ export interface IOrder extends Document {
   serviceId: Types.ObjectId;
   totalPrice: number;
   serviceData: Record<string, string>;
+  serviceName?: string; // Virtual field for service name
   status:
     | "pending"
     | "processing"
@@ -30,6 +31,10 @@ const OrderSchema = new Schema(
       required: true,
       unique: true,
       default: () => `ORD-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`,
+      index: true,
+    },
+    serviceName: {
+      type: String,
       index: true,
     },
     userId: {
