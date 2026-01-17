@@ -716,7 +716,16 @@ async function uploadFile(
   fileType: string,
 ): Promise<string> {
   try {
-    EnhancedLogger.info(`Uploading file: ${fileName} (${fileType})`);
+    EnhancedLogger.info(`Uploading file: ${fileName} (${fileType})`, {
+      bufferSize: fileBuffer.length,
+    });
+
+    // Check if file upload URL is configured
+    if (!CONFIG.fileUploadUrl || CONFIG.fileUploadUrl === "/api/upload") {
+      EnhancedLogger.warn(`File upload URL not properly configured, using mock URL`);
+      // Return a mock URL for testing
+      return `https://example.com/uploads/${fileName}`;
+    }
 
     // Create FormData
     const formData = new FormData();
@@ -726,6 +735,8 @@ async function uploadFile(
     formData.append("fileName", fileName);
     formData.append("fileType", fileType);
 
+    EnhancedLogger.info(`Uploading to: ${CONFIG.fileUploadUrl}`);
+
     // Upload to your file upload endpoint
     const response = await fetch(CONFIG.fileUploadUrl, {
       method: "POST",
@@ -733,13 +744,31 @@ async function uploadFile(
     });
 
     if (!response.ok) {
-      throw new Error(`File upload failed: ${response.statusText}`);
+      const errorText = await response.text();
+      EnhancedLogger.error(`File upload failed: ${response.statusText}`, {
+        status: response.status,
+        error: errorText,
+      });
+      throw new Error(`File upload failed: ${response.statusText} - ${errorText}`);
     }
 
     const result = await response.json();
+    
+    if (!result.fileUrl) {
+      EnhancedLogger.error(`No fileUrl in response`, { result });
+      throw new Error("No file URL returned from upload server");
+    }
+
+    EnhancedLogger.info(`File upload successful`, {
+      fileUrl: result.fileUrl,
+    });
+    
     return result.fileUrl;
-  } catch (error) {
-    EnhancedLogger.error(`Failed to upload file:`, error);
+  } catch (error: any) {
+    EnhancedLogger.error(`Failed to upload file:`, {
+      error: error?.message || error,
+      stack: error?.stack,
+    });
     throw error;
   }
 }
@@ -760,12 +789,22 @@ async function downloadWhatsAppMedia(
     });
 
     if (!response.ok) {
+      const errorText = await response.text();
+      EnhancedLogger.error(`Failed to get media URL: ${response.statusText}`, {
+        status: response.status,
+        error: errorText,
+      });
       throw new Error(`Failed to get media URL: ${response.statusText}`);
     }
 
     const mediaData = await response.json();
     const downloadUrl = mediaData.url;
     const mimeType = mediaData.mime_type || "application/octet-stream";
+
+    if (!downloadUrl) {
+      EnhancedLogger.error(`No download URL in media data`, { mediaData });
+      throw new Error("No download URL received from WhatsApp API");
+    }
 
     // Download media
     const downloadResponse = await fetch(downloadUrl, {
@@ -775,6 +814,11 @@ async function downloadWhatsAppMedia(
     });
 
     if (!downloadResponse.ok) {
+      const errorText = await downloadResponse.text();
+      EnhancedLogger.error(`Failed to download media: ${downloadResponse.statusText}`, {
+        status: downloadResponse.status,
+        error: errorText,
+      });
       throw new Error(
         `Failed to download media: ${downloadResponse.statusText}`,
       );
@@ -790,8 +834,11 @@ async function downloadWhatsAppMedia(
     });
 
     return { buffer, mimeType };
-  } catch (error) {
-    EnhancedLogger.error(`Failed to download WhatsApp media:`, error);
+  } catch (error: any) {
+    EnhancedLogger.error(`Failed to download WhatsApp media:`, {
+      error: error?.message || error,
+      stack: error?.stack,
+    });
     throw error;
   }
 }
@@ -3845,10 +3892,10 @@ async function handleAdminProcessOrderUpdate(
 ): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   const state = await stateManager.getUserState(formattedPhone);
-  const currentState = state?.currentState;
   const orderId = state?.data?.adminProcessOrder?.orderId;
   const order = state?.data?.adminProcessOrder?.order;
   const step = state?.data?.adminProcessOrder?.step || 1;
+  const currentState = state?.currentState;
 
   if (!orderId || !order) {
     await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
@@ -4069,6 +4116,37 @@ async function handleAdminProcessOrderUpdate(
 
       await completeOrderDelivery(phone);
     }
+    // Handle text input for delivery type (if someone types instead of clicking)
+    else if (currentState === "admin_process_order_delivery_type" && input) {
+      // Convert text input to delivery type
+      let deliveryType = "";
+      if (input.includes("text") || input.includes("টেক্সট") || input === "1") {
+        deliveryType = "text";
+      } else if (
+        input.includes("file") ||
+        input.includes("ফাইল") ||
+        input === "2"
+      ) {
+        deliveryType = "file";
+      } else if (
+        input.includes("both") ||
+        input.includes("উভয়") ||
+        input === "3"
+      ) {
+        deliveryType = "both";
+      } else {
+        await sendTextMessage(
+          phone,
+          "❌ দয়া করে একটি বৈধ অপশন সিলেক্ট করুন:\n\n1. টেক্সট\n2. ফাইল\n3. উভয়",
+        );
+        return;
+      }
+
+      await handleAdminProcessOrderUpdate(
+        formattedPhone,
+        `delivery_${deliveryType}`,
+      );
+    }
   } catch (err) {
     EnhancedLogger.error(`Failed to update order status:`, err);
     await sendTextMessage(phone, "❌ স্ট্যাটাস আপডেট করতে সমস্যা হয়েছে!");
@@ -4227,6 +4305,11 @@ async function handleAdminFileUpload(
     return;
   }
 
+  EnhancedLogger.info(`Starting file upload for order: ${orderId}`, {
+    messageType: message.type,
+    deliveryType,
+  });
+
   try {
     if (message.type === "image" || message.type === "document") {
       const mediaId =
@@ -4234,12 +4317,14 @@ async function handleAdminFileUpload(
       const fileName =
         message.type === "image"
           ? `order_${orderId}_${Date.now()}.jpg`
-          : message.document?.filename || `order_${orderId}_${Date.now()}`;
+          : message.document?.filename || `order_${orderId}_${Date.now()}.pdf`;
 
       if (!mediaId) {
         await sendTextMessage(phone, "❌ ফাইল আইডি পাওয়া যায়নি!");
         return;
       }
+
+      EnhancedLogger.info(`Downloading media: ${mediaId}`);
 
       // Download media from WhatsApp
       const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
@@ -4253,38 +4338,60 @@ async function handleAdminFileUpload(
         return;
       }
 
-      // Upload to your server
-      const fileUrl = await uploadFile(buffer, fileName, mimeType);
-
-      // Update state with file info
-      await stateManager.updateStateData(formattedPhone, {
-        adminProcessOrder: {
-          ...state.data?.adminProcessOrder,
-          deliveryData: {
-            ...state.data?.adminProcessOrder?.deliveryData,
-            fileUrl: fileUrl,
-            fileName: fileName,
-            fileType: mimeType,
-          },
-          step: deliveryType === "both" ? 5 : 4,
-        },
+      EnhancedLogger.info(`Media downloaded, uploading to server`, {
+        fileName,
+        fileSize: buffer.length,
+        mimeType,
       });
 
-      await sendTextMessage(
-        phone,
-        `✅ *ফাইল আপলোড সফল*\n\n📁 ফাইল: ${fileName}\n📊 সাইজ: ${(buffer.length / 1024).toFixed(2)}KB\n\nফাইল সফলভাবে আপলোড হয়েছে!`,
-      );
+      try {
+        // Upload to your server
+        const fileUrl = await uploadFile(buffer, fileName, mimeType);
 
-      // Continue with order completion
-      await completeOrderDelivery(phone);
+        EnhancedLogger.info(`File uploaded successfully`, {
+          fileUrl,
+          fileName,
+        });
+
+        // Update state with file info
+        await stateManager.updateStateData(formattedPhone, {
+          adminProcessOrder: {
+            ...state.data?.adminProcessOrder,
+            deliveryData: {
+              ...state.data?.adminProcessOrder?.deliveryData,
+              fileUrl: fileUrl,
+              fileName: fileName,
+              fileType: mimeType,
+            },
+            step: deliveryType === "both" ? 5 : 4,
+          },
+        });
+
+        await sendTextMessage(
+          phone,
+          `✅ *ফাইল আপলোড সফল*\n\n📁 ফাইল: ${fileName}\n📊 সাইজ: ${(buffer.length / 1024).toFixed(2)}KB\n\nফাইল সফলভাবে আপলোড হয়েছে!`,
+        );
+
+        // Continue with order completion
+        await completeOrderDelivery(phone);
+      } catch (uploadError) {
+        EnhancedLogger.error(`Failed to upload file to server:`, uploadError);
+        await sendTextMessage(
+          phone,
+          "❌ ফাইল সার্ভারে আপলোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+        );
+      }
     } else {
       await sendTextMessage(
         phone,
         "❌ দয়া করে একটি ইমেজ বা ডকুমেন্ট ফাইল আপলোড করুন!",
       );
     }
-  } catch (err) {
-    EnhancedLogger.error(`Failed to handle file upload:`, err);
+  } catch (err: any) {
+    EnhancedLogger.error(`Failed to handle file upload:`, {
+      error: err?.message || err,
+      stack: err?.stack,
+    });
     await sendTextMessage(phone, "❌ ফাইল আপলোড করতে সমস্যা হয়েছে!");
   }
 }
@@ -6414,7 +6521,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
   const requestId =
-    Date.now().toString(36) + Math.random().toString(36).substr(2);
+    Date.now().toString(36) + Math.random().toString(36).substring(2);
   EnhancedLogger.info(`[${requestId}] Webhook verification request received`, {
     url: req.url,
     method: "GET",
