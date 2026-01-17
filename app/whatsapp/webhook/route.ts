@@ -4473,7 +4473,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
       // Step 2: Send file if available
       if (deliveryData?.fileUrl && deliveryData?.fileName && deliveryData?.fileType) {
         // Check if URL is accessible before trying to send
-        const publicUrl = deliveryData.fileUrl;
+        const publicUrl = `${process.env.NEXT_PUBLIC_URL}/file/${orderId}`;
         const isAccessible = await isUrlAccessible(publicUrl);
         
         if (isAccessible) {
