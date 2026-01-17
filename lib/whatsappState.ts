@@ -5,7 +5,7 @@ import Redis from "ioredis";
 export interface UserState {
   phone: string;
   currentState: string;
-  data: Record<string, unknown>;
+  data: Record<string, any>;
   expiresAt: number;
   createdAt: number;
   lastActivity: number;

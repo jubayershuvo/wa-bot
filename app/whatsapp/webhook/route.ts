@@ -12,26 +12,52 @@ import axios from "axios";
 const LOG_CONFIG = {
   debug: process.env.NODE_ENV === "development",
   logLevel: process.env.LOG_LEVEL || "INFO",
+  maxLogSize: 10000, // Max characters per log entry
 };
 
-class Logger {
+class EnhancedLogger {
+  private static truncateData(data: any): any {
+    if (typeof data === "string" && data.length > LOG_CONFIG.maxLogSize) {
+      return data.substring(0, LOG_CONFIG.maxLogSize) + "... [TRUNCATED]";
+    }
+    if (typeof data === "object" && data !== null) {
+      const str = JSON.stringify(data);
+      if (str.length > LOG_CONFIG.maxLogSize) {
+        return {
+          _truncated: true,
+          message: "Data too large, truncated for logging",
+          originalLength: str.length,
+        };
+      }
+    }
+    return data;
+  }
+
   private static getTimestamp(): string {
     return new Date().toISOString();
   }
 
-  private static formatMessage(level: string, message: string, data?: unknown): string {
+  private static formatMessage(
+    level: string,
+    message: string,
+    data?: unknown,
+  ): string {
     const timestamp = this.getTimestamp();
     const formattedMessage = `[${timestamp}] [${level}] [WHATSAPP-WEBHOOK] ${message}`;
-    
+
     if (data) {
       try {
-        const dataStr = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+        const truncatedData = this.truncateData(data);
+        const dataStr =
+          typeof truncatedData === "string"
+            ? truncatedData
+            : JSON.stringify(truncatedData, null, 2);
         return `${formattedMessage}\n${dataStr}`;
       } catch {
-        return `${formattedMessage}\n${data}`;
+        return `${formattedMessage}\n[Non-serializable data]`;
       }
     }
-    
+
     return formattedMessage;
   }
 
@@ -53,12 +79,17 @@ class Logger {
     console.error(this.formatMessage("ERROR", message, data));
   }
 
-  static logRequest(phone: string, message: WhatsAppMessage, requestId: string) {
+  static logRequest(
+    phone: string,
+    message: WhatsAppMessage,
+    requestId: string,
+  ) {
     this.info(`[${requestId}] Message received from ${phone}`, {
       type: message.type,
       messageId: message.id,
       text: message.text?.body?.substring(0, 100),
       interactiveType: message.interactive?.type,
+      timestamp: message.timestamp,
     });
   }
 
@@ -66,6 +97,28 @@ class Logger {
     this.debug(`[${requestId}] Response sent to ${phone}`, {
       messageId: response?.messages?.[0]?.id,
       success: true,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  static logStateChange(
+    phone: string,
+    oldState: string,
+    newState: string,
+    data?: any,
+  ) {
+    this.debug(`State change for ${phone}`, {
+      oldState,
+      newState,
+      data: this.truncateData(data),
+    });
+  }
+
+  static logFlowCompletion(phone: string, flowType: string, result: any) {
+    this.info(`Flow completed for ${phone}`, {
+      flowType,
+      result: this.truncateData(result),
+      timestamp: new Date().toISOString(),
     });
   }
 }
@@ -82,10 +135,86 @@ const CONFIG = {
   supportNumber: process.env.SUPPORT_NUMBER || "+8801XXXXXXXXX",
   supportTelegram: process.env.SUPPORT_TELEGRAM || "t.me/signcopy",
   ubrnApiUrl: process.env.UBRN_API_URL || "https://17.fortest.top/api/search",
-  ubrnServicePrice: 10, // 10 Taka for UBRN verification
+  ubrnServicePrice: 10,
   fileUploadUrl: process.env.FILE_UPLOAD_URL || "/api/upload",
-  maxFileSize: 10 * 1024 * 1024, // 10MB
+  maxFileSize: 10 * 1024 * 1024,
+  maxBroadcastUsers: 100, // Limit broadcast to prevent rate limiting
+  sessionTimeout: 30 * 60 * 1000, // 30 minutes session timeout
+  retryAttempts: 3,
+  retryDelay: 1000,
 };
+
+// --- Instant Services Configuration ---
+const INSTANT_SERVICES = [
+  {
+    id: "instant_ubrn_verification",
+    name: "🔍 DOB Search",
+    description: "UBRN নাম্বার দিয়ে তথ্য যাচাই করুন",
+    price: 10,
+    isActive: true,
+    requiresInput: true,
+    inputPrompt: "UBRN নম্বরটি পাঠান:",
+    inputExample: "19862692537094068",
+  },
+];
+
+// --- Rate Limiter ---
+class RateLimiter {
+  private requests: Map<string, { count: number; resetTime: number }> =
+    new Map();
+  private readonly limit: number;
+  private readonly windowMs: number;
+
+  constructor(limit: number = 5, windowMs: number = 60000) {
+    this.limit = limit;
+    this.windowMs = windowMs;
+  }
+
+  isAllowed(phone: string): boolean {
+    const now = Date.now();
+    const userRequests = this.requests.get(phone);
+
+    if (!userRequests) {
+      this.requests.set(phone, { count: 1, resetTime: now + this.windowMs });
+      return true;
+    }
+
+    if (now > userRequests.resetTime) {
+      userRequests.count = 1;
+      userRequests.resetTime = now + this.windowMs;
+      return true;
+    }
+
+    if (userRequests.count >= this.limit) {
+      return false;
+    }
+
+    userRequests.count++;
+    return true;
+  }
+
+  getRemaining(phone: string): number {
+    const userRequests = this.requests.get(phone);
+    if (!userRequests) return this.limit;
+    return Math.max(0, this.limit - userRequests.count);
+  }
+
+  getResetTime(phone: string): number {
+    const userRequests = this.requests.get(phone);
+    return userRequests?.resetTime || Date.now() + this.windowMs;
+  }
+
+  clearExpired(): void {
+    const now = Date.now();
+    for (const [phone, data] of this.requests.entries()) {
+      if (now > data.resetTime) {
+        this.requests.delete(phone);
+      }
+    }
+  }
+}
+
+const rateLimiter = new RateLimiter(10, 60000); // 10 requests per minute
 
 // --- TypeScript Interfaces ---
 interface WhatsAppMessage {
@@ -113,11 +242,28 @@ interface WhatsAppMessage {
 interface WebhookBody {
   object: string;
   entry: Array<{
+    id: string;
+    time: number;
     changes: Array<{
       value: {
+        messaging_product: string;
+        metadata: {
+          display_phone_number: string;
+          phone_number_id: string;
+        };
+        contacts?: Array<{
+          profile: { name: string };
+          wa_id: string;
+        }>;
         messages?: WhatsAppMessage[];
-        statuses?: string[];
+        statuses?: Array<{
+          id: string;
+          status: string;
+          timestamp: string;
+          recipient_id: string;
+        }>;
       };
+      field: string;
     }>;
   }>;
 }
@@ -126,6 +272,7 @@ interface WebhookBody {
 interface RechargeStateData {
   trxId?: string;
   amount?: number;
+  attempts: number;
 }
 
 interface ServiceOrderStateData {
@@ -134,6 +281,7 @@ interface ServiceOrderStateData {
   serviceName?: string;
   fieldIndex?: number;
   collectedData?: Record<string, any>;
+  attempts: number;
 }
 
 interface UbrnStateData {
@@ -149,21 +297,25 @@ interface AdminAddServiceStateData {
     price?: number;
     instructions?: string;
     requiredFields?: ServiceField[];
-    isInstant?: boolean;
+    isActive?: boolean;
   };
+  currentField?: Partial<ServiceField>;
+  fieldStep?: number;
 }
 
 interface AdminEditServiceStateData {
   serviceId?: string;
   serviceData?: Partial<IService>;
   editOption?: string;
-  newField?: Partial<ServiceField>;
-  fieldsAction?: string;
-  fields?: ServiceField[];
-  fieldIndex?: number;
+  step?: number;
 }
 
 interface AdminDeleteServiceStateData {
+  serviceId?: string;
+  serviceName?: string;
+}
+
+interface AdminToggleServiceStateData {
   serviceId?: string;
   serviceName?: string;
 }
@@ -172,17 +324,32 @@ interface AdminProcessOrderStateData {
   orderId?: string;
   order?: any;
   step?: number;
-  fileType?: string;
-  fileId?: string;
-  fileName?: string;
+}
+
+interface AdminAddBalanceStateData {
+  phone?: string;
+  amount?: number;
+  reason?: string;
+  step?: number;
+}
+
+interface AdminBanUserStateData {
+  phone?: string;
+  userId?: string;
+  reason?: string;
+  step?: number;
+}
+
+interface AdminBroadcastStateData {
+  message?: string;
+  userType?: string;
+  step?: number;
 }
 
 interface AdminFileDeliveryStateData {
   orderId?: string;
+  step?: number;
   fileType?: string;
-  fileId?: string;
-  fileName?: string;
-  caption?: string;
 }
 
 interface UserStateData {
@@ -192,9 +359,14 @@ interface UserStateData {
   adminAddService?: AdminAddServiceStateData;
   adminEditService?: AdminEditServiceStateData;
   adminDeleteService?: AdminDeleteServiceStateData;
+  adminToggleService?: AdminToggleServiceStateData;
   adminProcessOrder?: AdminProcessOrderStateData;
+  adminAddBalance?: AdminAddBalanceStateData;
+  adminBanUser?: AdminBanUserStateData;
+  adminBroadcast?: AdminBroadcastStateData;
   adminFileDelivery?: AdminFileDeliveryStateData;
-  [key: string]: unknown;
+  lastActivity: number;
+  sessionId: string;
 }
 
 // --- WhatsApp API Helper Functions ---
@@ -228,52 +400,92 @@ function formatPhoneNumber(phone: string): string {
   return cleaned;
 }
 
-async function callWhatsAppApi(endpoint: string, payload: object): Promise<any> {
+async function callWhatsAppApi(
+  endpoint: string,
+  payload: object,
+  retries: number = CONFIG.retryAttempts,
+): Promise<any> {
   const url = `${CONFIG.baseUrl}/${CONFIG.apiVersion}/${CONFIG.phoneNumberId}/${endpoint}`;
-  Logger.debug(`Calling WhatsApp API: ${endpoint}`, {
-    url,
-    payloadSize: JSON.stringify(payload).length,
-  });
 
-  try {
-    const startTime = Date.now();
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${CONFIG.accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      EnhancedLogger.debug(
+        `Calling WhatsApp API (attempt ${attempt}/${retries}): ${endpoint}`,
+        {
+          url,
+          payloadSize: JSON.stringify(payload).length,
+        },
+      );
 
-    const responseTime = Date.now() - startTime;
-    const result = await response.json();
-
-    if (!response.ok) {
-      Logger.error(`WhatsApp API error for ${endpoint}`, {
-        status: response.status,
-        statusText: response.statusText,
-        error: result,
-        responseTime: `${responseTime}ms`,
+      const startTime = Date.now();
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${CONFIG.accessToken}`,
+          "Content-Type": "application/json",
+          "User-Agent": "SignCopy-Bot/1.0",
+        },
+        body: JSON.stringify(payload),
       });
-      throw new Error(`WhatsApp API error: ${response.status} ${response.statusText}`);
-    } else {
-      Logger.debug(`WhatsApp API success for ${endpoint}`, {
+
+      const responseTime = Date.now() - startTime;
+      const result = await response.json();
+
+      if (!response.ok) {
+        EnhancedLogger.error(
+          `WhatsApp API error for ${endpoint} (attempt ${attempt})`,
+          {
+            status: response.status,
+            statusText: response.statusText,
+            error: result,
+            responseTime: `${responseTime}ms`,
+          },
+        );
+
+        if (
+          attempt < retries &&
+          (response.status === 429 || response.status >= 500)
+        ) {
+          const delay = CONFIG.retryDelay * Math.pow(2, attempt - 1);
+          EnhancedLogger.debug(`Retrying in ${delay}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+
+        throw new Error(
+          `WhatsApp API error: ${response.status} ${response.statusText} - ${JSON.stringify(result)}`,
+        );
+      }
+
+      EnhancedLogger.debug(`WhatsApp API success for ${endpoint}`, {
         messageId: result?.messages?.[0]?.id,
         responseTime: `${responseTime}ms`,
       });
-    }
 
-    return result;
-  } catch (apiError) {
-    Logger.error(`Network error calling ${endpoint}:`, apiError);
-    throw apiError;
+      return result;
+    } catch (apiError) {
+      EnhancedLogger.error(
+        `Network error calling ${endpoint} (attempt ${attempt}):`,
+        apiError,
+      );
+
+      if (attempt < retries) {
+        const delay = CONFIG.retryDelay * Math.pow(2, attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+
+      throw apiError;
+    }
   }
 }
 
 async function sendTextMessage(to: string, text: string): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
-  Logger.info(`Sending text message to ${formattedTo}`, { textLength: text.length });
+  EnhancedLogger.info(`Sending text message to ${formattedTo}`, {
+    textLength: text.length,
+    textPreview: text.substring(0, 100),
+  });
 
   const payload = {
     messaging_product: "whatsapp",
@@ -281,19 +493,19 @@ async function sendTextMessage(to: string, text: string): Promise<any> {
     to: formattedTo,
     type: "text",
     text: {
-      preview_url: false,
+      preview_url: text.includes("http") ? true : false,
       body: text,
     },
   };
 
   try {
     const result = await callWhatsAppApi("messages", payload);
-    Logger.debug(`Text message sent to ${formattedTo}`, {
+    EnhancedLogger.debug(`Text message sent to ${formattedTo}`, {
       messageId: result?.messages?.[0]?.id,
     });
     return result;
   } catch (err) {
-    Logger.error(`Failed to send text message to ${formattedTo}:`, err);
+    EnhancedLogger.error(`Failed to send text message to ${formattedTo}:`, err);
     throw err;
   }
 }
@@ -302,10 +514,10 @@ async function sendButtonMenu(
   to: string,
   headerText: string,
   bodyText: string,
-  buttons: Array<{ id: string; title: string }>
+  buttons: Array<{ id: string; title: string }>,
 ): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
-  Logger.info(`Sending button menu to ${formattedTo}`, {
+  EnhancedLogger.info(`Sending button menu to ${formattedTo}`, {
     header: headerText,
     buttons: buttons.length,
   });
@@ -340,30 +552,36 @@ async function sendButtonMenu(
 
   try {
     const result = await callWhatsAppApi("messages", payload);
-    Logger.debug(`Button menu sent to ${formattedTo}`, {
+    EnhancedLogger.debug(`Button menu sent to ${formattedTo}`, {
       messageId: result?.messages?.[0]?.id,
     });
     return result;
   } catch (err) {
-    Logger.error(`Failed to send button menu to ${formattedTo}:`, err);
+    EnhancedLogger.error(`Failed to send button menu to ${formattedTo}:`, err);
     throw err;
   }
 }
 
-async function sendTextWithCancelButton(to: string, text: string): Promise<void> {
+async function sendTextWithCancelButton(
+  to: string,
+  text: string,
+  customCancelText?: string,
+): Promise<void> {
   const formattedTo = formatPhoneNumber(to);
-  Logger.info(`Sending text with cancel button to ${formattedTo}`);
+  EnhancedLogger.info(`Sending text with cancel button to ${formattedTo}`);
 
   try {
     await sendButtonMenu(formattedTo, "Action Required", text, [
-      { id: "cancel_flow", title: "❌ বাতিল করুন" },
+      { id: "cancel_flow", title: customCancelText || "❌ বাতিল করুন" },
     ]);
   } catch (err) {
-    Logger.error(`Failed to send text with cancel button to ${formattedTo}:`, err);
-    // Fallback to regular text message
+    EnhancedLogger.error(
+      `Failed to send text with cancel button to ${formattedTo}:`,
+      err,
+    );
     await sendTextMessage(
       formattedTo,
-      `${text}\n\n🚫 বাতিল করতে 'cancel' লিখুন।`
+      `${text}\n\n🚫 বাতিল করতে 'cancel' লিখুন।`,
     );
   }
 }
@@ -374,10 +592,13 @@ async function sendListMenu(
   body: string,
   rows: Array<{ id: string; title: string; description?: string }>,
   sectionTitle: string,
-  buttonText: string = "অপশন দেখুন"
+  buttonText: string = "অপশন দেখুন",
 ): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
-  Logger.info(`Sending list menu to ${formattedTo}`, { header, rows: rows.length });
+  EnhancedLogger.info(`Sending list menu to ${formattedTo}`, {
+    header,
+    rows: rows.length,
+  });
 
   const validatedRows = rows.slice(0, 10).map((row) => ({
     id: row.id.substring(0, 200),
@@ -416,13 +637,12 @@ async function sendListMenu(
 
   try {
     const result = await callWhatsAppApi("messages", payload);
-    Logger.debug(`List menu sent to ${formattedTo}`, {
+    EnhancedLogger.debug(`List menu sent to ${formattedTo}`, {
       messageId: result?.messages?.[0]?.id,
     });
     return result;
   } catch (err) {
-    Logger.error(`Failed to send list menu to ${formattedTo}:`, err);
-    // Fallback to text menu
+    EnhancedLogger.error(`Failed to send list menu to ${formattedTo}:`, err);
     let textMenu = `${header}\n\n${body}\n\n`;
     rows.forEach((row, index) => {
       textMenu += `${index + 1}. ${row.title}\n`;
@@ -433,59 +653,186 @@ async function sendListMenu(
   }
 }
 
+async function sendQuickReplyMenu(
+  to: string,
+  text: string,
+  replies: Array<{ id: string; title: string }>,
+): Promise<any> {
+  const formattedTo = formatPhoneNumber(to);
+  EnhancedLogger.info(`Sending quick reply menu to ${formattedTo}`, {
+    replies: replies.length,
+  });
+
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: formattedTo,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: {
+        text: text.substring(0, 1024),
+      },
+      action: {
+        buttons: replies.slice(0, 3).map((reply) => ({
+          type: "reply" as const,
+          reply: {
+            id: reply.id.substring(0, 256),
+            title: reply.title.substring(0, 20),
+          },
+        })),
+      },
+    },
+  };
+
+  try {
+    const result = await callWhatsAppApi("messages", payload);
+    EnhancedLogger.debug(`Quick reply menu sent to ${formattedTo}`, {
+      messageId: result?.messages?.[0]?.id,
+    });
+    return result;
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to send quick reply menu to ${formattedTo}:`,
+      err,
+    );
+    throw err;
+  }
+}
+
 // --- User Management ---
 async function getOrCreateUser(phone: string, name?: string): Promise<IUser> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Getting/creating user for ${formattedPhone}`);
+  EnhancedLogger.info(`Getting/creating user for ${formattedPhone}`);
 
   try {
     await connectDB();
 
     let user = await User.findOne({ whatsapp: formattedPhone });
     if (!user) {
-      Logger.info(`Creating new user for ${formattedPhone}`);
+      EnhancedLogger.info(`Creating new user for ${formattedPhone}`);
       user = new User({
         name: name || "User",
         whatsapp: formattedPhone,
         whatsappLastActive: new Date(),
         whatsappMessageCount: 1,
         balance: 0,
+        isBanned: false,
         createdAt: new Date(),
       });
       await user.save();
-      Logger.info(`Created new user with ID: ${user._id}`);
+      EnhancedLogger.info(`Created new user with ID: ${user._id}`);
+
+      // Notify admin about new user
+      await notifyAdmin(
+        `👤 নতুন ব্যবহারকারী যুক্ত হয়েছে\n\nনাম: ${user.name}\nফোন: ${formattedPhone}\nআইডি: ${user._id}`,
+      );
     } else {
-      Logger.debug(`Found existing user: ${user._id}`);
+      if (user.isBanned) {
+        EnhancedLogger.warn(`Banned user tried to access: ${formattedPhone}`);
+        throw new Error("User is banned");
+      }
+      EnhancedLogger.debug(`Found existing user: ${user._id}`);
       user.whatsappLastActive = new Date();
       user.whatsappMessageCount += 1;
+      user.name = name || user.name;
       await user.save();
     }
 
     return user;
   } catch (err) {
-    Logger.error(`Error in getOrCreateUser for ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Error in getOrCreateUser for ${formattedPhone}:`,
+      err,
+    );
     throw err;
   }
 }
 
 async function notifyAdmin(message: string): Promise<void> {
-  if (CONFIG.adminId) {
-    Logger.info(`Sending admin notification to ${CONFIG.adminId}`);
-    try {
-      await sendTextMessage(
-        CONFIG.adminId,
-        `🔔 *ADMIN NOTIFICATION*\n\n${message}`
-      );
-    } catch (err) {
-      Logger.error(`Failed to send admin notification:`, err);
-    }
+  if (!CONFIG.adminId) {
+    EnhancedLogger.warn(`Admin ID not configured, skipping notification`);
+    return;
   }
+
+  EnhancedLogger.info(`Sending admin notification to ${CONFIG.adminId}`, {
+    messageLength: message.length,
+  });
+
+  try {
+    await sendTextMessage(
+      CONFIG.adminId,
+      `🔔 *ADMIN NOTIFICATION*\n\n${message}\n\n📅 ${new Date().toLocaleString()}`,
+    );
+    EnhancedLogger.debug(`Admin notification sent successfully`);
+  } catch (err) {
+    EnhancedLogger.error(`Failed to send admin notification:`, err);
+  }
+}
+
+// --- Session Management ---
+async function validateSession(phone: string): Promise<boolean> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+
+  if (!state) {
+    return true; // No state means new session
+  }
+
+  const lastActivity = (state.data?.lastActivity as number) || 0;
+  const currentTime = Date.now();
+  const sessionAge = currentTime - lastActivity;
+
+  if (sessionAge > CONFIG.sessionTimeout) {
+    EnhancedLogger.info(`Session expired for ${formattedPhone}`, {
+      sessionAge: `${Math.round(sessionAge / 1000)}s`,
+      timeout: `${CONFIG.sessionTimeout / 1000}s`,
+    });
+    await stateManager.clearUserState(formattedPhone);
+    return false;
+  }
+
+  // Update last activity
+  await stateManager.updateStateData(formattedPhone, {
+    lastActivity: currentTime,
+  });
+
+  return true;
+}
+
+// --- Rate Limit Check ---
+async function checkRateLimit(
+  phone: string,
+): Promise<{ allowed: boolean; message?: string }> {
+  const formattedPhone = formatPhoneNumber(phone);
+
+  // Clear expired entries periodically
+  if (Math.random() < 0.1) {
+    // 10% chance to clean up
+    rateLimiter.clearExpired();
+  }
+
+  if (!rateLimiter.isAllowed(formattedPhone)) {
+    const remainingTime = Math.ceil(
+      (rateLimiter.getResetTime(formattedPhone) - Date.now()) / 1000,
+    );
+    const message = `⏳ *রেট লিমিট* \n\nআপনি অনেক দ্রুত রিকোয়েস্ট করছেন। দয়া করে ${remainingTime} সেকেন্ড পরে আবার চেষ্টা করুন।`;
+
+    EnhancedLogger.warn(`Rate limit exceeded for ${formattedPhone}`, {
+      remaining: rateLimiter.getRemaining(formattedPhone),
+      resetIn: `${remainingTime}s`,
+    });
+
+    return { allowed: false, message };
+  }
+
+  return { allowed: true };
 }
 
 // --- Main Menu Handler ---
 async function showMainMenu(phone: string, isAdmin: boolean): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Showing main menu to ${formattedPhone}`, { isAdmin });
+  EnhancedLogger.info(`Showing main menu to ${formattedPhone}`, { isAdmin });
 
   try {
     await stateManager.clearUserState(formattedPhone);
@@ -496,7 +843,7 @@ async function showMainMenu(phone: string, isAdmin: boolean): Promise<void> {
       await showUserMainMenu(formattedPhone);
     }
   } catch (err) {
-    Logger.error(`Failed to show main menu to ${formattedPhone}:`, err);
+    EnhancedLogger.error(`Failed to show main menu to ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
       `🏠 *SignCopy Main Menu*\n\n` +
@@ -507,7 +854,8 @@ async function showMainMenu(phone: string, isAdmin: boolean): Promise<void> {
         `5. 📜 ট্রান্সাকশন হিস্টরি - 'হিস্টরি' লিখুন\n` +
         `6. 👤 অ্যাকাউন্ট তথ্য - 'অ্যাকাউন্ট' লিখুন\n` +
         `7. 🎧 সাপোর্ট / হেল্প - 'সাপোর্ট' লিখুন\n\n` +
-        `অথবা 'Menu' লিখুন পুনরায় মেনু দেখার জন্য।`
+        `🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন\n` +
+        `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
     );
   }
 }
@@ -517,17 +865,17 @@ async function showAdminMainMenu(phone: string): Promise<void> {
     {
       id: "admin_services",
       title: "📦 সার্ভিস ম্যানেজমেন্ট",
-      description: "সার্ভিস এডিট/এড/রিমুভ",
+      description: "সার্ভিস এডিট/এড/রিমুভ/টগল",
     },
     {
       id: "admin_orders",
       title: "📋 অর্ডার ম্যানেজমেন্ট",
-      description: "অর্ডার ভিউ ও প্রসেস",
+      description: "অর্ডার ভিউ, প্রসেস ও ডেলিভারি",
     },
     {
-      id: "admin_deliveries",
-      title: "📤 ডেলিভারি ম্যানেজমেন্ট",
-      description: "ফাইল/টেক্সট ডেলিভারি",
+      id: "admin_users",
+      title: "👥 ইউজার ম্যানেজমেন্ট",
+      description: "ইউজার তালিকা, ব্যালেন্স ও ব্যান",
     },
     {
       id: "admin_broadcast",
@@ -540,19 +888,19 @@ async function showAdminMainMenu(phone: string): Promise<void> {
       description: "সিস্টেম তথ্য ও রিপোর্ট",
     },
     {
-      id: "admin_users",
-      title: "👥 ইউজার ম্যানেজমেন্ট",
-      description: "ইউজার তালিকা ও ম্যানেজ",
+      id: "admin_settings",
+      title: "⚙️ সিস্টেম সেটিংস",
+      description: "সিস্টেম কনফিগারেশন",
     },
   ];
 
   await sendListMenu(
     phone,
     "⚙️ অ্যাডমিন প্যানেল",
-    "অ্যাডমিন অপশনগুলো থেকে সিলেক্ট করুন:",
+    "অ্যাডমিন অপশনগুলো থেকে সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
     adminMenuRows,
     "অ্যাডমিন মেনু",
-    "অ্যাডমিন অপশন"
+    "অ্যাডমিন অপশন",
   );
 }
 
@@ -588,60 +936,78 @@ async function showUserMainMenu(phone: string): Promise<void> {
       title: "👤 আমার অ্যাকাউন্ট",
       description: "আপনার অ্যাকাউন্টের তথ্য ও ডিটেইলস",
     },
+    {
+      id: "user_support",
+      title: "🎧 সাপোর্ট / হেল্প",
+      description: "সাপোর্ট টিমের সাথে যোগাযোগ",
+    },
   ];
 
   await sendListMenu(
     phone,
     "🏠 SignCopy - Main Menu",
-    "আপনার প্রয়োজন অনুযায়ী নিচের অপশন সিলেক্ট করুন:",
+    "আপনার প্রয়োজন অনুযায়ী নিচের অপশন সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
     userMenuRows,
     "মেনু অপশনসমূহ",
-    "মেনু দেখুন"
+    "মেনু দেখুন",
   );
 }
 
 // --- Cancel Flow Handler ---
-async function cancelFlow(phone: string, isAdmin: boolean = false): Promise<void> {
+async function cancelFlow(
+  phone: string,
+  isAdmin: boolean = false,
+): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Canceling flow for ${formattedPhone}`);
+  EnhancedLogger.info(`Canceling flow for ${formattedPhone}`);
 
   try {
     await stateManager.clearUserState(formattedPhone);
     await sendTextMessage(formattedPhone, "🚫 অপারেশন বাতিল করা হয়েছে।");
     await showMainMenu(formattedPhone, isAdmin);
+    EnhancedLogger.logFlowCompletion(formattedPhone, "cancel", { isAdmin });
   } catch (err) {
-    Logger.error(`Failed to cancel flow for ${formattedPhone}:`, err);
+    EnhancedLogger.error(`Failed to cancel flow for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
-      "❌ বাতিল করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ বাতিল করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
   }
 }
 
+// ================= USER FEATURES =================
+
 // --- Recharge Flow ---
 async function handleRechargeStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Starting recharge flow for ${formattedPhone}`);
+  EnhancedLogger.info(`Starting recharge flow for ${formattedPhone}`);
 
   try {
     await stateManager.setUserState(formattedPhone, {
       currentState: "awaiting_trx_id",
       flowType: "recharge",
+      data: {
+        recharge: {
+          attempts: 0,
+        },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
     });
 
-    const message = `💳 *রিচার্জ করুন*\n\n📱 আমাদের বিকাশ নম্বর: *${CONFIG.bkashNumber}*\n\nবিকাশে পেমেন্ট করার পর *Transaction ID* পাঠান:\n\`TRX_ID\`\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন:`;
+    const message = `💳 *রিচার্জ করুন*\n\n📱 আমাদের বিকাশ নম্বর: *${CONFIG.bkashNumber}*\n\nবিকাশে পেমেন্ট করার পর *Transaction ID* পাঠান:\n\n\`TRX_ID\`\n\n📌 নোট:\n• ট্রান্সাকশন আইডি পেতে বিকাশ অ্যাপ চেক করুন\n• পেমেন্ট যাচাই করতে ১-২ মিনিট সময় লাগতে পারে\n• সমস্যা হলে সাপোর্টে যোগাযোগ করুন\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন:`;
 
     await sendTextWithCancelButton(formattedPhone, message);
-    Logger.info(`Recharge instructions sent to ${formattedPhone}`);
+    EnhancedLogger.info(`Recharge instructions sent to ${formattedPhone}`);
   } catch (err) {
-    Logger.error(`Failed to start recharge flow for ${phone}:`, err);
+    EnhancedLogger.error(`Failed to start recharge flow for ${phone}:`, err);
     throw err;
   }
 }
 
 async function handleTrxIdInput(phone: string, trxId: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Processing TRX ID for ${formattedPhone}`, { trxId });
+  EnhancedLogger.info(`Processing TRX ID for ${formattedPhone}`, { trxId });
 
   try {
     await stateManager.updateStateData(formattedPhone, {
@@ -651,14 +1017,19 @@ async function handleTrxIdInput(phone: string, trxId: string): Promise<void> {
       },
     });
 
+    await sendTextMessage(
+      formattedPhone,
+      `⏳ *পেমেন্ট যাচাই করা হচ্ছে...*\n\nটিআরএক্স আইডি: ${trxId}/3\n\nদয়া করে অপেক্ষা করুন...`,
+    );
+
     const payment = await fetch(
-      `https://api.bdx.kg/bkash/submit.php?trxid=${trxId}`
+      `https://api.bdx.kg/bkash/submit.php?trxid=${trxId}`,
     );
 
     if (!payment.ok) {
       await sendTextMessage(
         formattedPhone,
-        "❌ রিচার্জ যাচাই করতে ব্যর্থ। দয়া পরে চেষ্টা করুন।"
+        "❌ রিচার্জ যাচাই করতে ব্যর্থ। দয়া পরে চেষ্টা করুন অথবা সাপোর্টে যোগাযোগ করুন।",
       );
       await showMainMenu(formattedPhone, false);
       return;
@@ -668,25 +1039,24 @@ async function handleTrxIdInput(phone: string, trxId: string): Promise<void> {
     if (paymentData.error) {
       await sendTextMessage(
         formattedPhone,
-        `❌ রিচার্জ যাচাই করতে ব্যর্থ: ${paymentData.error}`
+        `❌ রিচার্জ যাচাই করতে ব্যর্থ: ${paymentData.error}\n\nদয়া করে সঠিক ট্রান্সাকশন আইডি দিন।`,
       );
-      await showMainMenu(formattedPhone, false);
       return;
     }
 
     if (!paymentData.amount || !paymentData.payerAccount) {
       await sendTextMessage(
         formattedPhone,
-        "❌ অবৈধ ট্রান্সাকশন আইডি বা পরিমাণ। দয়া করে সঠিক তথ্য প্রদান করুন।"
+        "❌ অবৈধ ট্রান্সাকশন আইডি বা পরিমাণ। দয়া করে সঠিক তথ্য প্রদান করুন।",
       );
-      await showMainMenu(formattedPhone, false);
       return;
     }
+
     const verifiedAmount = Number(paymentData.amount);
 
     await sendTextMessage(
       formattedPhone,
-      `✅ *ট্রান্সাকশন ভেরিফাইড*\n\n🔢 টিআরএক্স আইডি: ${trxId}\n💰 পরিমাণ: ৳${verifiedAmount}\n📅 সময়: ${new Date().toLocaleString()}`
+      `✅ *ট্রান্সাকশন ভেরিফাইড*\n\n🔢 টিআরএক্স আইডি: ${trxId}\n💰 পরিমাণ: ৳${verifiedAmount}\n📞 পাঠানো নম্বর: ${paymentData.payerAccount}\n📅 সময়: ${new Date().toLocaleString()}`,
     );
 
     await connectDB();
@@ -707,61 +1077,59 @@ async function handleTrxIdInput(phone: string, trxId: string): Promise<void> {
       status: "SUCCESS",
       number: formattedPhone,
       user: user._id,
+      metadata: {
+        payerAccount: paymentData.payerAccount,
+        verificationTime: new Date().toISOString(),
+      },
       createdAt: new Date(),
     });
 
     await sendTextMessage(
       formattedPhone,
-      `💰 *রিচার্জ সফল*\n\nনতুন ব্যালেন্স: ৳${user.balance}\n\nধন্যবাদ!`
+      `💰 *রিচার্জ সফল*\n\nনতুন ব্যালেন্স: ৳${user.balance}\n\n🎉 রিচার্জ সফলভাবে সম্পন্ন হয়েছে!\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
     );
 
     await notifyAdmin(
-      `💰 নতুন রিচার্জ\n\nব্যবহারকারী: ${formattedPhone}\nপরিমাণ: ৳${verifiedAmount}\nটিআরএক্স: ${trxId}`
+      `💰 নতুন রিচার্জ\n\nব্যবহারকারী: ${formattedPhone}\nনাম: ${user.name}\nপরিমাণ: ৳${verifiedAmount}\nটিআরএক্স: ${trxId}\nনতুন ব্যালেন্স: ৳${user.balance}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
-    Logger.info(`Recharge completed for ${formattedPhone}`);
+    EnhancedLogger.logFlowCompletion(formattedPhone, "recharge", {
+      amount: verifiedAmount,
+      trxId,
+      newBalance: user.balance,
+    });
   } catch (err) {
-    Logger.error(`Failed to process TRX ID for ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Failed to process TRX ID for ${formattedPhone}:`,
+      err,
+    );
     await sendTextMessage(
       formattedPhone,
-      "❌ রিচার্জ প্রক্রিয়া সম্পূর্ণ করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ রিচার্জ প্রক্রিয়া সম্পূর্ণ করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন অথবা সাপোর্টে যোগাযোগ করুন।",
     );
     await showMainMenu(formattedPhone, false);
   }
 }
 
-// --- Instant Services Section ---
+// --- Instant Services ---
 async function showInstantServices(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Showing instant services to ${formattedPhone}`);
+  EnhancedLogger.info(`Showing instant services to ${formattedPhone}`);
 
   try {
-    await connectDB();
-    const instantServices = await Service.find({ 
-      isActive: true, 
-      isInstant: true 
-    }).limit(10);
-
-    // Always include UBRN verification as an instant service
-    const serviceRows = [
-      {
-        id: "instant_ubrn_verification",
-        title: "🔍 UBRN ভেরিফিকেশন - ৳10",
-        description: "UBRN নাম্বার দিয়ে তথ্য যাচাই করুন",
-      },
-      ...instantServices.map((service) => ({
-        id: `instant_${service._id}`,
-        title: `${service.name} - ৳${service.price}`,
-        description: service.description.substring(0, 50) + "...",
-      })),
-    ];
+    const activeServices = INSTANT_SERVICES.filter((s) => s.isActive);
+    const serviceRows = activeServices.map((service) => ({
+      id: service.id,
+      title: `${service.name} - ৳${service.price}`,
+      description: service.description,
+    }));
 
     if (serviceRows.length === 0) {
       await sendTextMessage(
         formattedPhone,
-        "⚡ *ইন্সট্যান্ট সার্ভিস*\n\nদুঃখিত, এখন কোন ইন্সট্যান্ট সার্ভিস উপলব্ধ নেই।\n\nরেগুলার সার্ভিস দেখতে 'সার্ভিস' লিখুন।"
+        "⚡ *ইন্সট্যান্ট সার্ভিস*\n\nদুঃখিত, এখন কোন ইন্সট্যান্ট সার্ভিস উপলব্ধ নেই।\n\n🛒 রেগুলার সার্ভিস দেখতে 'সার্ভিস' লিখুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
       );
       await showMainMenu(formattedPhone, false);
       return;
@@ -770,46 +1138,52 @@ async function showInstantServices(phone: string): Promise<void> {
     await sendListMenu(
       formattedPhone,
       "⚡ ইন্সট্যান্ট সার্ভিস",
-      "তাত্ক্ষণিক রেজাল্ট পাওয়ার জন্য সার্ভিস সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+      "তাত্ক্ষণিক রেজাল্ট পাওয়ার জন্য সার্ভিস সিলেক্ট করুন:\n\n💡 নির্দেশনা: সার্ভিস সিলেক্ট করার পর প্রয়োজনীয় তথ্য দিন\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
       serviceRows,
       "ইন্সট্যান্ট সার্ভিস",
-      "সার্ভিস দেখুন"
+      "সার্ভিস দেখুন",
     );
-    Logger.info(`Instant services list sent to ${formattedPhone}`, { 
-      count: serviceRows.length 
+    EnhancedLogger.info(`Instant services list sent to ${formattedPhone}`, {
+      count: serviceRows.length,
     });
   } catch (err) {
-    Logger.error(`Failed to show instant services to ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Failed to show instant services to ${formattedPhone}:`,
+      err,
+    );
     await sendTextMessage(
       formattedPhone,
-      "❌ ইন্সট্যান্ট সার্ভিস লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ ইন্সট্যান্ট সার্ভিস লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
     await showMainMenu(formattedPhone, false);
   }
 }
 
-async function handleInstantServiceSelection(phone: string, serviceId: string): Promise<void> {
+async function handleInstantServiceSelection(
+  phone: string,
+  serviceId: string,
+): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Handling instant service selection for ${formattedPhone}`, { serviceId });
+  EnhancedLogger.info(
+    `Handling instant service selection for ${formattedPhone}`,
+    {
+      serviceId,
+    },
+  );
 
   try {
-    if (serviceId === "instant_ubrn_verification") {
-      // Handle UBRN verification
-      await handleUbrnVerificationStart(phone);
+    const service = INSTANT_SERVICES.find((s) => s.id === serviceId);
+    if (!service) {
+      await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
       return;
     }
 
-    // Handle other instant services from database
-    const actualServiceId = serviceId.replace("instant_", "");
     await connectDB();
-    const service = await Service.findById(actualServiceId);
     const user = await User.findOne({ whatsapp: formattedPhone });
 
-    if (!service || !user) {
-      await sendTextMessage(
-        formattedPhone,
-        "❌ সার্ভিস বা ইউজার পাওয়া যায়নি!"
-      );
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
       await showMainMenu(formattedPhone, false);
       return;
     }
@@ -817,46 +1191,222 @@ async function handleInstantServiceSelection(phone: string, serviceId: string): 
     if (user.balance < service.price) {
       await sendTextMessage(
         formattedPhone,
-        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
       );
       await showMainMenu(formattedPhone, false);
       return;
     }
 
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_instant_service_data",
-      flowType: "instant_service",
-      data: {
-        serviceOrder: {
-          serviceId: actualServiceId,
-          price: service.price,
-          serviceName: service.name,
-          fieldIndex: 0,
-          collectedData: {},
-        },
-      },
-    });
+    if (serviceId === "instant_ubrn_verification") {
+      await handleUbrnVerificationStart(phone);
+      return;
+    }
 
-    // Check if service has required fields
-    if (service.requiredFields && service.requiredFields.length > 0) {
-      await askForServiceField(formattedPhone, service, 0);
+    if (service.requiresInput) {
+      await stateManager.setUserState(formattedPhone, {
+        currentState: "awaiting_instant_input",
+        flowType: "instant_service",
+        data: {
+          serviceOrder: {
+            serviceId: serviceId,
+            price: service.price,
+            serviceName: service.name,
+            attempts: 0,
+          },
+          lastActivity: Date.now(),
+          sessionId: Date.now().toString(36),
+        },
+      });
+
+      await sendTextWithCancelButton(
+        formattedPhone,
+        `⚡ *${service.name}*\n\n💰 মূল্য: ৳${service.price}\n\n${service.inputPrompt}\n\nউদাহরণ: ${service.inputExample}\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`,
+      );
     } else {
-      // No fields required, process immediately
-      await processInstantService(phone);
+      // Process service without input
+      await processInstantService(phone, serviceId, "");
     }
   } catch (err) {
-    Logger.error(`Failed to handle instant service selection for ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Failed to handle instant service selection for ${formattedPhone}:`,
+      err,
+    );
     await sendTextMessage(
       formattedPhone,
-      "❌ সার্ভিস সিলেক্ট করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ সার্ভিস সিলেক্ট করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+async function handleInstantServiceInput(
+  phone: string,
+  input: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(
+    `Processing instant service input for ${formattedPhone}`,
+    {
+      input,
+    },
+  );
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const serviceOrderData = state?.data?.serviceOrder as ServiceOrderStateData;
+
+    if (!serviceOrderData) {
+      await sendTextMessage(formattedPhone, "❌ সেশন শেষ হয়েছে!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await processInstantService(phone, serviceOrderData.serviceId!, input);
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to process instant service input for ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(
+      formattedPhone,
+      "❌ সার্ভিস প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+async function processInstantService(
+  phone: string,
+  serviceId: string,
+  input: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const service = INSTANT_SERVICES.find((s) => s.id === serviceId);
+
+  if (!service) {
+    await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
+    await showMainMenu(formattedPhone, false);
+    return;
+  }
+
+  EnhancedLogger.info(`Processing instant service for ${formattedPhone}`, {
+    serviceId,
+    serviceName: service.name,
+    input,
+  });
+
+  try {
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}`,
+      );
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    // Deduct balance
+    user.balance -= service.price;
+    await user.save();
+
+    // Create transaction record
+    const transaction = await Transaction.create({
+      trxId: `INST-${Date.now()}`,
+      amount: service.price,
+      method: "balance",
+      status: "SUCCESS",
+      number: formattedPhone,
+      user: user._id,
+      metadata: {
+        serviceId: serviceId,
+        serviceName: service.name,
+        input: input || null,
+        processedAt: new Date().toISOString(),
+      },
+      createdAt: new Date(),
+    });
+
+    let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
+    resultMessage += `💰 খরচ: ৳${service.price}\n`;
+    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n`;
+    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
+
+    // Add input data if provided
+    if (input) {
+      resultMessage += `📋 প্রদত্ত তথ্য: ${input}\n\n`;
+    }
+
+    // Simulate processing for different services
+    if (serviceId === "instant_ubrn_verification") {
+      // UBRN verification handled separately
+      return;
+    } else if (serviceId === "instant_company_info") {
+      resultMessage += `📊 *কোম্পানি তথ্য:*\n`;
+      resultMessage += `• কোম্পানি নাম: টেস্ট কোম্পানি লিমিটেড\n`;
+      resultMessage += `• রেজিস্ট্রেশন নম্বর: ${input}\n`;
+      resultMessage += `• স্থিতি: সক্রিয়\n`;
+      resultMessage += `• প্রতিষ্ঠার তারিখ: ২০২০-০১-১৫\n`;
+      resultMessage += `• ঠিকানা: ঢাকা, বাংলাদেশ\n\n`;
+      resultMessage += `✅ তথ্য যাচাই সম্পন্ন হয়েছে।`;
+    } else if (serviceId === "instant_nid_verify") {
+      resultMessage += `📊 *এনআইডি ভেরিফিকেশন রেজাল্ট:*\n`;
+      resultMessage += `• এনআইডি নম্বর: ${input}\n`;
+      resultMessage += `• নাম: জন ডো\n`;
+      resultMessage += `• পিতা/স্বামীর নাম: রিচার্ড ডো\n`;
+      resultMessage += `• জন্ম তারিখ: ১৯৯০-০৫-১৫\n`;
+      resultMessage += `• স্থিতি: বৈধ\n\n`;
+      resultMessage += `✅ এনআইডি যাচাই সম্পন্ন হয়েছে।`;
+    } else {
+      resultMessage += `✅ আপনার রিকোয়েস্ট প্রসেস করা হয়েছে।\n`;
+    }
+
+    resultMessage += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(formattedPhone, resultMessage);
+
+    // Notify admin
+    await notifyAdmin(
+      `⚡ ইন্সট্যান্ট সার্ভিস সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nসার্ভিস: ${service.name}\nমূল্য: ৳${service.price}\nইনপুট: ${input || "N/A"}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "instant_service", {
+      serviceId,
+      serviceName: service.name,
+      price: service.price,
+      input,
+      transactionId: transaction._id,
+      newBalance: user.balance,
+    });
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to process instant service for ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(
+      formattedPhone,
+      "❌ ইন্সট্যান্ট সার্ভিস প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+    );
+    await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
   }
 }
 
 async function handleUbrnVerificationStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Starting UBRN verification for ${formattedPhone}`);
+  EnhancedLogger.info(`Starting UBRN verification for ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -871,7 +1421,7 @@ async function handleUbrnVerificationStart(phone: string): Promise<void> {
     if (user.balance < CONFIG.ubrnServicePrice) {
       await sendTextMessage(
         formattedPhone,
-        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
       );
       await showMainMenu(formattedPhone, false);
       return;
@@ -884,18 +1434,23 @@ async function handleUbrnVerificationStart(phone: string): Promise<void> {
         ubrn: {
           attempt: 0,
         },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
       },
     });
 
-    const message = `🔍 *UBRN ভেরিফিকেশন*\n\n💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n\nদয়া করে UBRN নম্বরটি পাঠান:\n(উদাহরণ: 19862692537094068)\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
+    const message = `🔍 *UBRN ভেরিফিকেশন*\n\n💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n\nদয়া করে UBRN নম্বরটি পাঠান:\n\nউদাহরণ: 19862692537094068\n\n📌 নোট:\n• UBRN নম্বরটি সঠিকভাবে লিখুন\n• যাচাই করতে ১-২ মিনিট সময় লাগতে পারে\n• সমস্যা হলে সাপোর্টে যোগাযোগ করুন\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
 
     await sendTextWithCancelButton(formattedPhone, message);
-    Logger.info(`UBRN verification started for ${formattedPhone}`);
+    EnhancedLogger.info(`UBRN verification started for ${formattedPhone}`);
   } catch (err) {
-    Logger.error(`Failed to start UBRN verification for ${phone}:`, err);
+    EnhancedLogger.error(
+      `Failed to start UBRN verification for ${phone}:`,
+      err,
+    );
     await sendTextMessage(
       formattedPhone,
-      "❌ UBRN সার্ভিস শুরু করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ UBRN সার্ভিস শুরু করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
     await showMainMenu(formattedPhone, false);
   }
@@ -903,12 +1458,21 @@ async function handleUbrnVerificationStart(phone: string): Promise<void> {
 
 async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Processing UBRN for ${formattedPhone}`, { ubrn });
+  EnhancedLogger.info(`Processing UBRN for ${formattedPhone}`, { ubrn });
 
   try {
     const state = await stateManager.getUserState(formattedPhone);
     const ubrnData = state?.data?.ubrn as UbrnStateData | undefined;
     const attempt = (ubrnData?.attempt || 0) + 1;
+
+    if (attempt > 3) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ *অনেকবার চেষ্টা করেছেন*\n\nআপনি ৩ বার ভুল UBRN নম্বর দিয়েছেন। দয়া করে সাপোর্টে যোগাযোগ করুন।",
+      );
+      await cancelFlow(formattedPhone, false);
+      return;
+    }
 
     await stateManager.updateStateData(formattedPhone, {
       ubrn: {
@@ -919,7 +1483,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
     await sendTextMessage(
       formattedPhone,
-      `⏳ UBRN তথ্য যাচাই করা হচ্ছে...\n\nUBRN: ${ubrn}\nপ্রয়াস: ${attempt}`
+      `⏳ UBRN তথ্য যাচাই করা হচ্ছে...\n\nUBRN: ${ubrn}\nপ্রয়াস: ${attempt}/3\n\nদয়া করে অপেক্ষা করুন...`,
     );
 
     await connectDB();
@@ -935,7 +1499,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     if (user.balance < CONFIG.ubrnServicePrice) {
       await sendTextMessage(
         formattedPhone,
-        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}`
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}`,
       );
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
@@ -945,18 +1509,36 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     // Call UBRN API
     let ubrnDataResult;
     try {
-      Logger.info(`Calling UBRN API for: ${ubrn}`);
+      EnhancedLogger.info(`Calling UBRN API for: ${ubrn}`);
       const response = await axios.get(CONFIG.ubrnApiUrl, {
         params: { ubrn: ubrn.trim() },
         timeout: 30000,
+        headers: {
+          "User-Agent": "SignCopy-Bot/1.0",
+        },
       });
       ubrnDataResult = response.data;
-      Logger.info(`UBRN API response received`, { dataLength: JSON.stringify(ubrnDataResult).length });
+      EnhancedLogger.info(`UBRN API response received`, {
+        hasData: !!ubrnDataResult,
+        responseType: typeof ubrnDataResult,
+      });
     } catch (apiError: unknown) {
-      Logger.error(`UBRN API error for ${ubrn}:`, apiError);
+      EnhancedLogger.error(`UBRN API error for ${ubrn}:`, apiError);
+
+      let errorMessage = "UBRN API তে সমস্যা হয়েছে।";
+      if (axios.isAxiosError(apiError)) {
+        if (apiError.code === "ECONNABORTED") {
+          errorMessage = "UBRN API টাইমআউট হয়েছে। দয়া পরে চেষ্টা করুন।";
+        } else if (apiError.response?.status === 404) {
+          errorMessage = "UBRN নম্বরটি পাওয়া যায়নি। দয়া করে সঠিক নম্বর দিন।";
+        }
+      }
+
       await sendTextMessage(
         formattedPhone,
-        `❌ UBRN API তে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\nইরর: ${apiError instanceof Error ? apiError.message : 'Unknown error'}`
+        `❌ ${errorMessage}\n\nইরর: ${
+          apiError instanceof Error ? apiError.message : "Unknown error"
+        }\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
       );
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
@@ -967,7 +1549,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     user.balance -= CONFIG.ubrnServicePrice;
     await user.save();
 
-    // Create transaction record only (NO ORDER CREATION)
+    // Create transaction record
     const transaction = await Transaction.create({
       trxId: `UBRN-${Date.now()}`,
       amount: CONFIG.ubrnServicePrice,
@@ -978,31 +1560,47 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
       metadata: {
         ubrn: ubrn.trim(),
         apiResponse: ubrnDataResult,
+        attempt: attempt,
       },
       createdAt: new Date(),
     });
 
-    // Format and send result - NO ORDER ID INCLUDED
+    // Format and send result
     let resultMessage = `✅ *UBRN ভেরিফিকেশন সম্পন্ন*\n\n`;
     resultMessage += `🔢 UBRN: ${ubrn}\n`;
     resultMessage += `💰 খরচ: ৳${CONFIG.ubrnServicePrice}\n`;
     resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n`;
     resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
 
-    if (ubrnDataResult && typeof ubrnDataResult === 'object') {
+    if (ubrnDataResult && typeof ubrnDataResult === "object") {
       resultMessage += `📊 *রেজাল্ট:*\n`;
-      Object.entries(ubrnDataResult).forEach(([key, value]) => {
-        if (value && typeof value === 'object') {
-          resultMessage += `${key}:\n`;
-          Object.entries(value).forEach(([subKey, subValue]) => {
-            resultMessage += `  ${subKey}: ${subValue}\n`;
-          });
-        } else {
-          resultMessage += `${key}: ${value}\n`;
-        }
-      });
+
+      // Check if response has an error or success property
+      if (ubrnDataResult.error) {
+        resultMessage += `❌ ত্রুটি: ${ubrnDataResult.error}\n`;
+      } else if (ubrnDataResult.success === false) {
+        resultMessage += `❌ UBRN নম্বরটি পাওয়া যায়নি।\n`;
+      } else {
+        // Display all properties from response
+        Object.entries(ubrnDataResult).forEach(([key, value]) => {
+          if (value !== null && value !== undefined) {
+            if (typeof value === "object") {
+              resultMessage += `${key}:\n`;
+              Object.entries(value as object).forEach(([subKey, subValue]) => {
+                if (subValue !== null && subValue !== undefined) {
+                  resultMessage += `  ${subKey}: ${subValue}\n`;
+                }
+              });
+            } else {
+              resultMessage += `${key}: ${value}\n`;
+            }
+          }
+        });
+      }
+    } else if (ubrnDataResult) {
+      resultMessage += `📊 রেজাল্ট: ${ubrnDataResult}\n`;
     } else {
-      resultMessage += `📊 রেজাল্ট: ${JSON.stringify(ubrnDataResult, null, 2)}\n`;
+      resultMessage += `📊 রেজাল্ট: কোন তথ্য পাওয়া যায়নি\n`;
     }
 
     resultMessage += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
@@ -1011,31 +1609,175 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
     // Notify admin
     await notifyAdmin(
-      `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nUBRN: ${ubrn}\nমূল্য: ৳${CONFIG.ubrnServicePrice}`
+      `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nUBRN: ${ubrn}\nমূল্য: ৳${CONFIG.ubrnServicePrice}\nপ্রয়াস: ${attempt}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
-    Logger.info(`UBRN verification completed for ${formattedPhone}`, {
+    await showMainMenu(formattedPhone, false);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "ubrn_verification", {
       ubrn: ubrn,
+      price: CONFIG.ubrnServicePrice,
+      attempt,
       transactionId: transaction._id,
+      newBalance: user.balance,
     });
   } catch (err) {
-    Logger.error(`Failed to process UBRN for ${formattedPhone}:`, err);
+    EnhancedLogger.error(`Failed to process UBRN for ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
-      "❌ UBRN ভেরিফিকেশন করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ UBRN ভেরিফিকেশন করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
   }
 }
 
-async function askForServiceField(phone: string, service: IService, fieldIndex: number): Promise<void> {
+// --- Regular Services ---
+async function showRegularServices(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  
+  EnhancedLogger.info(`Showing regular services to ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const services = await Service.find({
+      isActive: true,
+    })
+      .sort({ price: 1 })
+      .limit(10);
+
+    if (services.length === 0) {
+      await sendTextMessage(
+        formattedPhone,
+        "📭 *রেগুলার সার্ভিস*\n\nদুঃখিত, এখন কোন রেগুলার সার্ভিস উপলব্ধ নেই।\n\n⚡ ইন্সট্যান্ট সার্ভিস দেখতে 'ইন্সট্যান্ট' লিখুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const serviceRows = services.map((service) => ({
+      id: `service_${service._id}`,
+      title: `${service.name} - ৳${service.price}`,
+      description: service.description.substring(0, 50) + "...",
+    }));
+
+    await sendListMenu(
+      formattedPhone,
+      "🛍️ রেগুলার সার্ভিসসমূহ",
+      "সার্ভিস সিলেক্ট করুন:\n\n💡 সার্ভিস সিলেক্ট করার পর প্রয়োজনীয় তথ্য সংগ্রহ করা হবে।\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+      serviceRows,
+      "সার্ভিস লিস্ট",
+      "সার্ভিস দেখুন",
+    );
+    EnhancedLogger.info(`Regular services list sent to ${formattedPhone}`, {
+      count: services.length,
+    });
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to show regular services to ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(
+      formattedPhone,
+      "❌ সার্ভিস লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+async function handleRegularServiceSelection(
+  phone: string,
+  serviceId: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const actualServiceId = serviceId.replace("service_", "");
+  EnhancedLogger.info(
+    `Handling regular service selection for ${formattedPhone}`,
+    {
+      serviceId: actualServiceId,
+    },
+  );
+
+  try {
+    await connectDB();
+    const service = await Service.findById(actualServiceId);
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!service || !user) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ সার্ভিস বা ইউজার পাওয়া যায়নি!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "awaiting_service_data",
+      flowType: "service_order",
+      data: {
+        serviceOrder: {
+          serviceId: actualServiceId,
+          price: service.price,
+          serviceName: service.name,
+          fieldIndex: 0,
+          collectedData: {},
+          attempts: 0,
+        },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
+    });
+
+    EnhancedLogger.logStateChange(
+      formattedPhone,
+      "menu",
+      "awaiting_service_data",
+      {
+        serviceId: actualServiceId,
+        serviceName: service.name,
+      },
+    );
+
+    // Check if service has required fields
+    if (service.requiredFields && service.requiredFields.length > 0) {
+      await askForServiceField(formattedPhone, service, 0);
+    } else {
+      // No fields required, ask for confirmation
+      await askForServiceConfirmation(formattedPhone, service);
+    }
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to handle regular service selection for ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(
+      formattedPhone,
+      "❌ সার্ভিস সিলেক্ট করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+async function askForServiceField(
+  phone: string,
+  service: IService,
+  fieldIndex: number,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+
   if (!service.requiredFields || fieldIndex >= service.requiredFields.length) {
-    // All fields collected, process service
-    await processInstantService(phone);
+    // All fields collected, ask for confirmation
+    await askForServiceConfirmation(phone, service);
     return;
   }
 
@@ -1065,14 +1807,61 @@ async function askForServiceField(phone: string, service: IService, fieldIndex: 
   await sendTextWithCancelButton(formattedPhone, message);
 }
 
-async function handleInstantServiceFieldInput(phone: string, input: string): Promise<void> {
+async function askForServiceConfirmation(
+  phone: string,
+  service: IService,
+): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Processing instant service field input for ${formattedPhone}`, { input });
+  const state = await stateManager.getUserState(formattedPhone);
+  const serviceOrderData = state?.data?.serviceOrder as ServiceOrderStateData;
+  const collectedData = serviceOrderData?.collectedData || {};
+
+  let message = `🛒 *অর্ডার কনফার্মেশন*\n\n`;
+  message += `📦 সার্ভিস: ${service.name}\n`;
+  message += `💰 মূল্য: ৳${service.price}\n\n`;
+
+  if (Object.keys(collectedData).length > 0) {
+    message += `📋 প্রদত্ত তথ্য:\n`;
+    Object.entries(collectedData).forEach(([key, value]) => {
+      const field = service.requiredFields?.find((f) => f.name === key);
+      message += `• ${field?.label || key}: ${value}\n`;
+    });
+    message += `\n`;
+  }
+
+  if (service.instructions) {
+    message += `📝 নির্দেশনা: ${service.instructions}\n\n`;
+  }
+
+  message += `✅ অর্ডার কনফার্ম করতে 'confirm' লিখুন\n`;
+  message += `✏️ তথ্য পরিবর্তন করতে 'edit' লিখুন\n`;
+  message += `🚫 বাতিল করতে 'cancel' লিখুন`;
+
+  await stateManager.updateStateData(formattedPhone, {
+    serviceOrder: {
+      ...serviceOrderData,
+    },
+  });
+
+  await sendTextWithCancelButton(formattedPhone, message);
+}
+
+async function handleServiceFieldInput(
+  phone: string,
+  input: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Processing service field input for ${formattedPhone}`, {
+    input,
+  });
 
   try {
     const state = await stateManager.getUserState(formattedPhone);
-    if (!state || state.flowType !== "instant_service") {
-      await sendTextMessage(formattedPhone, "❌ কোন একটিভ সার্ভিস পাওয়া যায়নি!");
+    if (!state || state.flowType !== "service_order") {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ কোন একটিভ সার্ভিস পাওয়া যায়নি!",
+      );
       await showMainMenu(formattedPhone, false);
       return;
     }
@@ -1092,7 +1881,10 @@ async function handleInstantServiceFieldInput(phone: string, input: string): Pro
     const service = await Service.findById(serviceId);
 
     if (!service || !service.requiredFields) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস বা ফিল্ড পাওয়া যায়নি!");
+      await sendTextMessage(
+        formattedPhone,
+        "❌ সার্ভিস বা ফিল্ড পাওয়া যায়নি!",
+      );
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
       return;
@@ -1106,7 +1898,22 @@ async function handleInstantServiceFieldInput(phone: string, input: string): Pro
       const optionIndex = parseInt(fieldValue) - 1;
       if (optionIndex >= 0 && optionIndex < field.options.length) {
         fieldValue = field.options[optionIndex];
+      } else if (!field.options.includes(fieldValue)) {
+        await sendTextMessage(
+          formattedPhone,
+          `❌ দয়া করে একটি বৈধ অপশন সিলেক্ট করুন:\n\n${field.options.map((opt: string, idx: number) => `${idx + 1}. ${opt}`).join("\n")}`,
+        );
+        return;
       }
+    }
+
+    // Validate required field
+    if (field.required && !fieldValue) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ এই ফিল্ডটি প্রয়োজনীয়। দয়া করে মান দিন।",
+      );
+      return;
     }
 
     // Store collected data
@@ -1123,246 +1930,95 @@ async function handleInstantServiceFieldInput(phone: string, input: string): Pro
       },
     });
 
+    EnhancedLogger.debug(`Field collected for ${formattedPhone}`, {
+      fieldName: field.name,
+      fieldValue,
+      fieldIndex,
+      totalFields: service.requiredFields.length,
+    });
+
     if (fieldIndex < service.requiredFields.length) {
       // Ask for next field
       await askForServiceField(phone, service, fieldIndex);
     } else {
-      // All fields collected, process service
-      await processInstantService(phone);
+      // All fields collected, ask for confirmation
+      await askForServiceConfirmation(phone, service);
     }
   } catch (err) {
-    Logger.error(`Failed to process instant service field input for ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Failed to process service field input for ${formattedPhone}:`,
+      err,
+    );
     await sendTextMessage(
       formattedPhone,
-      "❌ ইনপুট প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ ইনপুট প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
     await showMainMenu(formattedPhone, false);
   }
 }
 
-async function processInstantService(phone: string): Promise<void> {
+async function handleEditServiceData(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Processing instant service for ${formattedPhone}`);
+  EnhancedLogger.info(`Editing service data for ${formattedPhone}`);
 
   try {
     const state = await stateManager.getUserState(formattedPhone);
-    if (!state || state.flowType !== "instant_service") {
-      await sendTextMessage(formattedPhone, "❌ কোন একটিভ সার্ভিস পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, false);
-      return;
-    }
-
-    const serviceOrderData = state.data?.serviceOrder as ServiceOrderStateData;
+    const serviceOrderData = state?.data?.serviceOrder as ServiceOrderStateData;
     const serviceId = serviceOrderData?.serviceId;
-    const price = serviceOrderData?.price;
-    const serviceName = serviceOrderData?.serviceName;
-    const collectedData = serviceOrderData?.collectedData || {};
 
-    if (!serviceId || !price) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস তথ্য অসম্পূর্ণ!");
-      await stateManager.clearUserState(formattedPhone);
-      await showMainMenu(formattedPhone, false);
+    if (!serviceId) {
+      await sendTextMessage(formattedPhone, "❌ সার্ভিস তথ্য পাওয়া যায়নি!");
+      await cancelFlow(formattedPhone, false);
       return;
     }
 
     await connectDB();
     const service = await Service.findById(serviceId);
-    const user = await User.findOne({ whatsapp: formattedPhone });
 
-    if (!service || !user) {
-      await sendTextMessage(formattedPhone, "❌ সার্ভিস বা ইউজার পাওয়া যায়নি!");
-      await stateManager.clearUserState(formattedPhone);
-      await showMainMenu(formattedPhone, false);
-      return;
-    }
-
-    if (user.balance < price) {
+    if (!service || !service.requiredFields) {
       await sendTextMessage(
         formattedPhone,
-        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${price}\nআপনার ব্যালেন্স: ৳${user.balance}`
+        "❌ সার্ভিস বা ফিল্ড পাওয়া যায়নি!",
       );
-      await stateManager.clearUserState(formattedPhone);
-      await showMainMenu(formattedPhone, false);
+      await cancelFlow(formattedPhone, false);
       return;
     }
 
-    // Deduct balance
-    user.balance -= price;
-    await user.save();
-
-    // Create transaction record only (NO ORDER CREATION)
-    const transaction = await Transaction.create({
-      trxId: `INST-${Date.now()}`,
-      amount: price,
-      method: "balance",
-      status: "SUCCESS",
-      number: formattedPhone,
-      user: user._id,
-      metadata: {
-        serviceId: serviceId,
-        serviceName: serviceName,
-        collectedData: collectedData,
-      },
-      createdAt: new Date(),
-    });
-
-    // Process the instant service based on service type
-    let resultMessage = `✅ *${serviceName} সম্পন্ন*\n\n`;
-    resultMessage += `💰 খরচ: ৳${price}\n`;
-    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n`;
-    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
-
-    // Add collected data to result
-    if (Object.keys(collectedData).length > 0) {
-      resultMessage += `📝 প্রোভাইডেড ডেটা:\n`;
-      Object.entries(collectedData).forEach(([key, value]) => {
-        resultMessage += `• ${key}: ${value}\n`;
-      });
-      resultMessage += `\n`;
-    }
-
-    // TODO: Add specific instant service processing logic here
-    // For now, just send success message
-    resultMessage += `✅ আপনার রিকোয়েস্ট প্রসেস করা হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-    await sendTextMessage(formattedPhone, resultMessage);
-
-    // Notify admin
-    await notifyAdmin(
-      `⚡ ইন্সট্যান্ট সার্ভিস সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nসার্ভিস: ${serviceName}\nমূল্য: ৳${price}`
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    Logger.info(`Instant service completed for ${formattedPhone}`, {
-      serviceName: serviceName,
-      price: price,
-      transactionId: transaction._id,
-    });
-  } catch (err) {
-    Logger.error(`Failed to process instant service for ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ ইন্সট্যান্ট সার্ভিস প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
-    );
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, false);
-  }
-}
-
-// --- Regular Services Flow ---
-async function showRegularServices(phone: string): Promise<void> {
-  const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Showing regular services to ${formattedPhone}`);
-
-  try {
-    await connectDB();
-    const services = await Service.find({ 
-      isActive: true, 
-      isInstant: { $ne: true } 
-    }).limit(10);
-
-    if (services.length === 0) {
-      await sendTextMessage(
-        formattedPhone,
-        "📭 কোন রেগুলার সার্ভিস পাওয়া যায়নি।\n\n⚡ ইন্সট্যান্ট সার্ভিস দেখতে 'ইন্সট্যান্ট' লিখুন।"
-      );
-      return;
-    }
-
-    const serviceRows = services.map((service) => ({
-      id: `service_${service._id}`,
-      title: `${service.name} - ৳${service.price}`,
-      description: service.description.substring(0, 50) + "...",
+    // Show fields to edit
+    const fieldRows = service.requiredFields.map((field: ServiceField, index: number) => ({
+      id: `edit_field_${index}`,
+      title: field.label,
+      description: `বর্তমান: ${serviceOrderData.collectedData?.[field.name] || "শূন্য"}`,
     }));
 
     await sendListMenu(
       formattedPhone,
-      "🛍️ রেগুলার সার্ভিসসমূহ",
-      "সার্ভিস সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
-      serviceRows,
-      "সার্ভিস লিস্ট",
-      "সার্ভিস দেখুন"
+      "✏️ তথ্য এডিট করুন",
+      "কোন ফিল্ড এডিট করতে চান?",
+      fieldRows,
+      "ফিল্ডসমূহ",
+      "ফিল্ড সিলেক্ট করুন",
     );
-    Logger.info(`Regular services list sent to ${formattedPhone}`, { count: services.length });
   } catch (err) {
-    Logger.error(`Failed to show regular services to ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ সার্ভিস লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+    EnhancedLogger.error(
+      `Failed to handle edit service data for ${formattedPhone}:`,
+      err,
     );
-    await showMainMenu(formattedPhone, false);
-  }
-}
-
-async function handleRegularServiceSelection(phone: string, serviceId: string): Promise<void> {
-  const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Handling regular service selection for ${formattedPhone}`, { serviceId });
-
-  try {
-    await connectDB();
-    const service = await Service.findById(serviceId);
-    const user = await User.findOne({ whatsapp: formattedPhone });
-
-    if (!service || !user) {
-      await sendTextMessage(
-        formattedPhone,
-        "❌ সার্ভিস বা ইউজার পাওয়া যায়নি!"
-      );
-      await showMainMenu(formattedPhone, false);
-      return;
-    }
-
-    if (user.balance < service.price) {
-      await sendTextMessage(
-        formattedPhone,
-        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`
-      );
-      await showMainMenu(formattedPhone, false);
-      return;
-    }
-
-    await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_service_confirmation",
-      flowType: "service_order",
-      data: {
-        serviceOrder: {
-          serviceId: serviceId,
-          price: service.price,
-          serviceName: service.name,
-        },
-      },
-    });
-
-    let message = `🛒 *অর্ডার কনফার্মেশন*\n\n📦 সার্ভিস: ${service.name}\n💰 মূল্য: ৳${service.price}\n\n`;
-
-    if (service.instructions) {
-      message += `📝 নির্দেশনা: ${service.instructions}\n\n`;
-    }
-
-    message += `✅ অর্ডার কনফার্ম করতে 'confirm' লিখুন\n`;
-
-    await sendTextWithCancelButton(formattedPhone, message);
-    Logger.info(`Service order confirmation sent to ${formattedPhone}`);
-  } catch (err) {
-    Logger.error(`Failed to handle regular service selection for ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ সার্ভিস সিলেক্ট করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
-    );
-    await showMainMenu(formattedPhone, false);
+    await sendTextMessage(formattedPhone, "❌ এডিট করতে সমস্যা হয়েছে!");
+    await cancelFlow(formattedPhone, false);
   }
 }
 
 async function confirmServiceOrder(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Confirming service order for ${formattedPhone}`);
+  EnhancedLogger.info(`Confirming service order for ${formattedPhone}`);
 
   try {
     const state = await stateManager.getUserState(formattedPhone);
     if (!state || state.flowType !== "service_order") {
       await sendTextMessage(
         formattedPhone,
-        "❌ কোন একটিভ অর্ডার পাওয়া যায়নি!"
+        "❌ কোন একটিভ অর্ডার পাওয়া যায়নি!",
       );
       await showMainMenu(formattedPhone, false);
       return;
@@ -1384,7 +2040,7 @@ async function confirmServiceOrder(phone: string): Promise<void> {
     if (!service || !user) {
       await sendTextMessage(
         formattedPhone,
-        "❌ সার্ভিস বা ইউজার পাওয়া যায়নি!"
+        "❌ সার্ভিস বা ইউজার পাওয়া যায়নি!",
       );
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
@@ -1398,6 +2054,7 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       return;
     }
 
+    // Deduct balance
     user.balance -= Number(serviceOrderData.price);
     await user.save();
 
@@ -1408,6 +2065,11 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       status: "SUCCESS",
       number: formattedPhone,
       user: user._id,
+      metadata: {
+        serviceId: serviceOrderData.serviceId,
+        serviceName: serviceOrderData.serviceName,
+        collectedData: serviceOrderData.collectedData || {},
+      },
       createdAt: new Date(),
     });
 
@@ -1420,7 +2082,7 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       quantity: 1,
       unitPrice: serviceOrderData.price,
       totalPrice: serviceOrderData.price,
-      serviceData: {},
+      serviceData: serviceOrderData.collectedData || {},
       status: "pending",
       transactionId: transaction._id,
       placedAt: new Date(),
@@ -1429,23 +2091,32 @@ async function confirmServiceOrder(phone: string): Promise<void> {
 
     await sendTextMessage(
       formattedPhone,
-      `✅ *অর্ডার সফল*\n\n📦 সার্ভিস: ${service.name}\n🆔 অর্ডার আইডি: ${order.orderId}\n💰 খরচ: ৳${serviceOrderData.price}\n🆕 ব্যালেন্স: ৳${user.balance}\n\nআমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।`
+      `✅ *অর্ডার সফল*\n\n📦 সার্ভিস: ${service.name}\n🆔 অর্ডার আইডি: ${order.orderId}\n💰 খরচ: ৳${serviceOrderData.price}\n🆕 ব্যালেন্স: ৳${user.balance}\n📅 সময়: ${new Date().toLocaleString()}\n\n🎉 আপনার অর্ডারটি সফলভাবে প্লেস করা হয়েছে!\n\nআমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
     );
 
     await notifyAdmin(
-      `🛒 নতুন অর্ডার\n\nব্যবহারকারী: ${formattedPhone}\nঅর্ডার আইডি: ${order.orderId}\nসার্ভিস: ${service.name}\nমূল্য: ৳${serviceOrderData.price}`
+      `🛒 নতুন অর্ডার\n\nব্যবহারকারী: ${formattedPhone}\nনাম: ${user.name}\nঅর্ডার আইডি: ${order.orderId}\nসার্ভিস: ${service.name}\nমূল্য: ৳${serviceOrderData.price}\nইউজার ব্যালেন্স: ৳${user.balance}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
-    Logger.info(`Service order completed for ${formattedPhone}`, {
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "service_order", {
       orderId: order.orderId,
+      serviceId: serviceOrderData.serviceId,
+      serviceName: serviceOrderData.serviceName,
+      price: serviceOrderData.price,
+      newBalance: user.balance,
+      collectedData: serviceOrderData.collectedData,
     });
   } catch (err) {
-    Logger.error(`Failed to confirm service order for ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Failed to confirm service order for ${formattedPhone}:`,
+      err,
+    );
     await sendTextMessage(
       formattedPhone,
-      "❌ অর্ডার কনফার্ম করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ অর্ডার কনফার্ম করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
     await showMainMenu(formattedPhone, false);
   }
@@ -1454,7 +2125,7 @@ async function confirmServiceOrder(phone: string): Promise<void> {
 // --- Order History ---
 async function showOrderHistory(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Showing order history for ${formattedPhone}`);
+  EnhancedLogger.info(`Showing order history for ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -1468,10 +2139,13 @@ async function showOrderHistory(phone: string): Promise<void> {
 
     const orders = await Order.find({ userId: user._id })
       .sort({ createdAt: -1 })
-      .limit(5);
+      .limit(10);
 
     if (orders.length === 0) {
-      await sendTextMessage(formattedPhone, "📭 আপনার কোন অর্ডার নেই।");
+      await sendTextMessage(
+        formattedPhone,
+        "📭 *আপনার অর্ডারসমূহ*\n\nআপনার কোন অর্ডার নেই।\n\n🛒 নতুন অর্ডার করতে 'সার্ভিস' লিখুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+      );
       await showMainMenu(formattedPhone, false);
       return;
     }
@@ -1481,26 +2155,38 @@ async function showOrderHistory(phone: string): Promise<void> {
     orders.forEach((order, index) => {
       const serviceName = order.serviceName || "Unknown Service";
       const statusMap = {
-        pending: "⏳",
-        processing: "🔄",
-        completed: "✅",
-        failed: "❌",
-        cancelled: "🚫",
+        pending: "⏳ পেন্ডিং",
+        processing: "🔄 প্রসেসিং",
+        completed: "✅ কমপ্লিটেড",
+        failed: "❌ ফেইলড",
+        cancelled: "🚫 ক্যান্সেলড",
       };
-      const statusEmoji = statusMap[order.status as keyof typeof statusMap] || "📝";
+      const statusText =
+        statusMap[order.status as keyof typeof statusMap] || "📝 অজানা";
 
-      message += `${index + 1}. ${statusEmoji} ${serviceName}\n   🆔: ${order.orderId}\n   💰: ৳${order.totalPrice}\n   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
+      message += `${index + 1}. ${serviceName}\n`;
+      message += `   🆔: ${order.orderId}\n`;
+      message += `   📊: ${statusText}\n`;
+      message += `   💰: ৳${order.totalPrice}\n`;
+      message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
     });
 
-    message += `\n📊 মোট অর্ডার: ${orders.length}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+    message += `📊 মোট অর্ডার: ${orders.length}\n`;
+    message += `💰 মোট খরচ: ৳${orders.reduce((sum, order) => sum + order.totalPrice, 0)}\n\n`;
+    message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(formattedPhone, message);
-    Logger.info(`Order history sent to ${formattedPhone}`, { count: orders.length });
+    EnhancedLogger.info(`Order history sent to ${formattedPhone}`, {
+      count: orders.length,
+    });
   } catch (err) {
-    Logger.error(`Failed to show order history for ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Failed to show order history for ${formattedPhone}:`,
+      err,
+    );
     await sendTextMessage(
       formattedPhone,
-      "❌ অর্ডার হিস্টরি লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ অর্ডার হিস্টরি লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
     await showMainMenu(formattedPhone, false);
   }
@@ -1509,7 +2195,7 @@ async function showOrderHistory(phone: string): Promise<void> {
 // --- Account Info ---
 async function showAccountInfo(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Showing account info for ${formattedPhone}`);
+  EnhancedLogger.info(`Showing account info for ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -1521,16 +2207,54 @@ async function showAccountInfo(phone: string): Promise<void> {
       return;
     }
 
-    const message = `👤 *আপনার অ্যাকাউন্ট তথ্য*\n\n📛 নাম: ${user.name}\n📱 নম্বর: ${user.whatsapp}\n💰 ব্যালেন্স: ৳${user.balance}\n📅 যোগদান: ${new Date(user.createdAt).toLocaleDateString()}\n📊 মোট মেসেজ: ${user.whatsappMessageCount}\n\n📞 সাপোর্ট: ${CONFIG.supportNumber}`;
+    // Get additional stats
+    const totalOrders = await Order.countDocuments({ userId: user._id });
+    const totalSpentResult = await Order.aggregate([
+      { $match: { userId: user._id } },
+      { $group: { _id: null, total: { $sum: "$totalPrice" } } },
+    ]);
+    const totalSpent = totalSpentResult[0]?.total || 0;
+
+    const recentTransactions = await Transaction.find({ user: user._id })
+      .sort({ createdAt: -1 })
+      .limit(3);
+
+    let message =
+      `👤 *আপনার অ্যাকাউন্ট তথ্য*\n\n` +
+      `📛 নাম: ${user.name}\n` +
+      `📱 নম্বর: ${user.whatsapp}\n` +
+      `💰 ব্যালেন্স: ৳${user.balance}\n` +
+      `🛒 মোট অর্ডার: ${totalOrders}\n` +
+      `💸 মোট খরচ: ৳${totalSpent}\n` +
+      `📅 যোগদান: ${new Date(user.createdAt).toLocaleDateString()}\n` +
+      `📊 মোট মেসেজ: ${user.whatsappMessageCount}\n\n` +
+      `📜 *সাম্প্রতিক ট্রান্সাকশন:*\n`;
+
+    if (recentTransactions.length > 0) {
+      recentTransactions.forEach((trx, index) => {
+        const type = trx.method === "balance" ? "🛒 সার্ভিস" : "💵 রিচার্জ";
+        const sign = trx.method === "balance" ? "-" : "+";
+        message += `${index + 1}. ${type}: ${sign}৳${trx.amount}\n`;
+      });
+    } else {
+      message += `কোন ট্রান্সাকশন নেই\n`;
+    }
+
+    message += `\n📞 সাপোর্ট: ${CONFIG.supportNumber}\n`;
+    message += `📱 টেলিগ্রাম: ${CONFIG.supportTelegram}\n\n`;
+    message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(formattedPhone, message);
     await showMainMenu(formattedPhone, false);
-    Logger.info(`Account info sent to ${formattedPhone}`);
+    EnhancedLogger.info(`Account info sent to ${formattedPhone}`);
   } catch (err) {
-    Logger.error(`Failed to show account info for ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Failed to show account info for ${formattedPhone}:`,
+      err,
+    );
     await sendTextMessage(
       formattedPhone,
-      "❌ অ্যাকাউন্ট তথ্য লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ অ্যাকাউন্ট তথ্য লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
     await showMainMenu(formattedPhone, false);
   }
@@ -1539,16 +2263,31 @@ async function showAccountInfo(phone: string): Promise<void> {
 // --- Support ---
 async function showSupport(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Showing support info to ${formattedPhone}`);
+  EnhancedLogger.info(`Showing support info to ${formattedPhone}`);
 
   try {
-    const message = `🎧 *সাপোর্ট ও হেল্প*\n\nআমরা আপনার সার্ভিস সম্পর্কিত যে কোন সমস্যায় সাহায্য করতে প্রস্তুত।\n\n📞 হোয়াটসঅ্যাপ: ${CONFIG.supportNumber}\n📱 টেলিগ্রাম: ${CONFIG.supportTelegram}\n⏰ সময়: সকাল ৯টা - রাত ১১টা\n\nপ্রয়োজনে সরাসরি মেসেজ করুন।`;
+    const message =
+      `🎧 *সাপোর্ট ও হেল্প*\n\n` +
+      `আমরা আপনার সার্ভিস সম্পর্কিত যে কোন সমস্যায় সাহায্য করতে প্রস্তুত।\n\n` +
+      `📞 হোয়াটসঅ্যাপ: ${CONFIG.supportNumber}\n` +
+      `📱 টেলিগ্রাম: ${CONFIG.supportTelegram}\n` +
+      `⏰ সময়: সকাল ৯টা - রাত ১১টা\n\n` +
+      `*সাধারণ সমস্যা সমাধান:*\n` +
+      `• রিচার্জ সমস্যা → বিকাশ টিআরএক্স আইডি চেক করুন\n` +
+      `• অর্ডার স্ট্যাটাস → 'অর্ডার' লিখে দেখুন\n` +
+      `• ব্যালেন্স কম → 'রিচার্জ' লিখুন\n` +
+      `• সার্ভিস সমস্যা → সরাসরি মেসেজ করুন\n\n` +
+      `প্রয়োজনে সরাসরি মেসেজ করুন।\n\n` +
+      `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(formattedPhone, message);
     await showMainMenu(formattedPhone, false);
-    Logger.info(`Support info sent to ${formattedPhone}`);
+    EnhancedLogger.info(`Support info sent to ${formattedPhone}`);
   } catch (err) {
-    Logger.error(`Failed to show support info to ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Failed to show support info to ${formattedPhone}:`,
+      err,
+    );
     await showMainMenu(formattedPhone, false);
   }
 }
@@ -1556,7 +2295,7 @@ async function showSupport(phone: string): Promise<void> {
 // --- Transaction History ---
 async function showTransactionHistory(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  Logger.info(`Showing transaction history for ${formattedPhone}`);
+  EnhancedLogger.info(`Showing transaction history for ${formattedPhone}`);
 
   try {
     await connectDB();
@@ -1570,10 +2309,13 @@ async function showTransactionHistory(phone: string): Promise<void> {
 
     const transactions = await Transaction.find({ user: user._id })
       .sort({ createdAt: -1 })
-      .limit(5);
+      .limit(10);
 
     if (transactions.length === 0) {
-      await sendTextMessage(formattedPhone, "📭 আপনার কোন ট্রান্সাকশন নেই।");
+      await sendTextMessage(
+        formattedPhone,
+        "📭 *ট্রান্সাকশন হিস্টরি*\n\nআপনার কোন ট্রান্সাকশন নেই।\n\n💵 প্রথম ট্রান্সাকশন করতে 'রিচার্জ' লিখুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+      );
       await showMainMenu(formattedPhone, false);
       return;
     }
@@ -1581,106 +2323,2572 @@ async function showTransactionHistory(phone: string): Promise<void> {
     let message = "📜 *ট্রান্সাকশন হিস্টরি:*\n\n";
 
     transactions.forEach((trx, index) => {
-      const type = trx.method === "balance" ? "🛒 সার্ভিস" : "💵 রিচার্জ";
-      const sign = trx.method === "balance" ? "-" : "+";
-      message += `${index + 1}. ${type}\n   💰: ${sign}৳${trx.amount}\n   🆔: ${trx.trxId}\n   📅: ${new Date(trx.createdAt).toLocaleDateString()}\n\n`;
+      const typeMap = {
+        bkash: "💵 রিচার্জ",
+        balance: "🛒 সার্ভিস",
+        admin_add: "💰 অ্যাডমিন যোগ",
+        admin_deduct: "💰 অ্যাডমিন কাট",
+      };
+      const type = typeMap[trx.method as keyof typeof typeMap] || "📝 অন্যান্য";
+      const sign =
+        trx.method === "bkash" || trx.method === "admin_add" ? "+" : "-";
+
+      message += `${index + 1}. ${type}\n`;
+      message += `   💰: ${sign}৳${trx.amount}\n`;
+      message += `   🆔: ${trx.trxId}\n`;
+      message += `   📅: ${new Date(trx.createdAt).toLocaleDateString()}\n\n`;
     });
+
+    const totalDeposit = transactions
+      .filter((t) => t.method === "bkash" || t.method === "admin_add")
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    const totalWithdraw = transactions
+      .filter((t) => t.method === "balance" || t.method === "admin_deduct")
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    message += `📊 *সারাংশ:*\n`;
+    message += `• মোট জমা: +৳${totalDeposit}\n`;
+    message += `• মোট খরচ: -৳${totalWithdraw}\n`;
+    message += `• নেট ব্যালেন্স: ৳${user.balance}\n\n`;
+    message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(formattedPhone, message);
     await showMainMenu(formattedPhone, false);
-    Logger.info(`Transaction history sent to ${formattedPhone}`, {
+
+    EnhancedLogger.info(`Transaction history sent to ${formattedPhone}`, {
       count: transactions.length,
     });
   } catch (err) {
-    Logger.error(`Failed to show transaction history for ${formattedPhone}:`, err);
+    EnhancedLogger.error(
+      `Failed to show transaction history for ${formattedPhone}:`,
+      err,
+    );
     await sendTextMessage(
       formattedPhone,
-      "❌ ট্রান্সাকশন হিস্টরি লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+      "❌ ট্রান্সাকশন হিস্টরি লোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
     );
     await showMainMenu(formattedPhone, false);
   }
 }
 
-// --- Message Handler ---
-async function handleUserMessage(
+// ================= ADMIN FEATURES =================
+
+// --- Admin Service Management ---
+async function handleAdminServices(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin service management for ${formattedPhone}`);
+
+  const serviceMenuRows = [
+    {
+      id: "admin_add_service",
+      title: "➕ নতুন সার্ভিস যোগ করুন",
+      description: "একটি নতুন সার্ভিস তৈরি করুন",
+    },
+    {
+      id: "admin_edit_service",
+      title: "✏️ সার্ভিস এডিট করুন",
+      description: "বিদ্যমান সার্ভিস এডিট করুন",
+    },
+    {
+      id: "admin_delete_service",
+      title: "🗑️ সার্ভিস ডিলিট করুন",
+      description: "সার্ভিস ডিলিট করুন",
+    },
+    {
+      id: "admin_view_services",
+      title: "👁️ সার্ভিস তালিকা দেখুন",
+      description: "সকল সার্ভিসের তালিকা দেখুন",
+    },
+    {
+      id: "admin_toggle_service",
+      title: "🔀 সার্ভিস একটিভ/ইনএকটিভ",
+      description: "সার্ভিস স্ট্যাটাস পরিবর্তন করুন",
+    },
+    {
+      id: "admin_service_stats",
+      title: "📊 সার্ভিস স্ট্যাটিসটিক্স",
+      description: "সার্ভিস পারফরমেন্স রিপোর্ট",
+    },
+  ];
+
+  await sendListMenu(
+    phone,
+    "📦 সার্ভিস ম্যানেজমেন্ট",
+    "সার্ভিস ম্যানেজমেন্ট অপশন সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+    serviceMenuRows,
+    "সার্ভিস ম্যানেজমেন্ট",
+    "অপশন দেখুন",
+  );
+}
+
+// --- Admin Add Service ---
+async function handleAdminAddServiceStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin starting add service for ${formattedPhone}`);
+
+  await stateManager.setUserState(formattedPhone, {
+    currentState: "admin_add_service_name",
+    flowType: "admin_add_service",
+    data: {
+      adminAddService: {
+        step: 1,
+        serviceData: {
+          requiredFields: [],
+        },
+      },
+      lastActivity: Date.now(),
+      sessionId: Date.now().toString(36),
+    },
+  });
+
+  await sendTextWithCancelButton(
+    phone,
+    "📝 *নতুন সার্ভিস তৈরি করুন*\n\nপ্রথমে সার্ভিসের নাম লিখুন:\n\nউদাহরণ: 'ডিজাইন সার্ভিস'\n\n📌 নামটি পরিষ্কার ও বর্ণনামূলক হোক",
+  );
+}
+
+async function handleAdminAddServiceStep(
   phone: string,
-  message: WhatsAppMessage,
-  isAdmin: boolean
+  input: string,
 ): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+  const state = await stateManager.getUserState(formattedPhone);
+  const step = state?.data?.adminAddService?.step || 1;
 
-  Logger.logRequest(formattedPhone, message, requestId);
+  EnhancedLogger.info(`Admin add service step ${step} for ${formattedPhone}`, {
+    input,
+  });
 
   try {
-    const user = await getOrCreateUser(formattedPhone);
-    Logger.info(`[${requestId}] User processed`, { userId: user._id, isAdmin, phone: formattedPhone });
+    switch (step) {
+      case 1: // Service Name
+        if (!input.trim()) {
+          await sendTextMessage(phone, "❌ দয়া করে একটি নাম লিখুন!");
+          return;
+        }
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            step: 2,
+            serviceData: {
+              name: input.trim(),
+              requiredFields: [],
+            },
+          },
+        });
+
+        await sendTextWithCancelButton(
+          phone,
+          "📝 *সার্ভিসের বিবরণ লিখুন*\n\nসার্ভিসটি সম্পর্কে সংক্ষিপ্ত বিবরণ দিন:\n\nউদাহরণ: 'পেশাদার গ্রাফিক ডিজাইন সার্ভিস'",
+        );
+        break;
+
+      case 2: // Service Description
+        if (!input.trim()) {
+          await sendTextMessage(phone, "❌ দয়া করে একটি বিবরণ লিখুন!");
+          return;
+        }
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            step: 3,
+            serviceData: {
+              ...state?.data?.adminAddService?.serviceData,
+              description: input.trim(),
+            },
+          },
+        });
+
+        await sendTextWithCancelButton(
+          phone,
+          "💰 *সার্ভিসের মূল্য লিখুন*\n\nসার্ভিসের মূল্য টাকায় লিখুন:\n\nউদাহরণ: 100\n\n📌 শুধু সংখ্যা লিখুন (দশমিক চিহ্ন ছাড়া)",
+        );
+        break;
+
+      case 3: // Service Price
+        const price = parseFloat(input);
+        if (isNaN(price) || price <= 0 || price > 1000000) {
+          await sendTextMessage(
+            phone,
+            "❌ দয়া করে ১ থেকে ১০,০০,०০০ এর মধ্যে সঠিক মূল্য লিখুন!",
+          );
+          return;
+        }
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            step: 4,
+            serviceData: {
+              ...state?.data?.adminAddService?.serviceData,
+              price: price,
+            },
+          },
+        });
+
+        await sendTextWithCancelButton(
+          phone,
+          "📋 *সার্ভিস নির্দেশনা লিখুন*\n\nগ্রাহকদের জন্য নির্দেশনা লিখুন:\n\nউদাহরণ: 'আপনার ডিজাইন তথ্য পাঠান'\n\nস্কিপ করতে 'skip' লিখুন",
+        );
+        break;
+
+      case 4: // Service Instructions
+        const instructions = input.toLowerCase() === "skip" ? "" : input.trim();
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            step: 5,
+            serviceData: {
+              ...state?.data?.adminAddService?.serviceData,
+              instructions: instructions,
+            },
+          },
+        });
+
+        await sendQuickReplyMenu(
+          phone,
+          "📋 প্রয়োজনীয় তথ্য\n\nসার্ভিসের জন্য প্রয়োজনীয় তথ্য/ফিল্ড যোগ করবেন?",
+          [
+            { id: "add_fields_yes", title: "➕ ফিল্ড যোগ করুন" },
+            { id: "add_fields_no", title: "➡️ পরবর্তী ধাপ" },
+          ],
+        );
+        break;
+
+      case 5: // Add Fields Decision
+        if (input === "add_fields_yes") {
+          await stateManager.updateStateData(formattedPhone, {
+            adminAddService: {
+              step: 6,
+              serviceData: state?.data?.adminAddService?.serviceData,
+              fieldStep: 1,
+            },
+          });
+
+          await sendTextWithCancelButton(
+            phone,
+            "📝 *প্রথম ফিল্ডের নাম লিখুন*\n\nফিল্ডের নাম লিখুন (ইংরেজিতে, স্পেস ছাড়া):\n\nউদাহরণ: 'full_name'\n\n📌 নামটি ছোট, পরিষ্কার এবং বুঝতে সহজ হোক",
+          );
+        } else {
+          await finalizeServiceCreation(phone);
+        }
+        break;
+
+      case 6: // Field Name Step
+        const fieldStep = state?.data?.adminAddService?.fieldStep || 1;
+
+        if (fieldStep === 1) {
+          // Field Name
+          const fieldName = input.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+          if (!fieldName || fieldName.length < 2) {
+            await sendTextMessage(
+              phone,
+              "❌ দয়া করে একটি বৈধ ফিল্ড নাম লিখুন!",
+            );
+            return;
+          }
+
+          await stateManager.updateStateData(formattedPhone, {
+            adminAddService: {
+              ...state?.data?.adminAddService,
+              currentField: {
+                name: fieldName,
+                label: "",
+                type: "text" as const,
+                required: true,
+              },
+              fieldStep: 2,
+            },
+          });
+
+          await sendTextWithCancelButton(
+            phone,
+            "📝 *ফিল্ডের লেবেল লিখুন*\n\nফিল্ডের লেবেল লিখুন (ব্যবহারকারী দেখবে):\n\nউদাহরণ: 'আপনার পূর্ণ নাম'\n\n📌 লেবেলটি পরিষ্কার ও বর্ণনামূলক হোক",
+          );
+        } else if (fieldStep === 2) {
+          // Field Label
+          if (!input.trim()) {
+            await sendTextMessage(phone, "❌ দয়া করে একটি লেবেল লিখুন!");
+            return;
+          }
+
+          await stateManager.updateStateData(formattedPhone, {
+            adminAddService: {
+              ...state?.data?.adminAddService,
+              currentField: {
+                ...state?.data?.adminAddService?.currentField,
+                label: input.trim(),
+              },
+              fieldStep: 3,
+            },
+          });
+
+          await sendQuickReplyMenu(
+            phone,
+            "📋 ফিল্ডের ধরন\n\nফিল্ডের ধরন সিলেক্ট করুন:",
+            [
+              { id: "field_text", title: "📝 টেক্সট" },
+              { id: "field_number", title: "🔢 নাম্বার" },
+              { id: "field_select", title: "📋 সিলেক্ট অপশন" },
+              { id: "field_file", title: "📁 ফাইল" },
+            ],
+          );
+        } else if (fieldStep === 3) {
+          // Field Type
+          const fieldType =
+            input === "field_text"
+              ? "text"
+              : input === "field_number"
+                ? "number"
+                : input === "field_select"
+                  ? "select"
+                  : "file";
+
+          await stateManager.updateStateData(formattedPhone, {
+            adminAddService: {
+              ...state?.data?.adminAddService,
+              currentField: {
+                ...state?.data?.adminAddService?.currentField,
+                type: fieldType,
+              },
+              fieldStep: fieldType === "select" ? 4 : 5,
+            },
+          });
+
+          if (fieldType === "select") {
+            await sendTextWithCancelButton(
+              phone,
+              "📋 *অপশনসমূহ লিখুন*\n\nঅপশনগুলো কমা (,) দিয়ে আলাদা করে লিখুন:\n\nউদাহরণ: 'ছোট, মধ্যম, বড়'\n\n📌 কমপক্ষে ২টি অপশন দিন",
+            );
+          } else {
+            await sendQuickReplyMenu(
+              phone,
+              "📋 প্রয়োজনীয়তা\n\nফিল্ডটি কি প্রয়োজনীয়?",
+              [
+                { id: "required_yes", title: "✅ প্রয়োজনীয়" },
+                { id: "required_no", title: "➡️ ঐচ্ছিক" },
+              ],
+            );
+          }
+        } else if (fieldStep === 4) {
+          // Select Options
+          const options = input
+            .split(",")
+            .map((opt) => opt.trim())
+            .filter((opt) => opt.length > 0);
+
+          if (options.length < 2) {
+            await sendTextMessage(phone, "❌ কমপক্ষে ২টি অপশন দিন!");
+            return;
+          }
+
+          await stateManager.updateStateData(formattedPhone, {
+            adminAddService: {
+              ...state?.data?.adminAddService,
+              currentField: {
+                ...state?.data?.adminAddService?.currentField,
+                options: options,
+              },
+              fieldStep: 5,
+            },
+          });
+
+          await sendQuickReplyMenu(
+            phone,
+            "📋 প্রয়োজনীয়তা\n\nফিল্ডটি কি প্রয়োজনীয়?",
+            [
+              { id: "required_yes", title: "✅ প্রয়োজনীয়" },
+              { id: "required_no", title: "➡️ ঐচ্ছিক" },
+            ],
+          );
+        } else if (fieldStep === 5) {
+          // Required or not
+          const required = input === "required_yes";
+          const currentField = state?.data?.adminAddService?.currentField;
+
+          if (!currentField) {
+            throw new Error("Current field not found");
+          }
+
+          const completedField: ServiceField = {
+            id: `field_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            name: currentField.name || "",
+            label: currentField.label || "",
+            type: currentField.type || "text",
+            required: required,
+            options: currentField.options,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          const serviceData = state?.data?.adminAddService?.serviceData;
+          const updatedFields = [
+            ...(serviceData?.requiredFields || []),
+            completedField,
+          ];
+
+          await stateManager.updateStateData(formattedPhone, {
+            adminAddService: {
+              step: 7,
+              serviceData: {
+                ...serviceData,
+                requiredFields: updatedFields,
+              },
+              fieldStep: 1,
+              currentField: undefined,
+            },
+          });
+
+          await sendQuickReplyMenu(
+            phone,
+            "📋 ফিল্ড যোগ করা হয়েছে\n\nআরেকটি ফিল্ড যোগ করবেন?",
+            [
+              { id: "add_more_fields", title: "➕ আরেকটি যোগ করুন" },
+              { id: "finish_fields", title: "✅ শেষ করুন" },
+            ],
+          );
+        }
+        break;
+
+      case 7: // More fields or finish
+        if (input === "add_more_fields") {
+          await stateManager.updateStateData(formattedPhone, {
+            adminAddService: {
+              ...state?.data?.adminAddService,
+              step: 6,
+              fieldStep: 1,
+            },
+          });
+
+          await sendTextWithCancelButton(
+            phone,
+            "📝 *পরবর্তী ফিল্ডের নাম লিখুন*\n\nফিল্ডের নাম লিখুন (ইংরেজিতে):\n\nউদাহরণ: 'email'",
+          );
+        } else {
+          await finalizeServiceCreation(phone);
+        }
+        break;
+
+      default:
+        await sendTextMessage(phone, "❌ অজানা ধাপ!");
+        await cancelFlow(phone, true);
+    }
+  } catch (err) {
+    EnhancedLogger.error(`Error in admin add service step ${step}:`, err);
+    await sendTextMessage(phone, "❌ ত্রুটি হয়েছে। দয়া পরে চেষ্টা করুন।");
+    await cancelFlow(phone, true);
+  }
+}
+
+async function finalizeServiceCreation(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Finalizing service creation for ${formattedPhone}`);
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const serviceData = state?.data?.adminAddService?.serviceData;
+
+    if (
+      !serviceData ||
+      !serviceData.name ||
+      !serviceData.description ||
+      !serviceData.price
+    ) {
+      await sendTextMessage(phone, "❌ সার্ভিস তথ্য অসম্পূর্ণ!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    await connectDB();
+
+    // Check if service with same name exists
+    const existingService = await Service.findOne({
+      name: { $regex: new RegExp(`^${serviceData.name}$`, "i") },
+    });
+
+    if (existingService) {
+      await sendTextMessage(phone, "❌ এই নামে একটি সার্ভিস ইতিমধ্যে আছে!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    // Create the service
+    const newService = await Service.create({
+      name: serviceData.name,
+      description: serviceData.description,
+      price: serviceData.price,
+      instructions: serviceData.instructions || "",
+      requiredFields: serviceData.requiredFields || [],
+      isActive: true,
+    });
+
+    const message =
+      `✅ *সার্ভিস তৈরি সফল*\n\n` +
+      `📦 সার্ভিস: ${serviceData.name}\n` +
+      `💰 মূল্য: ৳${serviceData.price}\n` +
+      `📝 বিবরণ: ${serviceData.description}\n` +
+      `📋 ফিল্ড সংখ্যা: ${serviceData.requiredFields?.length || 0}\n` +
+      `🆔 সার্ভিস আইডি: ${newService._id}\n\n` +
+      `🎉 সার্ভিস সফলভাবে তৈরি করা হয়েছে!\n\n` +
+      `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, message);
+
+    await notifyAdmin(
+      `📦 নতুন সার্ভিস তৈরি করা হয়েছে\n\nসার্ভিস: ${serviceData.name}\nমূল্য: ৳${serviceData.price}\nতৈরি করেছেন: ${formattedPhone}\nসার্ভিস আইডি: ${newService._id}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_add_service", {
+      serviceId: newService._id,
+      serviceName: serviceData.name,
+      price: serviceData.price,
+      fieldCount: serviceData.requiredFields?.length || 0,
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to finalize service creation:`, err);
+    await sendTextMessage(phone, "❌ সার্ভিস তৈরি করতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+// --- Admin View Services ---
+async function handleAdminViewServices(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin viewing services for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const services = await Service.find().sort({ createdAt: -1 }).limit(15);
+
+    if (services.length === 0) {
+      await sendTextMessage(phone, "📭 কোন সার্ভিস পাওয়া যায়নি।");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    let message = "📦 *সার্ভিস তালিকা:*\n\n";
+
+    services.forEach((service, index) => {
+      const status = service.isActive ? "✅" : "❌";
+      const fieldCount = service.requiredFields?.length || 0;
+
+      message += `${index + 1}. ${status} ${service.name}\n`;
+      message += `   💰: ৳${service.price}\n`;
+      message += `   📋: ${fieldCount} ফিল্ড\n`;
+      message += `   🆔: ${service._id}\n`;
+      message += `   📅: ${new Date(service.createdAt).toLocaleDateString()}\n\n`;
+    });
+
+    const totalServices = await Service.countDocuments();
+    const activeServices = await Service.countDocuments({ isActive: true });
+    const totalRevenue = await Service.aggregate([
+      {
+        $lookup: {
+          from: "orders",
+          localField: "_id",
+          foreignField: "serviceId",
+          as: "orders",
+        },
+      },
+      { $unwind: "$orders" },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: "$orders.totalPrice" },
+        },
+      },
+    ]);
+
+    const revenue = totalRevenue[0]?.total || 0;
+
+    message += `📊 *স্ট্যাটিসটিক্স:*\n`;
+    message += `• মোট সার্ভিস: ${totalServices}\n`;
+    message += `• সক্রিয় সার্ভিস: ${activeServices}\n`;
+    message += `• মোট আয়: ৳${revenue}\n\n`;
+    message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, message);
+    await showMainMenu(phone, true);
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to show services to admin ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(phone, "❌ সার্ভিস লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+// --- Admin Edit Service ---
+async function handleAdminEditServiceStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin starting edit service for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const services = await Service.find().sort({ name: 1 }).limit(15);
+
+    if (services.length === 0) {
+      await sendTextMessage(phone, "📭 কোন সার্ভিস পাওয়া যায়নি।");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    const serviceRows = services.map((service) => ({
+      id: `edit_${service._id}`,
+      title: `${service.isActive ? "✅" : "❌"} ${service.name} - ৳${service.price}`,
+      description: service.description.substring(0, 50) + "...",
+    }));
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "admin_edit_service_select",
+      flowType: "admin_edit_service",
+      data: {
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
+    });
+
+    await sendListMenu(
+      phone,
+      "✏️ সার্ভিস এডিট করুন",
+      "এডিট করতে চান এমন সার্ভিস সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+      serviceRows,
+      "সার্ভিসসমূহ",
+      "সার্ভিস সিলেক্ট করুন",
+    );
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to start edit service for ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(phone, "❌ সার্ভিস লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+async function handleAdminEditServiceSelection(
+  phone: string,
+  serviceId: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const actualServiceId = serviceId.replace("edit_", "");
+  EnhancedLogger.info(`Admin selected service for edit: ${actualServiceId}`);
+
+  try {
+    await connectDB();
+    const service = await Service.findById(actualServiceId);
+
+    if (!service) {
+      await sendTextMessage(phone, "❌ সার্ভিস পাওয়া যায়নি!");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    await stateManager.updateStateData(formattedPhone, {
+      adminEditService: {
+        serviceId: actualServiceId,
+        serviceData: service.toObject(),
+        step: 1,
+      },
+    });
+
+    const editMenuRows = [
+      {
+        id: "edit_name",
+        title: "📛 নাম পরিবর্তন",
+        description: "সার্ভিসের নাম পরিবর্তন করুন",
+      },
+      {
+        id: "edit_description",
+        title: "📝 বিবরণ পরিবর্তন",
+        description: "সার্ভিসের বিবরণ পরিবর্তন করুন",
+      },
+      {
+        id: "edit_price",
+        title: "💰 মূল্য পরিবর্তন",
+        description: "সার্ভিসের মূল্য পরিবর্তন করুন",
+      },
+      {
+        id: "edit_instructions",
+        title: "📋 নির্দেশনা পরিবর্তন",
+        description: "সার্ভিসের নির্দেশনা পরিবর্তন করুন",
+      },
+      {
+        id: "edit_status",
+        title: "🔀 স্ট্যাটাস পরিবর্তন",
+        description: "সার্ভিস সক্রিয়/নিষ্ক্রিয় করুন",
+      },
+      {
+        id: "edit_fields",
+        title: "📋 ফিল্ড ম্যানেজমেন্ট",
+        description: "প্রয়োজনীয় ফিল্ডসমূহ ম্যানেজ করুন",
+      },
+    ];
+
+    await sendListMenu(
+      phone,
+      `✏️ ${service.name} এডিট করুন`,
+      "কি পরিবর্তন করতে চান?\n\nবর্তমান তথ্য:\n• মূল্য: ৳${service.price}\n• স্ট্যাটাস: ${service.isActive ? 'সক্রিয়' : 'নিষ্ক্রিয়'}\n• ফিল্ড: ${service.requiredFields?.length || 0}টি\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+      editMenuRows,
+      "এডিট অপশন",
+      "অপশন সিলেক্ট করুন",
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to handle edit service selection:`, err);
+    await sendTextMessage(phone, "❌ সার্ভিস লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+async function handleAdminEditServiceOption(
+  phone: string,
+  optionId: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin editing service option: ${optionId}`);
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const serviceId = state?.data?.adminEditService?.serviceId;
+
+    if (!serviceId) {
+      await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    await connectDB();
+    const service = await Service.findById(serviceId);
+    if (!service) {
+      await sendTextMessage(phone, "❌ সার্ভিস পাওয়া যায়নি!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    await stateManager.updateStateData(formattedPhone, {
+      adminEditService: {
+        ...state.data?.adminEditService,
+        editOption: optionId,
+        step: 2,
+      },
+    });
+
+    let message = "";
+    switch (optionId) {
+      case "edit_name":
+        message = `বর্তমান নাম: ${service.name}\n\nনতুন নাম লিখুন:`;
+        break;
+      case "edit_description":
+        message = `বর্তমান বিবরণ: ${service.description}\n\nনতুন বিবরণ লিখুন:`;
+        break;
+      case "edit_price":
+        message = `বর্তমান মূল্য: ৳${service.price}\n\nনতুন মূল্য লিখুন:`;
+        break;
+      case "edit_instructions":
+        message = `বর্তমান নির্দেশনা: ${service.instructions || "নেই"}\n\nনতুন নির্দেশনা লিখুন:\n\nস্কিপ করতে 'skip' লিখুন`;
+        break;
+      case "edit_status":
+        const newStatus = !service.isActive;
+        await Service.findByIdAndUpdate(serviceId, { isActive: newStatus });
+
+        await sendTextMessage(
+          phone,
+          `✅ *স্ট্যাটাস পরিবর্তন করা হয়েছে*\n\nসার্ভিস: ${service.name}\nনতুন স্ট্যাটাস: ${newStatus ? "✅ সক্রিয়" : "❌ নিষ্ক্রিয়"}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+        );
+
+        await notifyAdmin(
+          `🔀 সার্ভিস স্ট্যাটাস পরিবর্তন\n\nসার্ভিস: ${service.name}\nনতুন স্ট্যাটাস: ${newStatus ? "সক্রিয়" : "নিষ্ক্রিয়"}\nপরিবর্তন করেছেন: ${formattedPhone}`,
+        );
+
+        await stateManager.clearUserState(formattedPhone);
+        await showMainMenu(phone, true);
+        return;
+      case "edit_fields":
+        await handleAdminEditServiceFields(phone);
+        return;
+    }
+
+    await sendTextWithCancelButton(phone, message);
+  } catch (err) {
+    EnhancedLogger.error(`Failed to handle edit service option:`, err);
+    await sendTextMessage(phone, "❌ অপশন প্রসেস করতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+async function handleAdminEditServiceUpdate(
+  phone: string,
+  input: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const serviceId = state?.data?.adminEditService?.serviceId;
+  const editOption = state?.data?.adminEditService?.editOption;
+
+  if (!serviceId || !editOption) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  EnhancedLogger.info(`Admin updating service ${editOption}`, {
+    serviceId,
+    editOption,
+    input,
+  });
+
+  try {
+    await connectDB();
+    const service = await Service.findById(serviceId);
+    if (!service) {
+      await sendTextMessage(phone, "❌ সার্ভিস পাওয়া যায়নি!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    let updateData: any = {};
+    let updateField = "";
+    let newValue = "";
+
+    switch (editOption) {
+      case "edit_name":
+        if (!input.trim()) {
+          await sendTextMessage(phone, "❌ দয়া করে একটি নাম লিখুন!");
+          return;
+        }
+        updateData.name = input.trim();
+        updateField = "নাম";
+        newValue = input.trim();
+        break;
+      case "edit_description":
+        if (!input.trim()) {
+          await sendTextMessage(phone, "❌ দয়া করে একটি বিবরণ লিখুন!");
+          return;
+        }
+        updateData.description = input.trim();
+        updateField = "বিবরণ";
+        newValue = input.trim();
+        break;
+      case "edit_price":
+        const newPrice = parseFloat(input);
+        if (isNaN(newPrice) || newPrice <= 0 || newPrice > 1000000) {
+          await sendTextMessage(
+            phone,
+            "❌ দয়া করে ১ থেকে ১০,০০,০০০ এর মধ্যে সঠিক মূল্য লিখুন!",
+          );
+          return;
+        }
+        updateData.price = newPrice;
+        updateField = "মূল্য";
+        newValue = `৳${newPrice}`;
+        break;
+      case "edit_instructions":
+        updateData.instructions =
+          input.toLowerCase() === "skip" ? "" : input.trim();
+        updateField = "নির্দেশনা";
+        newValue =
+          input.toLowerCase() === "skip" ? "রিমুভ করা হয়েছে" : input.trim();
+        break;
+    }
+
+    await Service.findByIdAndUpdate(serviceId, updateData);
+
+    await sendTextMessage(
+      phone,
+      `✅ *সার্ভিস আপডেট করা হয়েছে*\n\nসার্ভিস: ${service.name}\nফিল্ড: ${updateField}\nনতুন মান: ${newValue}\n\n🎉 পরিবর্তনগুলি সফলভাবে সংরক্ষণ করা হয়েছে!\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+    );
+
+    await notifyAdmin(
+      `✏️ সার্ভিস আপডেট করা হয়েছে\n\nসার্ভিস: ${service.name}\nফিল্ড: ${updateField}\nনতুন মান: ${newValue}\nআপডেট করেছেন: ${formattedPhone}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_edit_service", {
+      serviceId,
+      editOption,
+      oldValue: service[editOption.replace("edit_", "") as keyof IService],
+      newValue: input,
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to update service:`, err);
+    await sendTextMessage(phone, "❌ আপডেট করতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+async function handleAdminEditServiceFields(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const serviceId = state?.data?.adminEditService?.serviceId;
+
+  if (!serviceId) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  const fieldMenuRows = [
+    {
+      id: "fields_add",
+      title: "➕ নতুন ফিল্ড যোগ করুন",
+      description: "সার্ভিসে নতুন ফিল্ড যোগ করুন",
+    },
+    {
+      id: "fields_view",
+      title: "👁️ ফিল্ডসমূহ দেখুন",
+      description: "সকল ফিল্ড দেখুন",
+    },
+    {
+      id: "fields_remove",
+      title: "🗑️ ফিল্ড রিমুভ করুন",
+      description: "ফিল্ড রিমুভ করুন",
+    },
+  ];
+
+  await sendListMenu(
+    phone,
+    "📋 ফিল্ড ম্যানেজমেন্ট",
+    "ফিল্ড ম্যানেজমেন্ট অপশন সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+    fieldMenuRows,
+    "ফিল্ড অপশন",
+    "অপশন সিলেক্ট করুন",
+  );
+}
+
+// --- Admin Delete Service ---
+async function handleAdminDeleteServiceStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin starting delete service for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const services = await Service.find().sort({ name: 1 }).limit(15);
+
+    if (services.length === 0) {
+      await sendTextMessage(phone, "📭 কোন সার্ভিস পাওয়া যায়নি।");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    const serviceRows = await Promise.all(
+      services.map(async (service) => ({
+        id: `delete_${service._id}`,
+        title: `${service.name} - ৳${service.price}`,
+        description: `অর্ডার: ${await Order.countDocuments({ serviceId: service._id })}টি`,
+      }))
+    );
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "admin_delete_service_select",
+      flowType: "admin_delete_service",
+      data: {
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
+    });
+
+    await sendListMenu(
+      phone,
+      "🗑️ সার্ভিস ডিলিট করুন",
+      "ডিলিট করতে চান এমন সার্ভিস সিলেক্ট করুন:\n\n⚠️ সতর্কতা: সার্ভিস ডিলিট করলে সংশ্লিষ্ট সকল তথ্য চিরতরে মুছে যাবে!\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+      serviceRows,
+      "সার্ভিসসমূহ",
+      "সার্ভিস সিলেক্ট করুন",
+    );
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to start delete service for ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(phone, "❌ সার্ভিস লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+async function handleAdminDeleteServiceConfirm(
+  phone: string,
+  serviceId: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const actualServiceId = serviceId.replace("delete_", "");
+  EnhancedLogger.info(
+    `Admin confirming delete for service: ${actualServiceId}`,
+  );
+
+  try {
+    await connectDB();
+    const service = await Service.findById(actualServiceId);
+
+    if (!service) {
+      await sendTextMessage(phone, "❌ সার্ভিস পাওয়া যায়নি!");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    const orderCount = await Order.countDocuments({
+      serviceId: actualServiceId,
+    });
+
+    await stateManager.updateStateData(formattedPhone, {
+      adminDeleteService: {
+        serviceId: actualServiceId,
+        serviceName: service.name,
+      },
+    });
+
+    const warningMessage =
+      orderCount > 0
+        ? `⚠️ এই সার্ভিসের সাথে ${orderCount}টি অর্ডার জড়িত আছে!\nসার্ভিস ডিলিট করলে এই অর্ডারগুলোর তথ্য হারিয়ে যেতে পারে।\n\n`
+        : "";
+
+    await sendQuickReplyMenu(
+      phone,
+      `⚠️ ডিলিট কনফার্মেশন\n\n${warningMessage}আপনি কি "${service.name}" সার্ভিসটি ডিলিট করতে চান?\n\n💰 মূল্য: ৳${service.price}\n📅 তৈরি: ${new Date(service.createdAt).toLocaleDateString()}\n\nএটি পার্মানেন্টলি ডিলিট হবে!`,
+      [
+        { id: "confirm_delete", title: "✅ ডিলিট করুন" },
+        { id: "cancel_delete", title: "❌ বাতিল করুন" },
+      ],
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to confirm delete service:`, err);
+    await sendTextMessage(phone, "❌ সার্ভিস লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+async function handleAdminDeleteServiceExecute(
+  phone: string,
+  confirm: boolean,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const serviceId = state?.data?.adminDeleteService?.serviceId;
+  const serviceName = state?.data?.adminDeleteService?.serviceName;
+
+  if (!serviceId || !serviceName) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  if (!confirm) {
+    await sendTextMessage(phone, "🚫 ডিলিট বাতিল করা হয়েছে।");
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+    return;
+  }
+
+  try {
+    await connectDB();
+
+    // Check if service has active orders
+    const activeOrders = await Order.countDocuments({
+      serviceId: serviceId,
+      status: { $in: ["pending", "processing"] },
+    });
+
+    if (activeOrders > 0) {
+      await sendTextMessage(
+        phone,
+        `❌ *ডিলিট সম্ভব নয়*\n\nএই সার্ভিসের ${activeOrders}টি সক্রিয় অর্ডার আছে।\nঅর্ডারগুলি প্রথমে কমপ্লিট বা ক্যান্সেল করুন।`,
+      );
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    // Delete the service
+    await Service.findByIdAndDelete(serviceId);
+
+    await sendTextMessage(
+      phone,
+      `✅ *সার্ভিস ডিলিট করা হয়েছে*\n\nসার্ভিস: ${serviceName}\n🆔: ${serviceId}\n\n🗑️ সার্ভিস সফলভাবে ডিলিট করা হয়েছে!\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+    );
+
+    await notifyAdmin(
+      `🗑️ সার্ভিস ডিলিট করা হয়েছে\n\nসার্ভিস: ${serviceName}\nআইডি: ${serviceId}\nডিলিট করেছেন: ${formattedPhone}\nসময়: ${new Date().toLocaleString()}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_delete_service", {
+      serviceId,
+      serviceName,
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to delete service:`, err);
+    await sendTextMessage(phone, "❌ ডিলিট করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+// --- Admin Toggle Service ---
+async function handleAdminToggleServiceStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin starting toggle service for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const services = await Service.find().sort({ name: 1 }).limit(15);
+
+    if (services.length === 0) {
+      await sendTextMessage(phone, "📭 কোন সার্ভিস পাওয়া যায়নি।");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    const serviceRows = services.map((service) => ({
+      id: `toggle_${service._id}`,
+      title: `${service.isActive ? "✅" : "❌"} ${service.name} - ৳${service.price}`,
+      description: service.isActive
+        ? "সক্রিয় (নিষ্ক্রিয় করতে ক্লিক করুন)"
+        : "নিষ্ক্রিয় (সক্রিয় করতে ক্লিক করুন)",
+    }));
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "admin_toggle_service_select",
+      flowType: "admin_toggle_service",
+      data: {
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
+    });
+
+    await sendListMenu(
+      phone,
+      "🔀 সার্ভিস স্ট্যাটাস পরিবর্তন",
+      "স্ট্যাটাস পরিবর্তন করতে চান এমন সার্ভিস সিলেক্ট করুন:\n\n✅ = সক্রিয়\n❌ = নিষ্ক্রিয়\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+      serviceRows,
+      "সার্ভিসসমূহ",
+      "সার্ভিস সিলেক্ট করুন",
+    );
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to start toggle service for ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(phone, "❌ সার্ভিস লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+async function handleAdminToggleServiceExecute(
+  phone: string,
+  serviceId: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const actualServiceId = serviceId.replace("toggle_", "");
+  EnhancedLogger.info(`Admin toggling service: ${actualServiceId}`);
+
+  try {
+    await connectDB();
+    const service = await Service.findById(actualServiceId);
+
+    if (!service) {
+      await sendTextMessage(phone, "❌ সার্ভিস পাওয়া যায়নি!");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    const newStatus = !service.isActive;
+    service.isActive = newStatus;
+    await service.save();
+
+    await sendTextMessage(
+      phone,
+      `✅ *সার্ভিস স্ট্যাটাস পরিবর্তন করা হয়েছে*\n\nসার্ভিস: ${service.name}\nনতুন স্ট্যাটাস: ${newStatus ? "✅ সক্রিয়" : "❌ নিষ্ক্রিয়"}\n\n🎉 পরিবর্তনগুলি সফলভাবে সংরক্ষণ করা হয়েছে!\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+    );
+
+    await notifyAdmin(
+      `🔀 সার্ভিস স্ট্যাটাস পরিবর্তন\n\nসার্ভিস: ${service.name}\nআইডি: ${actualServiceId}\nনতুন স্ট্যাটাস: ${newStatus ? "সক্রিয়" : "নিষ্ক্রিয়"}\nপরিবর্তন করেছেন: ${formattedPhone}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_toggle_service", {
+      serviceId: actualServiceId,
+      serviceName: service.name,
+      oldStatus: !newStatus,
+      newStatus,
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to toggle service:`, err);
+    await sendTextMessage(phone, "❌ স্ট্যাটাস পরিবর্তন করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+// --- Admin Order Management ---
+async function handleAdminOrders(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin order management for ${formattedPhone}`);
+
+  const orderMenuRows = [
+    {
+      id: "admin_view_orders",
+      title: "👁️ অর্ডার তালিকা দেখুন",
+      description: "সকল অর্ডারের তালিকা দেখুন",
+    },
+    {
+      id: "admin_process_order",
+      title: "🔄 অর্ডার প্রসেস করুন",
+      description: "অর্ডার স্ট্যাটাস পরিবর্তন করুন",
+    },
+    {
+      id: "admin_search_order",
+      title: "🔍 অর্ডার খুঁজুন",
+      description: "অর্ডার আইডি দিয়ে খুঁজুন",
+    },
+    {
+      id: "admin_order_stats",
+      title: "📊 অর্ডার স্ট্যাটিসটিক্স",
+      description: "অর্ডার সম্পর্কিত পরিসংখ্যান",
+    },
+  ];
+
+  await sendListMenu(
+    phone,
+    "📋 অর্ডার ম্যানেজমেন্ট",
+    "অর্ডার ম্যানেজমেন্ট অপশন সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+    orderMenuRows,
+    "অর্ডার অপশন",
+    "অপশন দেখুন",
+  );
+}
+
+// --- Admin View Orders ---
+async function handleAdminViewOrders(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin viewing orders for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const orders = await Order.find()
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .populate("userId", "name whatsapp");
+
+    if (orders.length === 0) {
+      await sendTextMessage(phone, "📭 কোন অর্ডার পাওয়া যায়নি।");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    let message = "📦 *অর্ডার তালিকা:*\n\n";
+
+    orders.forEach((order, index) => {
+      const statusMap = {
+        pending: "⏳",
+        processing: "🔄",
+        completed: "✅",
+        failed: "❌",
+        cancelled: "🚫",
+      };
+      const statusEmoji =
+        statusMap[order.status as keyof typeof statusMap] || "📝";
+      const user = order.userId as any;
+
+      message += `${index + 1}. ${statusEmoji} ${order.serviceName}\n`;
+      message += `   🆔: ${order.orderId}\n`;
+      message += `   👤: ${user?.name || "N/A"} (${user?.whatsapp || "N/A"})\n`;
+      message += `   💰: ৳${order.totalPrice}\n`;
+      message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
+    });
+
+    const totalOrders = await Order.countDocuments();
+    const pendingOrders = await Order.countDocuments({ status: "pending" });
+    const totalRevenue = await Order.aggregate([
+      { $group: { _id: null, total: { $sum: "$totalPrice" } } },
+    ]);
+    const revenue = totalRevenue[0]?.total || 0;
+
+    message += `📊 *স্ট্যাটিসটিক্স:*\n`;
+    message += `• মোট অর্ডার: ${totalOrders}\n`;
+    message += `• পেন্ডিং অর্ডার: ${pendingOrders}\n`;
+    message += `• মোট আয়: ৳${revenue}\n\n`;
+    message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, message);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.info(`Admin orders view sent to ${formattedPhone}`, {
+      orderCount: orders.length,
+    });
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to show orders to admin ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(phone, "❌ অর্ডার লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+// --- Admin Process Order ---
+async function handleAdminProcessOrderStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin starting process order for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const orders = await Order.find({
+      status: { $in: ["pending", "processing"] },
+    })
+      .sort({ createdAt: 1 })
+      .limit(10)
+      .populate("userId", "name whatsapp");
+
+    if (orders.length === 0) {
+      await sendTextMessage(
+        phone,
+        "📭 কোন পেন্ডিং বা প্রসেসিং অর্ডার পাওয়া যায়নি।",
+      );
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    const orderRows = orders.map((order) => ({
+      id: `process_${order._id}`,
+      title: `🆔 ${order.orderId} - ৳${order.totalPrice}`,
+      description: `${order.serviceName} - ${(order.userId as any)?.name || "N/A"} (${order.status})`,
+    }));
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "admin_process_order_select",
+      flowType: "admin_process_order",
+      data: {
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
+    });
+
+    await sendListMenu(
+      phone,
+      "🔄 অর্ডার প্রসেস করুন",
+      "প্রসেস করতে চান এমন অর্ডার সিলেক্ট করুন:\n\n⏳ = পেন্ডিং\n🔄 = প্রসেসিং\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+      orderRows,
+      "অর্ডারসমূহ",
+      "অর্ডার সিলেক্ট করুন",
+    );
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to start process order for ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(phone, "❌ অর্ডার লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+async function handleAdminProcessOrderStatus(
+  phone: string,
+  orderId: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const actualOrderId = orderId.replace("process_", "");
+  EnhancedLogger.info(`Admin processing order: ${actualOrderId}`);
+
+  try {
+    await connectDB();
+    const order = await Order.findById(actualOrderId).populate(
+      "userId",
+      "name whatsapp",
+    );
+
+    if (!order) {
+      await sendTextMessage(phone, "❌ অর্ডার পাওয়া যায়নি!");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    await stateManager.updateStateData(formattedPhone, {
+      adminProcessOrder: {
+        orderId: actualOrderId,
+        order: order,
+      },
+    });
+
+    const statusRows = [
+      {
+        id: "status_processing",
+        title: "🔄 প্রসেসিং",
+        description: "অর্ডারটি প্রসেস করা হচ্ছে",
+      },
+      {
+        id: "status_completed",
+        title: "✅ কমপ্লিটেড",
+        description: "অর্ডারটি সম্পন্ন হয়েছে",
+      },
+      {
+        id: "status_failed",
+        title: "❌ ফেইলড",
+        description: "অর্ডারটি ব্যর্থ হয়েছে",
+      },
+      {
+        id: "status_cancelled",
+        title: "🚫 ক্যান্সেলড",
+        description: "অর্ডারটি বাতিল করা হয়েছে",
+      },
+    ];
+
+    await sendListMenu(
+      phone,
+      `🔄 ${order.orderId} - স্ট্যাটাস পরিবর্তন`,
+      `বর্তমান স্ট্যাটাস: ${order.status}\nসার্ভিস: ${order.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"}\nমূল্য: ৳${order.totalPrice}\n\nনতুন স্ট্যাটাস সিলেক্ট করুন:`,
+      statusRows,
+      "স্ট্যাটাস অপশন",
+      "স্ট্যাটাস সিলেক্ট করুন",
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to process order status:`, err);
+    await sendTextMessage(phone, "❌ অর্ডার লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+async function handleAdminProcessOrderUpdate(
+  phone: string,
+  statusId: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const orderId = state?.data?.adminProcessOrder?.orderId;
+  const order = state?.data?.adminProcessOrder?.order;
+
+  if (!orderId || !order) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  const newStatus = statusId.replace("status_", "");
+  EnhancedLogger.info(`Updating order ${orderId} to status: ${newStatus}`);
+
+  try {
+    await connectDB();
+
+    // Update order status
+    await Order.findByIdAndUpdate(orderId, {
+      status: newStatus,
+      updatedAt: new Date(),
+    });
+
+    // Notify user about status change
+    const user = order.userId as any;
+    if (user && user.whatsapp) {
+      const statusMessages = {
+        processing:
+          "🔄 আপনার অর্ডারটি এখন প্রসেস করা হচ্ছে। শীঘ্রই সম্পন্ন হবে।",
+        completed:
+          "✅ আপনার অর্ডারটি সম্পন্ন হয়েছে! ধন্যবাদ আমাদের সার্ভিস ব্যবহার করার জন্য।",
+        failed:
+          "❌ দুঃখিত, আপনার অর্ডারটি সম্পন্ন করতে ব্যর্থ হয়েছে। দয়া করে সাপোর্টে যোগাযোগ করুন।",
+        cancelled:
+          "🚫 আপনার অর্ডারটি বাতিল করা হয়েছে। প্রয়োজনে সাপোর্টে যোগাযোগ করুন।",
+      };
+
+      const message = statusMessages[newStatus as keyof typeof statusMessages];
+      if (message) {
+        await sendTextMessage(
+          user.whatsapp,
+          `📦 *অর্ডার স্ট্যাটাস আপডেট*\n\nঅর্ডার আইডি: ${order.orderId}\nসার্ভিস: ${order.serviceName}\nনতুন স্ট্যাটাস: ${newStatus}\n\n${message}\n\n📞 সাপোর্ট: ${CONFIG.supportNumber}\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+        );
+      }
+    }
+
+    await sendTextMessage(
+      phone,
+      `✅ *অর্ডার স্ট্যাটাস আপডেট করা হয়েছে*\n\nঅর্ডার আইডি: ${order.orderId}\nসার্ভিস: ${order.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"}\nনতুন স্ট্যাটাস: ${newStatus}\n\n✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+    );
+
+    await notifyAdmin(
+      `🔄 অর্ডার স্ট্যাটাস আপডেট\n\nঅর্ডার: ${order.orderId}\nসার্ভিস: ${order.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"} (${(order.userId as any)?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${newStatus}\nআপডেট করেছেন: ${formattedPhone}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_process_order", {
+      orderId,
+      orderStatus: newStatus,
+      userId: (order.userId as any)?._id,
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to update order status:`, err);
+    await sendTextMessage(phone, "❌ স্ট্যাটাস আপডেট করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+// --- Admin Broadcast ---
+async function handleAdminBroadcast(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin broadcast for ${formattedPhone}`);
+
+  await stateManager.setUserState(formattedPhone, {
+    currentState: "admin_broadcast_message",
+    flowType: "admin_broadcast",
+    data: {
+      adminBroadcast: {
+        step: 1,
+      },
+      lastActivity: Date.now(),
+      sessionId: Date.now().toString(36),
+    },
+  });
+
+  await sendTextWithCancelButton(
+    phone,
+    "📢 *ব্রডকাস্ট মেসেজ*\n\nসকল ব্যবহারকারীকে পাঠাতে চান এমন মেসেজ লিখুন:\n\n💡 টিপস:\n• *বোল্ড* টেক্সট: *বোল্ড*\n• _ইটালিক_ টেক্সট: _ইটালিক_\n• `কোড` টেক্সট: `কোড`\n• লিংক: https://example.com\n\n📌 মেসেজটি পরিষ্কার ও বোধগম্য হোক",
+  );
+}
+
+async function handleAdminBroadcastMessage(
+  phone: string,
+  message: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin setting broadcast message for ${formattedPhone}`, {
+    messageLength: message.length,
+  });
+
+  if (!message.trim()) {
+    await sendTextMessage(phone, "❌ দয়া করে একটি মেসেজ লিখুন!");
+    return;
+  }
+
+  if (message.length > 1000) {
+    await sendTextMessage(
+      phone,
+      "❌ মেসেজটি খুব দীর্ঘ! দয়া করে ১০০০ ক্যারেক্টারের কম লিখুন।",
+    );
+    return;
+  }
+
+  await stateManager.updateStateData(formattedPhone, {
+    adminBroadcast: {
+      message: message.trim(),
+      step: 2,
+    },
+  });
+
+  await sendQuickReplyMenu(
+    phone,
+    "👥 টার্গেট ইউজার\n\nকোন ধরনের ইউজারদের মেসেজ পাঠাতে চান?\n\n💡 মেসেজ প্রিভিউ:\n" +
+      message.substring(0, 200) +
+      (message.length > 200 ? "..." : ""),
+    [
+      { id: "broadcast_all", title: "👥 সকল ইউজার" },
+      { id: "broadcast_active", title: "✅ একটিভ ইউজার" },
+      { id: "broadcast_new", title: "🆕 নতুন ইউজার" },
+    ],
+  );
+}
+
+async function handleAdminBroadcastSend(
+  phone: string,
+  userType: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const broadcastData = state?.data?.adminBroadcast as
+    | AdminBroadcastStateData
+    | undefined;
+  const message = broadcastData?.message;
+
+  if (!message) {
+    await sendTextMessage(phone, "❌ মেসেজ পাওয়া যায়নি!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  EnhancedLogger.info(`Admin sending broadcast to ${userType} users`, {
+    messageLength: message.length,
+  });
+
+  try {
+    await connectDB();
+
+    let filter: any = {};
+    let userTypeText = "";
+
+    switch (userType) {
+      case "broadcast_active":
+        // Users active in last 30 days
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+        filter.whatsappLastActive = { $gte: thirtyDaysAgo };
+        userTypeText = "একটিভ ইউজার";
+        break;
+      case "broadcast_new":
+        // Users created in last 7 days
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        filter.createdAt = { $gte: sevenDaysAgo };
+        userTypeText = "নতুন ইউজার";
+        break;
+      default:
+        userTypeText = "সকল ইউজার";
+      // For "broadcast_all", no filter
+    }
+
+    // Get total users count first
+    const totalUsers = await User.countDocuments(filter);
+
+    if (totalUsers === 0) {
+      await sendTextMessage(phone, `📭 ${userTypeText} পাওয়া যায়নি।`);
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    // Limit broadcast to prevent rate limiting
+    const limit = Math.min(totalUsers, CONFIG.maxBroadcastUsers);
+
+    await sendTextMessage(
+      phone,
+      `⏳ *ব্রডকাস্ট শুরু হচ্ছে*\n\nটার্গেট: ${userTypeText}\nমোট ইউজার: ${totalUsers}\nপ্রেরণ করা হবে: ${limit}\n\n⚡ প্রসেস চলছে... দয়া করে অপেক্ষা করুন।`,
+    );
+
+    const users = await User.find(filter).select("whatsapp name").limit(limit);
+
+    let successCount = 0;
+    let failCount = 0;
+    const failedUsers: string[] = [];
+
+    // Send messages in batches to avoid rate limiting
+    const batchSize = 5;
+    const delayBetweenBatches = 2000; // 2 seconds
+
+    for (let i = 0; i < users.length; i += batchSize) {
+      const batch = users.slice(i, i + batchSize);
+      const batchPromises = batch.map(async (user) => {
+        try {
+          await sendTextMessage(
+            user.whatsapp,
+            `📢 *SignCopy নোটিফিকেশন*\n\n${message}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন\n📞 সাপোর্ট: ${CONFIG.supportNumber}`,
+          );
+          successCount++;
+          EnhancedLogger.debug(`Broadcast sent to ${user.whatsapp}`);
+        } catch (err) {
+          failCount++;
+          failedUsers.push(user.whatsapp);
+          EnhancedLogger.error(
+            `Failed to send broadcast to ${user.whatsapp}:`,
+            err,
+          );
+        }
+      });
+
+      await Promise.all(batchPromises);
+
+      // Update progress
+      if (i + batchSize < users.length) {
+        const progress = Math.round(((i + batchSize) / users.length) * 100);
+        await sendTextMessage(
+          phone,
+          `⏳ প্রোগ্রেস: ${progress}%\nসফল: ${successCount}\nব্যর্থ: ${failCount}`,
+        );
+      }
+
+      // Delay between batches
+      if (i + batchSize < users.length) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, delayBetweenBatches),
+        );
+      }
+    }
+
+    let resultMessage =
+      `✅ *ব্রডকাস্ট সম্পন্ন*\n\n` +
+      `টার্গেট: ${userTypeText}\n` +
+      `সফল: ${successCount}\n` +
+      `ব্যর্থ: ${failCount}\n` +
+      `মোট: ${totalUsers}\n\n`;
+
+    if (failCount > 0) {
+      resultMessage += `❌ ব্যর্থ ইউজার: ${failedUsers.slice(0, 5).join(", ")}${failedUsers.length > 5 ? "..." : ""}\n\n`;
+    }
+
+    resultMessage += `🎉 ব্রডকাস্ট মেসেজ সফলভাবে পাঠানো হয়েছে!\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, resultMessage);
+
+    await notifyAdmin(
+      `📢 ব্রডকাস্ট সম্পন্ন\n\nটার্গেট: ${userTypeText}\nমোট: ${totalUsers}\nসফল: ${successCount}\nব্যর্থ: ${failCount}\nপ্রেরক: ${formattedPhone}\nসময়: ${new Date().toLocaleString()}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_broadcast", {
+      userType,
+      totalUsers,
+      successCount,
+      failCount,
+      messageLength: message.length,
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to send broadcast:`, err);
+    await sendTextMessage(phone, "❌ ব্রডকাস্ট পাঠাতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+// --- Admin Statistics ---
+async function handleAdminStats(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin stats for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+
+    // Get all stats
+    const totalUsers = await User.countDocuments();
+    const activeUsers = await User.countDocuments({
+      whatsappLastActive: {
+        $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
+      },
+    });
+    const newUsers = await User.countDocuments({
+      createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+    });
+    const bannedUsers = await User.countDocuments({ isBanned: true });
+
+    const totalServices = await Service.countDocuments();
+    const activeServices = await Service.countDocuments({ isActive: true });
+
+    const totalOrders = await Order.countDocuments();
+    const pendingOrders = await Order.countDocuments({ status: "pending" });
+    const processingOrders = await Order.countDocuments({
+      status: "processing",
+    });
+    const completedOrders = await Order.countDocuments({ status: "completed" });
+    const cancelledOrders = await Order.countDocuments({ status: "cancelled" });
+
+    const totalTransactions = await Transaction.countDocuments();
+
+    const revenueStats = await Transaction.aggregate([
+      { $match: { method: "bkash", status: "SUCCESS" } },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: "$amount" },
+          count: { $sum: 1 },
+          avg: { $avg: "$amount" },
+        },
+      },
+    ]);
+
+    const serviceSalesStats = await Transaction.aggregate([
+      { $match: { method: "balance", status: "SUCCESS" } },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: "$amount" },
+          count: { $sum: 1 },
+          avg: { $avg: "$amount" },
+        },
+      },
+    ]);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayRevenue = await Transaction.aggregate([
+      {
+        $match: {
+          method: "bkash",
+          status: "SUCCESS",
+          createdAt: { $gte: today },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+
+    const todayServiceSales = await Transaction.aggregate([
+      {
+        $match: {
+          method: "balance",
+          status: "SUCCESS",
+          createdAt: { $gte: today },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+
+    const revenue = revenueStats[0]?.total || 0;
+    const revenueCount = revenueStats[0]?.count || 0;
+    const revenueAvg = revenueStats[0]?.avg || 0;
+
+    const serviceSales = serviceSalesStats[0]?.total || 0;
+    const serviceSalesCount = serviceSalesStats[0]?.count || 0;
+    const serviceSalesAvg = serviceSalesStats[0]?.avg || 0;
+
+    const todayRevenueTotal = todayRevenue[0]?.total || 0;
+    const todayServiceSalesTotal = todayServiceSales[0]?.total || 0;
+
+    const message =
+      `📊 *সিস্টেম স্ট্যাটিসটিক্স*\n\n` +
+      `👥 *ইউজার স্ট্যাটস:*\n` +
+      `• মোট ইউজার: ${totalUsers}\n` +
+      `• একটিভ ইউজার: ${activeUsers}\n` +
+      `• নতুন ইউজার: ${newUsers}\n` +
+      `• ব্যান্ড ইউজার: ${bannedUsers}\n\n` +
+      `📦 *সার্ভিস স্ট্যাটস:*\n` +
+      `• মোট সার্ভিস: ${totalServices}\n` +
+      `• সক্রিয় সার্ভিস: ${activeServices}\n\n` +
+      `🛒 *অর্ডার স্ট্যাটস:*\n` +
+      `• মোট অর্ডার: ${totalOrders}\n` +
+      `• পেন্ডিং: ${pendingOrders}\n` +
+      `• প্রসেসিং: ${processingOrders}\n` +
+      `• কমপ্লিটেড: ${completedOrders}\n` +
+      `• ক্যান্সেলড: ${cancelledOrders}\n\n` +
+      `💰 *ফাইনান্স স্ট্যাটস:*\n` +
+      `• মোট ট্রান্সাকশন: ${totalTransactions}\n` +
+      `• মোট রেভিনিউ: ৳${revenue}\n` +
+      `• রেভিনিউ ট্রান্সাকশন: ${revenueCount}\n` +
+      `• গড় রেভিনিউ: ৳${revenueAvg.toFixed(2)}\n` +
+      `• সার্ভিস সেলস: ৳${serviceSales}\n` +
+      `• সার্ভিস ট্রান্সাকশন: ${serviceSalesCount}\n` +
+      `• গড় সার্ভিস মূল্য: ৳${serviceSalesAvg.toFixed(2)}\n\n` +
+      `📈 *আজকের পারফরমেন্স:*\n` +
+      `• আজকের রেভিনিউ: ৳${todayRevenueTotal}\n` +
+      `• আজকের সার্ভিস সেলস: ৳${todayServiceSalesTotal}\n\n` +
+      `📅 রিপোর্ট সময়: ${new Date().toLocaleString()}`;
+
+    await sendTextMessage(phone, message);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.info(`Admin stats sent to ${formattedPhone}`, {
+      totalUsers,
+      totalOrders,
+      revenue,
+      serviceSales,
+    });
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to get stats for admin ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(phone, "❌ স্ট্যাটিসটিক্স লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+// --- Admin User Management ---
+async function handleAdminUsers(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin user management for ${formattedPhone}`);
+
+  const userMenuRows = [
+    {
+      id: "admin_view_users",
+      title: "👁️ ইউজার তালিকা দেখুন",
+      description: "সকল ইউজারের তালিকা দেখুন",
+    },
+    {
+      id: "admin_search_user",
+      title: "🔍 ইউজার খুঁজুন",
+      description: "ফোন নম্বর দিয়ে ইউজার খুঁজুন",
+    },
+    {
+      id: "admin_user_details",
+      title: "📋 ইউজার ডিটেইলস",
+      description: "ইউজারের বিস্তারিত তথ্য দেখুন",
+    },
+    {
+      id: "admin_user_stats",
+      title: "📊 ইউজার স্ট্যাটিসটিক্স",
+      description: "ইউজার সম্পর্কিত পরিসংখ্যান",
+    },
+  ];
+
+  await sendListMenu(
+    phone,
+    "👥 ইউজার ম্যানেজমেন্ট",
+    "ইউজার ম্যানেজমেন্ট অপশন সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+    userMenuRows,
+    "ইউজার অপশন",
+    "অপশন দেখুন",
+  );
+}
+
+async function handleAdminViewUsers(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin viewing users for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const users = await User.find().sort({ createdAt: -1 }).limit(10);
+
+    if (users.length === 0) {
+      await sendTextMessage(phone, "📭 কোন ইউজার পাওয়া যায়নি।");
+      await showMainMenu(phone, true);
+      return;
+    }
+
+    let message = "👥 *ইউজার তালিকা:*\n\n";
+
+    users.forEach((user, index) => {
+      const status = user.isBanned ? "🚫" : "✅";
+      const lastActive = user.whatsappLastActive
+        ? new Date(user.whatsappLastActive).toLocaleDateString()
+        : "কখনো না";
+
+      message += `${index + 1}. ${status} ${user.name}\n`;
+      message += `   📱: ${user.whatsapp}\n`;
+      message += `   💰: ৳${user.balance}\n`;
+      message += `   📊: ${user.whatsappMessageCount} মেসেজ\n`;
+      message += `   📅: ${new Date(user.createdAt).toLocaleDateString()}\n`;
+      message += `   ⏰: ${lastActive}\n\n`;
+    });
+
+    const totalUsers = await User.countDocuments();
+    const activeUsers = await User.countDocuments({
+      whatsappLastActive: {
+        $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+      },
+    });
+    const totalBalance = await User.aggregate([
+      { $group: { _id: null, total: { $sum: "$balance" } } },
+    ]);
+    const totalBalanceAmount = totalBalance[0]?.total || 0;
+
+    message += `📊 *স্ট্যাটিসটিক্স:*\n`;
+    message += `• মোট ইউজার: ${totalUsers}\n`;
+    message += `• সক্রিয় ইউজার: ${activeUsers}\n`;
+    message += `• মোট ব্যালেন্স: ৳${totalBalanceAmount}\n`;
+    message += `• গড় ব্যালেন্স: ৳${(totalBalanceAmount / totalUsers).toFixed(2)}\n\n`;
+    message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, message);
+    await showMainMenu(phone, true);
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to show users to admin ${formattedPhone}:`,
+      err,
+    );
+    await sendTextMessage(phone, "❌ ইউজার লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+// --- Admin Add Balance ---
+async function handleAdminAddBalanceStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin starting add balance for ${formattedPhone}`);
+
+  await stateManager.setUserState(formattedPhone, {
+    currentState: "admin_add_balance_phone",
+    flowType: "admin_add_balance",
+    data: {
+      adminAddBalance: {
+        step: 1,
+      },
+      lastActivity: Date.now(),
+      sessionId: Date.now().toString(36),
+    },
+  });
+
+  await sendTextWithCancelButton(
+    phone,
+    "💰 *ব্যালেন্স যোগ করুন*\n\nযে ইউজারের ব্যালেন্স যোগ করতে চান, তার ফোন নম্বর লিখুন:\n\nফরম্যাট:\n• 017XXXXXXXX\n• 88017XXXXXXXX\n• +88017XXXXXXXX\n\n📌 নোট: ইউজারটি সিস্টেমে থাকতে হবে",
+  );
+}
+
+async function handleAdminAddBalancePhone(
+  phone: string,
+  userPhone: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin adding balance for user: ${userPhone}`);
+
+  try {
+    const formattedUserPhone = formatPhoneNumber(userPhone);
+
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedUserPhone });
+
+    if (!user) {
+      await sendTextMessage(
+        phone,
+        `❌ ইউজার পাওয়া যায়নি: ${formattedUserPhone}\n\nদয়া করে সঠিক ফোন নম্বর দিন অথবা ইউজারকে প্রথমে সিস্টেমে রেজিস্টার করতে বলুন।`,
+      );
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    if (user.isBanned) {
+      await sendTextMessage(
+        phone,
+        `❌ ইউজারটি ব্যান্ড করা হয়েছে: ${formattedUserPhone}\n\nনাম: ${user.name}\nস্ট্যাটাস: 🚫 ব্যান্ড\n\nপ্রথমে ইউজার আনবান করুন।`,
+      );
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    await stateManager.updateStateData(formattedPhone, {
+      adminAddBalance: {
+        phone: formattedUserPhone,
+        userId: user._id,
+        step: 2,
+      },
+    });
+
+    await sendTextWithCancelButton(
+      phone,
+      `💰 *পরিমাণ লিখুন*\n\nইউজার: ${user.name}\nফোন: ${formattedUserPhone}\nবর্তমান ব্যালেন্স: ৳${user.balance}\n\nযোগ করতে চান এমন পরিমাণ লিখুন:\n\n📌 শুধু সংখ্যা লিখুন (দশমিক চিহ্ন ছাড়া)\nউদাহরণ: 100`,
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to find user for balance add:`, err);
+    await sendTextMessage(phone, "❌ ইউজার খুঁজতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+async function handleAdminAddBalanceAmount(
+  phone: string,
+  amountStr: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const userPhone = state?.data?.adminAddBalance?.phone;
+
+  if (!userPhone) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  const amount = parseFloat(amountStr);
+  if (isNaN(amount) || amount <= 0 || amount > 100000) {
+    await sendTextMessage(
+      phone,
+      "❌ দয়া করে ১ থেকে ১,০০,০০০ এর মধ্যে সঠিক পরিমাণ লিখুন!",
+    );
+    await sendTextWithCancelButton(phone, "পরিমাণ লিখুন:");
+    return;
+  }
+
+  await stateManager.updateStateData(formattedPhone, {
+    adminAddBalance: {
+      ...state.data?.adminAddBalance,
+      amount: amount,
+      step: 3,
+    },
+  });
+
+  await sendTextWithCancelButton(
+    phone,
+    `📝 *কারণ লিখুন*\n\nপরিমাণ: ৳${amount}\nইউজার: ${userPhone}\n\nকারণ লিখুন (ঐচ্ছিক):\n\nউদাহরণ: 'রেফারেল বোনাস', 'সাপোর্ট রিকোয়েস্ট'\n\nস্কিপ করতে 'skip' লিখুন`,
+  );
+}
+
+async function handleAdminAddBalanceReason(
+  phone: string,
+  reason: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const userPhone = state?.data?.adminAddBalance?.phone;
+  const amount = state?.data?.adminAddBalance?.amount;
+  const userId = state?.data?.adminAddBalance?.userId;
+
+  if (!userPhone || !amount || !userId) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  try {
+    await connectDB();
+    const user = await User.findById(userId);
+
+    if (!user) {
+      await sendTextMessage(phone, `❌ ইউজার পাওয়া যায়নি: ${userPhone}`);
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    // Add balance
+    const oldBalance = user.balance;
+    user.balance += amount;
+    await user.save();
+
+    // Create transaction record
+    const transaction = await Transaction.create({
+      trxId: `ADMIN-ADD-${Date.now()}`,
+      amount: amount,
+      method: "admin_add",
+      status: "SUCCESS",
+      number: userPhone,
+      user: user._id,
+      metadata: {
+        addedBy: formattedPhone,
+        reason: reason === "skip" ? "Admin manual add" : reason,
+        oldBalance: oldBalance,
+        newBalance: user.balance,
+      },
+      createdAt: new Date(),
+    });
+
+    // Notify user
+    await sendTextMessage(
+      userPhone,
+      `💰 *ব্যালেন্স যোগ করা হয়েছে*\n\nপরিমাণ: +৳${amount}\nপুরোনো ব্যালেন্স: ৳${oldBalance}\nনতুন ব্যালেন্স: ৳${user.balance}\nকারণ: ${reason === "skip" ? "Admin manual add" : reason}\nসময়: ${new Date().toLocaleString()}\n\n🎉 আপনার অ্যাকাউন্টে ব্যালেন্স যোগ করা হয়েছে!\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+    );
+
+    await sendTextMessage(
+      phone,
+      `✅ *ব্যালেন্স যোগ করা হয়েছে*\n\nইউজার: ${user.name} (${userPhone})\nপরিমাণ: +৳${amount}\nপুরোনো ব্যালেন্স: ৳${oldBalance}\nনতুন ব্যালেন্স: ৳${user.balance}\nকারণ: ${reason === "skip" ? "Admin manual add" : reason}\n\n✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+    );
+
+    await notifyAdmin(
+      `💰 ব্যালেন্স যোগ করা হয়েছে\n\nযোগ করেছেন: ${formattedPhone}\nইউজার: ${user.name} (${userPhone})\nপরিমাণ: ৳${amount}\nপুরোনো ব্যালেন্স: ৳${oldBalance}\nনতুন ব্যালেন্স: ৳${user.balance}\nকারণ: ${reason === "skip" ? "Admin manual add" : reason}\nট্রান্সাকশন: ${transaction._id}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_add_balance", {
+      userId,
+      userPhone,
+      amount,
+      oldBalance,
+      newBalance: user.balance,
+      reason,
+      transactionId: transaction._id,
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to add balance:`, err);
+    await sendTextMessage(phone, "❌ ব্যালেন্স যোগ করতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+// --- Admin Ban User ---
+async function handleAdminBanUserStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin starting ban user for ${formattedPhone}`);
+
+  await stateManager.setUserState(formattedPhone, {
+    currentState: "admin_ban_user_phone",
+    flowType: "admin_ban_user",
+    data: {
+      adminBanUser: {
+        step: 1,
+      },
+      lastActivity: Date.now(),
+      sessionId: Date.now().toString(36),
+    },
+  });
+
+  await sendTextWithCancelButton(
+    phone,
+    "🚫 *ইউজার ব্যান/আনবান করুন*\n\nযে ইউজারকে ব্যান বা আনবান করতে চান, তার ফোন নম্বর লিখুন:\n\nফরম্যাট:\n• 017XXXXXXXX\n• 88017XXXXXXXX\n\n📌 নোট: ইউজারটি সিস্টেমে থাকতে হবে",
+  );
+}
+
+async function handleAdminBanUserPhone(
+  phone: string,
+  userPhone: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin banning user: ${userPhone}`);
+
+  try {
+    const formattedUserPhone = formatPhoneNumber(userPhone);
+
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedUserPhone });
+
+    if (!user) {
+      await sendTextMessage(
+        phone,
+        `❌ ইউজার পাওয়া যায়নি: ${formattedUserPhone}`,
+      );
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    await stateManager.updateStateData(formattedPhone, {
+      adminBanUser: {
+        phone: formattedUserPhone,
+        userId: user._id,
+        step: 2,
+      },
+    });
+
+    const action = user.isBanned ? "আনবান" : "ব্যান";
+    const actionText = user.isBanned ? "আনবান করতে" : "ব্যান করতে";
+
+    await sendQuickReplyMenu(
+      phone,
+      `🚫 ${action} কনফার্মেশন\n\nইউজার: ${user.name}\nফোন: ${formattedUserPhone}\nবর্তমান স্ট্যাটাস: ${user.isBanned ? "🚫 ব্যান্ড" : "✅ সক্রিয়"}\nব্যালেন্স: ৳${user.balance}\n\nআপনি কি এই ইউজারকে ${actionText} চান?`,
+      [
+        { id: `confirm_${action}`, title: `✅ ${action} করুন` },
+        { id: "cancel_action", title: "❌ বাতিল করুন" },
+      ],
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to find user for ban:`, err);
+    await sendTextMessage(phone, "❌ ইউজার খুঁজতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+async function handleAdminBanUserConfirm(
+  phone: string,
+  action: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const userPhone = state?.data?.adminBanUser?.phone;
+  const userId = state?.data?.adminBanUser?.userId;
+
+  if (!userPhone || !userId) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  if (action === "cancel_action") {
+    await sendTextMessage(phone, "🚫 অপারেশন বাতিল করা হয়েছে।");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  const shouldBan = action === "confirm_ব্যান";
+  const shouldUnban = action === "confirm_আনবান";
+
+  if (!shouldBan && !shouldUnban) {
+    await sendTextMessage(phone, "❌ অজানা একশন!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  try {
+    await connectDB();
+    const user = await User.findById(userId);
+
+    if (!user) {
+      await sendTextMessage(phone, `❌ ইউজার পাওয়া যায়নি!`);
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    const newStatus = shouldBan;
+    const actionText = shouldBan ? "ব্যান" : "আনবান";
+    const oldStatus = user.isBanned ? "ব্যান্ড" : "সক্রিয়";
+
+    // Update user status
+    user.isBanned = newStatus;
+    await user.save();
+
+    // Notify user if unbanned
+    if (shouldUnban) {
+      await sendTextMessage(
+        userPhone,
+        `✅ *আপনার অ্যাকাউন্ট আনবান করা হয়েছে*\n\nআপনার SignCopy অ্যাকাউন্টটি আনবান করা হয়েছে। আপনি এখন আবার আমাদের সার্ভিস ব্যবহার করতে পারবেন।\n\n📞 সাপোর্ট: ${CONFIG.supportNumber}\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+      );
+    } else if (shouldBan) {
+      await sendTextMessage(
+        userPhone,
+        `🚫 *আপনার অ্যাকাউন্ট ব্যান্ড করা হয়েছে*\n\nআপনার SignCopy অ্যাকাউন্টটি ব্যান্ড করা হয়েছে।\n\n📞 বিস্তারিত জানতে সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}`,
+      );
+    }
+
+    await sendTextMessage(
+      phone,
+      `✅ *ইউজার ${actionText} করা হয়েছে*\n\nইউজার: ${user.name} (${userPhone})\nপুরোনো স্ট্যাটাস: ${oldStatus}\nনতুন স্ট্যাটাস: ${newStatus ? "🚫 ব্যান্ড" : "✅ সক্রিয়"}\n\n${shouldBan ? "⚠️ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।" : "✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।"}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+    );
+
+    await notifyAdmin(
+      `🚫 ইউজার ${actionText} করা হয়েছে\n\n${actionText} করেছেন: ${formattedPhone}\nইউজার: ${user.name} (${userPhone})\nপুরোনো স্ট্যাটাস: ${oldStatus}\nনতুন স্ট্যাটাস: ${newStatus ? "ব্যান্ড" : "সক্রিয়"}\nসময়: ${new Date().toLocaleString()}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_ban_user", {
+      userId,
+      userPhone,
+      action: actionText,
+      oldStatus,
+      newStatus,
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to ${shouldBan ? "ban" : "unban"} user:`, err);
+    await sendTextMessage(
+      phone,
+      `❌ ইউজার ${shouldBan ? "ব্যান" : "আনবান"} করতে সমস্যা হয়েছে!`,
+    );
+    await cancelFlow(phone, true);
+  }
+}
+
+// --- Main Message Handler ---
+async function handleUserMessage(
+  phone: string,
+  name: string,
+  message: WhatsAppMessage,
+  isAdmin: boolean,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const requestId =
+    Date.now().toString(36) + Math.random().toString(36).substr(2);
+
+  EnhancedLogger.logRequest(formattedPhone, message, requestId);
+
+  try {
+    // Check rate limit
+    const rateLimitCheck = await checkRateLimit(formattedPhone);
+    if (!rateLimitCheck.allowed) {
+      await sendTextMessage(formattedPhone, rateLimitCheck.message!);
+      return;
+    }
+
+    // Validate session
+    const sessionValid = await validateSession(formattedPhone);
+    if (!sessionValid) {
+      await sendTextMessage(
+        formattedPhone,
+        "⏳ *সেশন শেষ হয়েছে*\n\nআপনার সেশন শেষ হয়ে গেছে। দয়া করে আবার 'Menu' লিখুন।",
+      );
+      return;
+    }
+
+    // Check if user is banned
+    try {
+      await connectDB();
+      const userCheck = await User.findOne({ whatsapp: formattedPhone });
+      if (userCheck?.isBanned) {
+        await sendTextMessage(
+          formattedPhone,
+          "🚫 *আপনার অ্যাকাউন্ট ব্যান্ড করা হয়েছে*\n\nআপনার Birth Help অ্যাকাউন্টটি সাময়িকভাবে বন্ধ করা হয়েছে।\n\n📞 বিস্তারিত জানতে সাপোর্টে যোগাযোগ করুন: " +
+            CONFIG.supportNumber,
+        );
+        return;
+      }
+    } catch (banCheckErr) {
+      EnhancedLogger.error(
+        `Error checking ban status for ${formattedPhone}:`,
+        banCheckErr,
+      );
+    }
+
+    const user = await getOrCreateUser(formattedPhone, name);
+    EnhancedLogger.info(`[${requestId}] User processed`, {
+      userId: user._id,
+      isAdmin,
+      phone: formattedPhone,
+      userName: user.name,
+    });
 
     const userState = await stateManager.getUserState(formattedPhone);
     const currentState = userState?.currentState;
     const flowType = userState?.flowType;
 
-    Logger.debug(`[${requestId}] User state`, { currentState, flowType });
+    EnhancedLogger.debug(`[${requestId}] User state`, {
+      currentState,
+      flowType,
+    });
 
     if (message.type === "text") {
       const userText = message.text?.body.trim().toLowerCase() || "";
-      Logger.info(`[${requestId}] Text message received: "${userText}"`, { currentState });
+      EnhancedLogger.info(
+        `[${requestId}] Text message received: "${userText}"`,
+        {
+          currentState,
+        },
+      );
 
+      // Cancel handler for all flows
       if (
         userText === "cancel" ||
         userText === "বাতিল" ||
         userText === "c" ||
-        userText === "cancel all"
+        userText === "cancel all" ||
+        userText === "stop"
       ) {
-        Logger.info(`[${requestId}] Cancelling flow for user`);
+        EnhancedLogger.info(`[${requestId}] Cancelling flow for user`);
         await cancelFlow(formattedPhone, isAdmin);
         return;
       }
 
       // ========================================
-      // INSTANT SERVICES STATE HANDLERS
-      // ========================================
-
-      if (currentState === "awaiting_ubrn_number") {
-        Logger.info(`[${requestId}] Processing UBRN input`);
-        await handleUbrnInput(formattedPhone, userText);
-        return;
-      }
-
-      if (currentState === "awaiting_instant_service_data") {
-        Logger.info(`[${requestId}] Processing instant service field input`);
-        await handleInstantServiceFieldInput(formattedPhone, userText);
-        return;
-      }
-
-      // ========================================
-      // REGULAR SERVICES STATE HANDLERS
+      // USER STATE HANDLERS
       // ========================================
 
       if (currentState === "awaiting_trx_id") {
         const trxId = userText.trim().toUpperCase();
         if (trxId) {
-          Logger.info(`[${requestId}] Processing TRX ID`);
+          EnhancedLogger.info(`[${requestId}] Processing TRX ID`);
           await handleTrxIdInput(formattedPhone, trxId);
         } else {
           await sendTextMessage(
             formattedPhone,
-            "❌ দয়া করে সঠিক টিআরএক্স আইডি পাঠান। ফরম্যাট: `YOUR_TRANSACTION_ID`\n\n🚫 বাতিল করতে 'cancel' লিখুন"
+            "❌ দয়া করে সঠিক টিআরএক্স আইডি পাঠান। ফরম্যাট: `YOUR_TRANSACTION_ID`\n\n🚫 বাতিল করতে 'cancel' লিখুন",
           );
         }
         return;
       }
 
-      if (
-        currentState === "awaiting_service_confirmation" &&
-        userText === "confirm"
-      ) {
-        Logger.info(`[${requestId}] Confirming service order`);
-        await confirmServiceOrder(formattedPhone);
+      if (currentState === "awaiting_ubrn_number") {
+        EnhancedLogger.info(`[${requestId}] Processing UBRN input`);
+        await handleUbrnInput(formattedPhone, userText);
         return;
       }
 
-      // Handle menu command (always works)
+      if (currentState === "awaiting_instant_input") {
+        EnhancedLogger.info(`[${requestId}] Processing instant service input`);
+        await handleInstantServiceInput(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "awaiting_service_data") {
+        EnhancedLogger.info(`[${requestId}] Processing service field input`);
+        await handleServiceFieldInput(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "awaiting_service_confirmation") {
+        if (userText === "confirm") {
+          EnhancedLogger.info(`[${requestId}] Confirming service order`);
+          await confirmServiceOrder(formattedPhone);
+        } else if (userText === "edit") {
+          EnhancedLogger.info(`[${requestId}] Editing service data`);
+          await handleEditServiceData(formattedPhone);
+        } else {
+          await sendTextMessage(
+            formattedPhone,
+            "❌ দয়া করে 'confirm' বা 'edit' লিখুন।\n\n🚫 বাতিল করতে 'cancel' লিখুন",
+          );
+        }
+        return;
+      }
+
+      // ========================================
+      // ADMIN STATE HANDLERS
+      // ========================================
+
+      // Admin Add Service
+      if (currentState?.startsWith("admin_add_service_")) {
+        EnhancedLogger.info(`[${requestId}] Admin add service step`);
+        await handleAdminAddServiceStep(formattedPhone, userText);
+        return;
+      }
+
+      // Admin Edit Service
+      if (currentState === "admin_edit_service_select") {
+        EnhancedLogger.info(`[${requestId}] Admin edit service selection`);
+        await handleAdminEditServiceSelection(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "admin_edit_service_option") {
+        EnhancedLogger.info(`[${requestId}] Admin edit service option`);
+        await handleAdminEditServiceOption(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "admin_edit_service_input") {
+        EnhancedLogger.info(`[${requestId}] Admin edit service input`);
+        await handleAdminEditServiceUpdate(formattedPhone, userText);
+        return;
+      }
+
+      // Admin Delete Service
+      if (currentState === "admin_delete_service_select") {
+        EnhancedLogger.info(`[${requestId}] Admin delete service selection`);
+        await handleAdminDeleteServiceConfirm(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "admin_delete_service_confirm") {
+        EnhancedLogger.info(`[${requestId}] Admin delete service confirmation`);
+        await handleAdminDeleteServiceExecute(
+          formattedPhone,
+          userText === "confirm_delete",
+        );
+        return;
+      }
+
+      // Admin Toggle Service
+      if (currentState === "admin_toggle_service_select") {
+        EnhancedLogger.info(`[${requestId}] Admin toggle service selection`);
+        await handleAdminToggleServiceExecute(formattedPhone, userText);
+        return;
+      }
+
+      // Admin Process Order
+      if (currentState === "admin_process_order_select") {
+        EnhancedLogger.info(`[${requestId}] Admin process order selection`);
+        await handleAdminProcessOrderStatus(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "admin_process_order_status") {
+        EnhancedLogger.info(`[${requestId}] Admin process order status update`);
+        await handleAdminProcessOrderUpdate(formattedPhone, userText);
+        return;
+      }
+
+      // Admin Broadcast
+      if (currentState === "admin_broadcast_message") {
+        EnhancedLogger.info(`[${requestId}] Admin broadcast message`);
+        await handleAdminBroadcastMessage(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "admin_broadcast_type") {
+        EnhancedLogger.info(`[${requestId}] Admin broadcast type`);
+        await handleAdminBroadcastSend(formattedPhone, userText);
+        return;
+      }
+
+      // Admin Add Balance
+      if (currentState === "admin_add_balance_phone") {
+        EnhancedLogger.info(`[${requestId}] Admin add balance phone`);
+        await handleAdminAddBalancePhone(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "admin_add_balance_amount") {
+        EnhancedLogger.info(`[${requestId}] Admin add balance amount`);
+        await handleAdminAddBalanceAmount(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "admin_add_balance_reason") {
+        EnhancedLogger.info(`[${requestId}] Admin add balance reason`);
+        await handleAdminAddBalanceReason(formattedPhone, userText);
+        return;
+      }
+
+      // Admin Ban User
+      if (currentState === "admin_ban_user_phone") {
+        EnhancedLogger.info(`[${requestId}] Admin ban user phone`);
+        await handleAdminBanUserPhone(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "admin_ban_user_confirm") {
+        EnhancedLogger.info(`[${requestId}] Admin ban user confirm`);
+        await handleAdminBanUserConfirm(formattedPhone, userText);
+        return;
+      }
+
+      // ========================================
+      // MENU COMMANDS (works anytime)
+      // ========================================
+
       if (
         [
           "menu",
@@ -1694,17 +4902,26 @@ async function handleUserMessage(
           "শুরু",
           "home",
           "মেইন",
+          "back",
+          "ব্য়াক",
+          "হোম",
         ].includes(userText)
       ) {
-        Logger.info(`[${requestId}] Showing main menu`);
+        EnhancedLogger.info(`[${requestId}] Showing main menu`);
         await showMainMenu(formattedPhone, isAdmin);
         return;
       }
 
       // Handle main commands (only if not in a flow)
       if (!currentState) {
-        if (userText.includes("রিচার্জ") || userText === "recharge") {
-          Logger.info(`[${requestId}] Starting recharge flow`);
+        // User commands
+        if (
+          userText.includes("রিচার্জ") ||
+          userText === "recharge" ||
+          userText === "balance" ||
+          userText.includes("ব্যালেন্স")
+        ) {
+          EnhancedLogger.info(`[${requestId}] Starting recharge flow`);
           await handleRechargeStart(formattedPhone);
           return;
         }
@@ -1712,9 +4929,10 @@ async function handleUserMessage(
         if (
           userText.includes("সার্ভিস") ||
           userText === "services" ||
-          userText === "service"
+          userText === "service" ||
+          userText.includes("সেবা")
         ) {
-          Logger.info(`[${requestId}] Showing regular services`);
+          EnhancedLogger.info(`[${requestId}] Showing regular services`);
           await showRegularServices(formattedPhone);
           return;
         }
@@ -1722,9 +4940,10 @@ async function handleUserMessage(
         if (
           userText.includes("ইন্সট্যান্ট") ||
           userText === "instant" ||
-          userText === "instantservice"
+          userText === "instantservice" ||
+          userText.includes("তাত্ক্ষণিক")
         ) {
-          Logger.info(`[${requestId}] Showing instant services`);
+          EnhancedLogger.info(`[${requestId}] Showing instant services`);
           await showInstantServices(formattedPhone);
           return;
         }
@@ -1732,9 +4951,10 @@ async function handleUserMessage(
         if (
           userText.includes("অর্ডার") ||
           userText === "orders" ||
-          userText === "order"
+          userText === "order" ||
+          userText.includes("আদেশ")
         ) {
-          Logger.info(`[${requestId}] Showing order history`);
+          EnhancedLogger.info(`[${requestId}] Showing order history`);
           await showOrderHistory(formattedPhone);
           return;
         }
@@ -1742,9 +4962,10 @@ async function handleUserMessage(
         if (
           userText.includes("হিস্টরি") ||
           userText === "history" ||
-          userText === "transactions"
+          userText === "transactions" ||
+          userText.includes("ইতিহাস")
         ) {
-          Logger.info(`[${requestId}] Showing transaction history`);
+          EnhancedLogger.info(`[${requestId}] Showing transaction history`);
           await showTransactionHistory(formattedPhone);
           return;
         }
@@ -1752,9 +4973,10 @@ async function handleUserMessage(
         if (
           userText.includes("অ্যাকাউন্ট") ||
           userText === "account" ||
-          userText === "info"
+          userText === "info" ||
+          userText.includes("প্রোফাইল")
         ) {
-          Logger.info(`[${requestId}] Showing account info`);
+          EnhancedLogger.info(`[${requestId}] Showing account info`);
           await showAccountInfo(formattedPhone);
           return;
         }
@@ -1763,30 +4985,97 @@ async function handleUserMessage(
           userText.includes("সাপোর্ট") ||
           userText.includes("হেল্প") ||
           userText === "support" ||
-          userText === "help"
+          userText === "help" ||
+          userText === "contact"
         ) {
-          Logger.info(`[${requestId}] Showing support info`);
+          EnhancedLogger.info(`[${requestId}] Showing support info`);
           await showSupport(formattedPhone);
           return;
         }
 
+        // Admin commands
+        if (isAdmin) {
+          if (
+            userText.includes("সার্ভিস ম্যানেজ") ||
+            userText === "manage services" ||
+            userText === "services"
+          ) {
+            EnhancedLogger.info(
+              `[${requestId}] Admin selected service management`,
+            );
+            await handleAdminServices(formattedPhone);
+            return;
+          }
+
+          if (
+            userText.includes("অর্ডার ম্যানেজ") ||
+            userText === "manage orders" ||
+            userText === "orders"
+          ) {
+            EnhancedLogger.info(
+              `[${requestId}] Admin selected order management`,
+            );
+            await handleAdminOrders(formattedPhone);
+            return;
+          }
+
+          if (
+            userText.includes("ইউজার ম্যানেজ") ||
+            userText === "manage users" ||
+            userText === "users"
+          ) {
+            EnhancedLogger.info(
+              `[${requestId}] Admin selected user management`,
+            );
+            await handleAdminUsers(formattedPhone);
+            return;
+          }
+
+          if (
+            userText.includes("ব্রডকাস্ট") ||
+            userText === "broadcast" ||
+            userText === "notification"
+          ) {
+            EnhancedLogger.info(`[${requestId}] Admin selected broadcast`);
+            await handleAdminBroadcast(formattedPhone);
+            return;
+          }
+
+          if (
+            userText.includes("স্ট্যাটস") ||
+            userText === "stats" ||
+            userText === "statistics" ||
+            userText === "report"
+          ) {
+            EnhancedLogger.info(`[${requestId}] Admin selected statistics`);
+            await handleAdminStats(formattedPhone);
+            return;
+          }
+        }
+
         // Default response for unrecognized messages
-        Logger.info(`[${requestId}] Sending default welcome message`);
+        EnhancedLogger.info(`[${requestId}] Sending default welcome message`);
         await sendTextMessage(
           formattedPhone,
-          "👋 নমস্কার! SignCopy তে আপনাকে স্বাগতম!\n\nআমাদের সার্ভিস সম্পর্কে জানতে 'Menu' লিখুন।\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন"
+          "👋 *নমস্কার! SignCopy তে আপনাকে স্বাগতম!*\n\nআমাদের সার্ভিস সম্পর্কে জানতে 'Menu' লিখুন।\n\n📌 *দ্রুত গাইড:*\n• রিচার্জ করতে: 'রিচার্জ'\n• সার্ভিস দেখতে: 'সার্ভিস'\n• অর্ডার দেখতে: 'অর্ডার'\n• অ্যাকাউন্ট দেখতে: 'অ্যাকাউন্ট'\n• সাপোর্ট পেতে: 'সাপোর্ট'\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
         );
         await showMainMenu(formattedPhone, isAdmin);
       } else {
         // If in a flow but received unrecognized command
-        Logger.warn(`[${requestId}] Unrecognized command in flow state`, { currentState, userText });
+        EnhancedLogger.warn(
+          `[${requestId}] Unrecognized command in flow state`,
+          {
+            currentState,
+            userText,
+          },
+        );
         await sendTextMessage(
           formattedPhone,
-          "❌ এই কমান্ড এখন গ্রহণযোগ্য নয়।\n\n🚫 বাতিল করতে 'cancel' লিখুন\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
+          "❌ এই কমান্ড এখন গ্রহণযোগ্য নয়।\n\n🚫 বাতিল করতে 'cancel' লিখুন\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
         );
       }
     } else if (message.type === "interactive") {
-      Logger.info(`[${requestId}] Interactive message received`, {
+      EnhancedLogger.info(`[${requestId}] Interactive message received`, {
         interactiveType: message.interactive?.type,
       });
 
@@ -1794,137 +5083,480 @@ async function handleUserMessage(
         const selectedId = message.interactive?.list_reply?.id || "";
         const selectedTitle = message.interactive?.list_reply?.title || "";
 
-        Logger.info(`[${requestId}] List reply received`, { selectedId, selectedTitle });
-
-        // Clear any existing state for list interactions (unless we're in a flow)
-        if (
-          !currentState ||
-          ![
-            "awaiting_trx_id",
-            "awaiting_service_confirmation",
-            "awaiting_ubrn_number",
-            "awaiting_instant_service_data",
-          ].includes(currentState)
-        ) {
-          await stateManager.clearUserState(formattedPhone);
-        }
+        EnhancedLogger.info(`[${requestId}] List reply received`, {
+          selectedId,
+          selectedTitle,
+        });
 
         // Handle user menu options
-        switch (selectedId) {
-          case "user_recharge":
-            Logger.info(`[${requestId}] User selected recharge`);
-            await handleRechargeStart(formattedPhone);
-            break;
-          case "user_services":
-            Logger.info(`[${requestId}] User selected regular services`);
-            await showRegularServices(formattedPhone);
-            break;
-          case "user_instant":
-            Logger.info(`[${requestId}] User selected instant services`);
-            await showInstantServices(formattedPhone);
-            break;
-          case "user_orders":
-            Logger.info(`[${requestId}] User selected order history`);
-            await showOrderHistory(formattedPhone);
-            break;
-          case "user_history":
-            Logger.info(`[${requestId}] User selected transaction history`);
-            await showTransactionHistory(formattedPhone);
-            break;
-          case "user_account":
-            Logger.info(`[${requestId}] User selected account info`);
-            await showAccountInfo(formattedPhone);
-            break;
-          // Admin menu options (simplified)
-          case "admin_services":
-            Logger.info(`[${requestId}] Admin selected service management`);
-            await sendTextMessage(
-              formattedPhone,
-              "📦 *সার্ভিস ম্যানেজমেন্ট*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
-            );
-            await showMainMenu(formattedPhone, true);
-            break;
-          // Service selection
-          default:
-            if (selectedId.startsWith("instant_")) {
-              Logger.info(`[${requestId}] User selected instant service`, { selectedId });
-              await handleInstantServiceSelection(formattedPhone, selectedId);
-            } else if (selectedId.startsWith("service_")) {
-              const serviceId = selectedId.replace("service_", "");
-              Logger.info(`[${requestId}] User selected regular service`, { serviceId });
-              await handleRegularServiceSelection(formattedPhone, serviceId);
-            } else if (selectedId === "cancel_flow") {
-              Logger.info(`[${requestId}] User cancelled flow`);
-              await cancelFlow(formattedPhone, isAdmin);
-            } else {
-              Logger.warn(`[${requestId}] Unknown option selected`, { selectedId });
+        if (selectedId.startsWith("user_")) {
+          // Clear state for user menu interactions
+          if (
+            !currentState ||
+            ![
+              "awaiting_trx_id",
+              "awaiting_service_confirmation",
+              "awaiting_ubrn_number",
+              "awaiting_instant_input",
+              "awaiting_service_data",
+            ].includes(currentState)
+          ) {
+            await stateManager.clearUserState(formattedPhone);
+          }
+
+          switch (selectedId) {
+            case "user_recharge":
+              EnhancedLogger.info(`[${requestId}] User selected recharge`);
+              await handleRechargeStart(formattedPhone);
+              break;
+            case "user_services":
+              EnhancedLogger.info(
+                `[${requestId}] User selected regular services`,
+              );
+              await showRegularServices(formattedPhone);
+              break;
+            case "user_instant":
+              EnhancedLogger.info(
+                `[${requestId}] User selected instant services`,
+              );
+              await showInstantServices(formattedPhone);
+              break;
+            case "user_orders":
+              EnhancedLogger.info(`[${requestId}] User selected order history`);
+              await showOrderHistory(formattedPhone);
+              break;
+            case "user_history":
+              EnhancedLogger.info(
+                `[${requestId}] User selected transaction history`,
+              );
+              await showTransactionHistory(formattedPhone);
+              break;
+            case "user_account":
+              EnhancedLogger.info(`[${requestId}] User selected account info`);
+              await showAccountInfo(formattedPhone);
+              break;
+            case "user_support":
+              EnhancedLogger.info(`[${requestId}] User selected support`);
+              await showSupport(formattedPhone);
+              break;
+            default:
+              EnhancedLogger.warn(
+                `[${requestId}] Unknown user option selected`,
+                {
+                  selectedId,
+                },
+              );
               await sendTextMessage(
                 formattedPhone,
-                "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন।"
+                "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন।",
               );
               await showMainMenu(formattedPhone, isAdmin);
-            }
+          }
+        }
+        // Handle admin menu options
+        else if (selectedId.startsWith("admin_")) {
+          // Clear state for admin menu interactions
+          await stateManager.clearUserState(formattedPhone);
+
+          switch (selectedId) {
+            case "admin_services":
+              EnhancedLogger.info(
+                `[${requestId}] Admin selected service management`,
+              );
+              await handleAdminServices(formattedPhone);
+              break;
+            case "admin_orders":
+              EnhancedLogger.info(
+                `[${requestId}] Admin selected order management`,
+              );
+              await handleAdminOrders(formattedPhone);
+              break;
+            case "admin_users":
+              EnhancedLogger.info(
+                `[${requestId}] Admin selected user management`,
+              );
+              await handleAdminUsers(formattedPhone);
+              break;
+            case "admin_broadcast":
+              EnhancedLogger.info(`[${requestId}] Admin selected broadcast`);
+              await handleAdminBroadcast(formattedPhone);
+              break;
+            case "admin_stats":
+              EnhancedLogger.info(`[${requestId}] Admin selected statistics`);
+              await handleAdminStats(formattedPhone);
+              break;
+            case "admin_settings":
+              EnhancedLogger.info(`[${requestId}] Admin selected settings`);
+              await sendTextMessage(
+                formattedPhone,
+                "⚙️ *সিস্টেম সেটিংস*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+              );
+              await showMainMenu(formattedPhone, true);
+              break;
+            // Admin Service Management
+            case "admin_add_service":
+              EnhancedLogger.info(`[${requestId}] Admin selected add service`);
+              await handleAdminAddServiceStart(formattedPhone);
+              break;
+            case "admin_edit_service":
+              EnhancedLogger.info(`[${requestId}] Admin selected edit service`);
+              await handleAdminEditServiceStart(formattedPhone);
+              break;
+            case "admin_delete_service":
+              EnhancedLogger.info(
+                `[${requestId}] Admin selected delete service`,
+              );
+              await handleAdminDeleteServiceStart(formattedPhone);
+              break;
+            case "admin_view_services":
+              EnhancedLogger.info(
+                `[${requestId}] Admin selected view services`,
+              );
+              await handleAdminViewServices(formattedPhone);
+              break;
+            case "admin_toggle_service":
+              EnhancedLogger.info(
+                `[${requestId}] Admin selected toggle service`,
+              );
+              await handleAdminToggleServiceStart(formattedPhone);
+              break;
+            case "admin_service_stats":
+              EnhancedLogger.info(
+                `[${requestId}] Admin selected service stats`,
+              );
+              await sendTextMessage(
+                formattedPhone,
+                "📊 *সার্ভিস স্ট্যাটিসটিক্স*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+              );
+              await showMainMenu(formattedPhone, true);
+              break;
+            // Admin Order Management
+            case "admin_view_orders":
+              EnhancedLogger.info(`[${requestId}] Admin selected view orders`);
+              await handleAdminViewOrders(formattedPhone);
+              break;
+            case "admin_process_order":
+              EnhancedLogger.info(
+                `[${requestId}] Admin selected process order`,
+              );
+              await handleAdminProcessOrderStart(formattedPhone);
+              break;
+            case "admin_search_order":
+              EnhancedLogger.info(`[${requestId}] Admin selected search order`);
+              await sendTextMessage(
+                formattedPhone,
+                "🔍 *অর্ডার খুঁজুন*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+              );
+              await showMainMenu(formattedPhone, true);
+              break;
+            case "admin_order_stats":
+              EnhancedLogger.info(`[${requestId}] Admin selected order stats`);
+              await sendTextMessage(
+                formattedPhone,
+                "📊 *অর্ডার স্ট্যাটিসটিক্স*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+              );
+              await showMainMenu(formattedPhone, true);
+              break;
+            // Admin User Management
+            case "admin_view_users":
+              EnhancedLogger.info(`[${requestId}] Admin selected view users`);
+              await handleAdminViewUsers(formattedPhone);
+              break;
+            case "admin_search_user":
+              EnhancedLogger.info(`[${requestId}] Admin selected search user`);
+              await sendTextMessage(
+                formattedPhone,
+                "🔍 *ইউজার খুঁজুন*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+              );
+              await showMainMenu(formattedPhone, true);
+              break;
+            case "admin_user_details":
+              EnhancedLogger.info(`[${requestId}] Admin selected user details`);
+              await sendTextMessage(
+                formattedPhone,
+                "📋 *ইউজার ডিটেইলস*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+              );
+              await showMainMenu(formattedPhone, true);
+              break;
+            case "admin_user_stats":
+              EnhancedLogger.info(`[${requestId}] Admin selected user stats`);
+              await sendTextMessage(
+                formattedPhone,
+                "📊 *ইউজার স্ট্যাটিসটিক্স*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+              );
+              await showMainMenu(formattedPhone, true);
+              break;
+            default:
+              // Handle service selection
+              if (selectedId.startsWith("instant_")) {
+                EnhancedLogger.info(
+                  `[${requestId}] User selected instant service`,
+                  {
+                    selectedId,
+                  },
+                );
+                await handleInstantServiceSelection(formattedPhone, selectedId);
+              } else if (selectedId.startsWith("service_")) {
+                EnhancedLogger.info(
+                  `[${requestId}] User selected regular service`,
+                  {
+                    selectedId,
+                  },
+                );
+                await handleRegularServiceSelection(formattedPhone, selectedId);
+              } else if (selectedId.startsWith("edit_")) {
+                EnhancedLogger.info(
+                  `[${requestId}] Admin selected edit service`,
+                  {
+                    selectedId,
+                  },
+                );
+                await stateManager.updateStateData(formattedPhone, {
+                  adminEditService: {
+                    serviceId: selectedId.replace("edit_", ""),
+                    step: 1,
+                  },
+                  currentState: "admin_edit_service_option",
+                });
+                await handleAdminEditServiceOption(formattedPhone, selectedId);
+              } else if (selectedId.startsWith("delete_")) {
+                EnhancedLogger.info(
+                  `[${requestId}] Admin selected delete service`,
+                  {
+                    selectedId,
+                  },
+                );
+                await stateManager.updateStateData(formattedPhone, {
+                  currentState: "admin_delete_service_confirm",
+                });
+                await handleAdminDeleteServiceConfirm(
+                  formattedPhone,
+                  selectedId,
+                );
+              } else if (selectedId.startsWith("toggle_")) {
+                EnhancedLogger.info(
+                  `[${requestId}] Admin selected toggle service`,
+                  {
+                    selectedId,
+                  },
+                );
+                await handleAdminToggleServiceExecute(
+                  formattedPhone,
+                  selectedId,
+                );
+              } else if (selectedId.startsWith("process_")) {
+                EnhancedLogger.info(
+                  `[${requestId}] Admin selected process order`,
+                  {
+                    selectedId,
+                  },
+                );
+                await stateManager.updateStateData(formattedPhone, {
+                  currentState: "admin_process_order_status",
+                });
+                await handleAdminProcessOrderStatus(formattedPhone, selectedId);
+              } else if (selectedId === "cancel_flow") {
+                EnhancedLogger.info(`[${requestId}] User cancelled flow`);
+                await cancelFlow(formattedPhone, isAdmin);
+              } else {
+                EnhancedLogger.warn(`[${requestId}] Unknown option selected`, {
+                  selectedId,
+                });
+                await sendTextMessage(
+                  formattedPhone,
+                  "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন।",
+                );
+                await showMainMenu(formattedPhone, isAdmin);
+              }
+          }
+        } else {
+          // Handle other list replies
+          if (selectedId.startsWith("instant_")) {
+            EnhancedLogger.info(
+              `[${requestId}] User selected instant service`,
+              {
+                selectedId,
+              },
+            );
+            await handleInstantServiceSelection(formattedPhone, selectedId);
+          } else if (selectedId.startsWith("service_")) {
+            EnhancedLogger.info(
+              `[${requestId}] User selected regular service`,
+              {
+                selectedId,
+              },
+            );
+            await handleRegularServiceSelection(formattedPhone, selectedId);
+          } else if (selectedId.startsWith("edit_")) {
+            EnhancedLogger.info(`[${requestId}] Admin selected edit service`, {
+              selectedId,
+            });
+            await stateManager.updateStateData(formattedPhone, {
+              adminEditService: {
+                serviceId: selectedId.replace("edit_", ""),
+                step: 1,
+              },
+              currentState: "admin_edit_service_option",
+            });
+            await handleAdminEditServiceOption(formattedPhone, selectedId);
+          } else if (selectedId.startsWith("delete_")) {
+            EnhancedLogger.info(
+              `[${requestId}] Admin selected delete service`,
+              {
+                selectedId,
+              },
+            );
+            await stateManager.updateStateData(formattedPhone, {
+              currentState: "admin_delete_service_confirm",
+            });
+            await handleAdminDeleteServiceConfirm(formattedPhone, selectedId);
+          } else if (selectedId.startsWith("toggle_")) {
+            EnhancedLogger.info(
+              `[${requestId}] Admin selected toggle service`,
+              {
+                selectedId,
+              },
+            );
+            await handleAdminToggleServiceExecute(formattedPhone, selectedId);
+          } else if (selectedId.startsWith("process_")) {
+            EnhancedLogger.info(`[${requestId}] Admin selected process order`, {
+              selectedId,
+            });
+            await stateManager.updateStateData(formattedPhone, {
+              currentState: "admin_process_order_status",
+            });
+            await handleAdminProcessOrderStatus(formattedPhone, selectedId);
+          } else if (selectedId === "cancel_flow") {
+            EnhancedLogger.info(`[${requestId}] User cancelled flow`);
+            await cancelFlow(formattedPhone, isAdmin);
+          } else {
+            EnhancedLogger.warn(`[${requestId}] Unknown option selected`, {
+              selectedId,
+            });
+            await sendTextMessage(
+              formattedPhone,
+              "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন।",
+            );
+            await showMainMenu(formattedPhone, isAdmin);
+          }
         }
       } else if (message.interactive?.type === "button_reply") {
         const selectedId = message.interactive?.button_reply?.id || "";
 
-        Logger.info(`[${requestId}] Button reply received`, { selectedId });
+        EnhancedLogger.info(`[${requestId}] Button reply received`, {
+          selectedId,
+        });
 
         if (selectedId === "cancel_flow") {
-          Logger.info(`[${requestId}] User cancelled flow via button`);
+          EnhancedLogger.info(`[${requestId}] User cancelled flow via button`);
           await cancelFlow(formattedPhone, isAdmin);
+        } else if (selectedId.startsWith("field_")) {
+          // Handle field type selection
+          await handleAdminAddServiceStep(formattedPhone, selectedId);
+        } else if (selectedId.startsWith("required_")) {
+          // Handle required field selection
+          await handleAdminAddServiceStep(formattedPhone, selectedId);
+        } else if (selectedId.startsWith("add_fields_")) {
+          // Handle add fields decision
+          await handleAdminAddServiceStep(formattedPhone, selectedId);
+        } else if (
+          selectedId.startsWith("add_more_") ||
+          selectedId.startsWith("finish_")
+        ) {
+          // Handle more fields or finish
+          await handleAdminAddServiceStep(formattedPhone, selectedId);
+        } else if (selectedId.startsWith("confirm_")) {
+          // Handle confirm actions
+          if (selectedId === "confirm_delete") {
+            await handleAdminDeleteServiceExecute(formattedPhone, true);
+          } else if (selectedId.startsWith("confirm_")) {
+            await handleAdminBanUserConfirm(formattedPhone, selectedId);
+          }
+        } else if (
+          selectedId === "cancel_action" ||
+          selectedId === "cancel_delete"
+        ) {
+          await handleAdminDeleteServiceExecute(formattedPhone, false);
+        } else if (selectedId.startsWith("broadcast_")) {
+          await handleAdminBroadcastSend(formattedPhone, selectedId);
+        } else if (selectedId.startsWith("status_")) {
+          await handleAdminProcessOrderUpdate(formattedPhone, selectedId);
+        } else if (selectedId.startsWith("edit_")) {
+          await handleAdminEditServiceOption(formattedPhone, selectedId);
         } else {
-          Logger.warn(`[${requestId}] Unknown button selected`, { selectedId });
+          EnhancedLogger.warn(`[${requestId}] Unknown button selected`, {
+            selectedId,
+          });
           await sendTextMessage(
             formattedPhone,
-            "ℹ️ দয়া করে লিস্ট মেনু ব্যবহার করুন। 'Menu' লিখুন।"
+            "ℹ️ দয়া করে লিস্ট মেনু ব্যবহার করুন। 'Menu' লিখুন।",
           );
           await showMainMenu(formattedPhone, isAdmin);
         }
       }
     } else {
-      Logger.warn(`[${requestId}] Unhandled message type`, { type: message.type });
+      EnhancedLogger.warn(`[${requestId}] Unhandled message type`, {
+        type: message.type,
+      });
       await sendTextMessage(
         formattedPhone,
-        "❌ এই ধরনের মেসেজ সমর্থিত নয়। দয়া করে টেক্সট মেসেজ পাঠান।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
+        "❌ এই ধরনের মেসেজ সমর্থিত নয়। দয়া করে টেক্সট মেসেজ পাঠান।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
       );
       await showMainMenu(formattedPhone, isAdmin);
     }
   } catch (handlerError) {
-    Logger.error(
+    EnhancedLogger.error(
       `[${requestId}] Error handling message from ${formattedPhone}:`,
-      handlerError
+      handlerError,
     );
-    await sendTextMessage(
-      formattedPhone,
-      "❌ সিস্টেমে ত্রুটি হয়েছে। দয়া পরে চেষ্টা করুন।"
-    );
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, isAdmin);
+
+    // Try to send error message to user
+    try {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ সিস্টেমে ত্রুটি হয়েছে। দয়া পরে চেষ্টা করুন।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+      );
+    } catch (sendError) {
+      EnhancedLogger.error(
+        `[${requestId}] Failed to send error message:`,
+        sendError,
+      );
+    }
+
+    // Clear state and show menu
+    try {
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+    } catch (stateError) {
+      EnhancedLogger.error(`[${requestId}] Failed to clear state:`, stateError);
+    }
   }
 }
 
 // --- Main Webhook Handler ---
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-  Logger.info(`[${requestId}] Webhook POST request received`, {
+  const requestId =
+    Date.now().toString(36) + Math.random().toString(36).substr(2);
+  EnhancedLogger.info(`[${requestId}] Webhook POST request received`, {
     url: req.url,
     method: "POST",
+    timestamp: new Date().toISOString(),
   });
 
   try {
     sessionMonitor.start();
 
     if (!CONFIG.accessToken || !CONFIG.phoneNumberId) {
-      Logger.error(`[${requestId}] Missing WhatsApp configuration`, {
+      EnhancedLogger.error(`[${requestId}] Missing WhatsApp configuration`, {
         hasAccessToken: !!CONFIG.accessToken,
         hasPhoneNumberId: !!CONFIG.phoneNumberId,
+        hasAdminId: !!CONFIG.adminId,
       });
       return new NextResponse("Server configuration error", { status: 500 });
     }
 
     const body: WebhookBody = await req.json();
-    Logger.debug(`[${requestId}] Webhook body received`, {
+    EnhancedLogger.debug(`[${requestId}] Webhook body received`, {
       object: body.object,
       entryCount: body.entry?.length || 0,
     });
@@ -1937,35 +5569,48 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       if (value?.messages && value.messages.length > 0) {
         const message = value.messages[0];
         const from = message.from;
+        const userName = value.contacts?.[0]?.profile?.name || "Unknown";
         const isAdmin = from === CONFIG.adminId;
 
-        Logger.info(`[${requestId}] Processing message from ${from}`, {
+        EnhancedLogger.info(`[${requestId}] Processing message from ${from}`, {
           isAdmin,
           messageId: message.id,
           messageType: message.type,
+          timestamp: message.timestamp,
         });
 
         // Handle message asynchronously but don't wait for it
-        handleUserMessage(from, message, isAdmin).catch((err) => {
-          Logger.error(`[${requestId}] Async message handling error:`, err);
+        handleUserMessage(from, userName, message, isAdmin).catch((err) => {
+          EnhancedLogger.error(
+            `[${requestId}] Async message handling error:`,
+            err,
+          );
         });
 
         // Return immediate response to WhatsApp
-        Logger.info(`[${requestId}] Webhook processed successfully, returning 200 OK`);
+        EnhancedLogger.info(
+          `[${requestId}] Webhook processed successfully, returning 200 OK`,
+        );
         return NextResponse.json({ status: "EVENT_RECEIVED" });
       } else if (value?.statuses) {
-        Logger.debug(`[${requestId}] Status update received`, value.statuses);
+        EnhancedLogger.debug(`[${requestId}] Status update received`, {
+          statuses: value.statuses,
+        });
         return NextResponse.json({ status: "STATUS_RECEIVED" });
       } else {
-        Logger.warn(`[${requestId}] No messages or statuses in webhook`);
+        EnhancedLogger.warn(
+          `[${requestId}] No messages or statuses in webhook`,
+        );
         return NextResponse.json({ status: "NO_MESSAGES" });
       }
     } else {
-      Logger.warn(`[${requestId}] Invalid object type in webhook`, { object: body.object });
+      EnhancedLogger.warn(`[${requestId}] Invalid object type in webhook`, {
+        object: body.object,
+      });
       return new NextResponse("Not Found", { status: 404 });
     }
   } catch (e: unknown) {
-    Logger.error(`[${requestId}] Webhook processing error:`, {
+    EnhancedLogger.error(`[${requestId}] Webhook processing error:`, {
       error: e instanceof Error ? e.message : "Unknown error",
       stack: e instanceof Error ? e.stack : undefined,
     });
@@ -1974,8 +5619,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 }
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
-  const requestId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-  Logger.info(`[${requestId}] Webhook verification request received`, {
+  const requestId =
+    Date.now().toString(36) + Math.random().toString(36).substr(2);
+  EnhancedLogger.info(`[${requestId}] Webhook verification request received`, {
     url: req.url,
     method: "GET",
   });
@@ -1985,14 +5631,18 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   const token = searchParams.get("hub.verify_token");
   const challenge = searchParams.get("hub.challenge");
 
-  Logger.debug(`[${requestId}] Webhook verification parameters`, { mode, token, challenge });
+  EnhancedLogger.debug(`[${requestId}] Webhook verification parameters`, {
+    mode,
+    token,
+    challenge,
+  });
 
   if (mode && token) {
     if (mode === "subscribe" && token === CONFIG.verifyToken) {
-      Logger.info(`[${requestId}] WEBHOOK_VERIFIED successfully`);
+      EnhancedLogger.info(`[${requestId}] WEBHOOK_VERIFIED successfully`);
       return new NextResponse(challenge);
     } else {
-      Logger.warn(`[${requestId}] Webhook verification failed`, {
+      EnhancedLogger.warn(`[${requestId}] Webhook verification failed`, {
         mode,
         token,
         expectedToken: CONFIG.verifyToken,
@@ -2001,6 +5651,9 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     }
   }
 
-  Logger.warn(`[${requestId}] Invalid verification request`, { mode, token });
+  EnhancedLogger.warn(`[${requestId}] Invalid verification request`, {
+    mode,
+    token,
+  });
   return new NextResponse("Method Not Allowed", { status: 405 });
 }
