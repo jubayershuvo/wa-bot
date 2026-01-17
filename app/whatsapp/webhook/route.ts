@@ -7,6 +7,7 @@ import stateManager from "@/lib/whatsappState";
 import { sessionMonitor } from "@/lib/sessionMonitor";
 import { connectDB } from "@/lib/mongodb-bot";
 import axios from "axios";
+import Spent from "@/models/Spent";
 
 // --- Enhanced Logging Configuration ---
 const LOG_CONFIG = {
@@ -133,10 +134,10 @@ const CONFIG = {
   adminId: process.env.ADMIN_WA_ID || "",
   bkashNumber: process.env.BKASH_NUMBER || "017XXXXXXXX",
   supportNumber: process.env.SUPPORT_NUMBER || "+8801XXXXXXXXX",
-  supportTelegram: process.env.SUPPORT_TELEGRAM || "t.me/signcopy",
+  supportTelegram: process.env.SUPPORT_TELEGRAM || "t.me/birthhelp",
   ubrnApiUrl: process.env.UBRN_API_URL || "https://17.fortest.top/api/search",
   ubrnServicePrice: 10,
-  fileUploadUrl: process.env.FILE_UPLOAD_URL || "/api/upload",
+  fileUploadUrl: process.env.FILE_UPLOYAD_URL || "/api/upload",
   maxFileSize: 10 * 1024 * 1024,
   maxBroadcastUsers: 100, // Limit broadcast to prevent rate limiting
   sessionTimeout: 30 * 60 * 1000, // 30 minutes session timeout
@@ -324,6 +325,14 @@ interface AdminProcessOrderStateData {
   orderId?: string;
   order?: any;
   step?: number;
+  deliveryType?: string;
+  deliveryData?: {
+    text?: string;
+    fileUrl?: string;
+    fileName?: string;
+    fileType?: string;
+    reason?: string;
+  };
 }
 
 interface AdminAddBalanceStateData {
@@ -423,7 +432,7 @@ async function callWhatsAppApi(
         headers: {
           Authorization: `Bearer ${CONFIG.accessToken}`,
           "Content-Type": "application/json",
-          "User-Agent": "SignCopy-Bot/1.0",
+          "User-Agent": "Birthhelp-Bot/1.0",
         },
         body: JSON.stringify(payload),
       });
@@ -621,7 +630,7 @@ async function sendListMenu(
         text: body.substring(0, 1024),
       },
       footer: {
-        text: "Powered by SignCopy",
+        text: "Powered by Birth Help",
       },
       action: {
         button: buttonText.substring(0, 20),
@@ -697,6 +706,93 @@ async function sendQuickReplyMenu(
       err,
     );
     throw err;
+  }
+}
+
+// --- File Upload Helper ---
+async function uploadFile(
+  fileBuffer: Buffer,
+  fileName: string,
+  fileType: string,
+): Promise<string> {
+  try {
+    EnhancedLogger.info(`Uploading file: ${fileName} (${fileType})`);
+
+    // Create FormData
+    const formData = new FormData();
+    const uint8Array = new Uint8Array(fileBuffer);
+    const blob = new Blob([uint8Array], { type: fileType });
+    formData.append("file", blob, fileName);
+    formData.append("fileName", fileName);
+    formData.append("fileType", fileType);
+
+    // Upload to your file upload endpoint
+    const response = await fetch(CONFIG.fileUploadUrl, {
+      method: "POST",
+      body: formData,
+    });
+
+    if (!response.ok) {
+      throw new Error(`File upload failed: ${response.statusText}`);
+    }
+
+    const result = await response.json();
+    return result.fileUrl;
+  } catch (error) {
+    EnhancedLogger.error(`Failed to upload file:`, error);
+    throw error;
+  }
+}
+
+// --- Download WhatsApp Media ---
+async function downloadWhatsAppMedia(
+  mediaId: string,
+): Promise<{ buffer: Buffer; mimeType: string }> {
+  try {
+    EnhancedLogger.info(`Downloading WhatsApp media: ${mediaId}`);
+
+    // Get media URL
+    const mediaUrl = `${CONFIG.baseUrl}/${CONFIG.apiVersion}/${mediaId}`;
+    const response = await fetch(mediaUrl, {
+      headers: {
+        Authorization: `Bearer ${CONFIG.accessToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to get media URL: ${response.statusText}`);
+    }
+
+    const mediaData = await response.json();
+    const downloadUrl = mediaData.url;
+    const mimeType = mediaData.mime_type || "application/octet-stream";
+
+    // Download media
+    const downloadResponse = await fetch(downloadUrl, {
+      headers: {
+        Authorization: `Bearer ${CONFIG.accessToken}`,
+      },
+    });
+
+    if (!downloadResponse.ok) {
+      throw new Error(
+        `Failed to download media: ${downloadResponse.statusText}`,
+      );
+    }
+
+    const arrayBuffer = await downloadResponse.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    EnhancedLogger.debug(`Media downloaded successfully`, {
+      mediaId,
+      mimeType,
+      size: buffer.length,
+    });
+
+    return { buffer, mimeType };
+  } catch (error) {
+    EnhancedLogger.error(`Failed to download WhatsApp media:`, error);
+    throw error;
   }
 }
 
@@ -846,7 +942,7 @@ async function showMainMenu(phone: string, isAdmin: boolean): Promise<void> {
     EnhancedLogger.error(`Failed to show main menu to ${formattedPhone}:`, err);
     await sendTextMessage(
       formattedPhone,
-      `🏠 *SignCopy Main Menu*\n\n` +
+      `🏠 *Birth Help Main Menu*\n\n` +
         `1. 💵 ব্যালেন্স রিচার্জ - 'রিচার্জ' লিখুন\n` +
         `2. 🛒 রেগুলার সার্ভিস - 'সার্ভিস' লিখুন\n` +
         `3. ⚡ ইন্সট্যান্ট সার্ভিস - 'ইন্সট্যান্ট' লিখুন\n` +
@@ -945,7 +1041,7 @@ async function showUserMainMenu(phone: string): Promise<void> {
 
   await sendListMenu(
     phone,
-    "🏠 SignCopy - Main Menu",
+    "🏠 Birth Help - Main Menu",
     "আপনার প্রয়োজন অনুযায়ী নিচের অপশন সিলেক্ট করুন:\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
     userMenuRows,
     "মেনু অপশনসমূহ",
@@ -1461,29 +1557,15 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
   EnhancedLogger.info(`Processing UBRN for ${formattedPhone}`, { ubrn });
 
   try {
-    const state = await stateManager.getUserState(formattedPhone);
-    const ubrnData = state?.data?.ubrn as UbrnStateData | undefined;
-    const attempt = (ubrnData?.attempt || 0) + 1;
-
-    if (attempt > 3) {
-      await sendTextMessage(
-        formattedPhone,
-        "❌ *অনেকবার চেষ্টা করেছেন*\n\nআপনি ৩ বার ভুল UBRN নম্বর দিয়েছেন। দয়া করে সাপোর্টে যোগাযোগ করুন।",
-      );
-      await cancelFlow(formattedPhone, false);
-      return;
-    }
-
     await stateManager.updateStateData(formattedPhone, {
       ubrn: {
         ubrn: ubrn.trim(),
-        attempt: attempt,
       },
     });
 
     await sendTextMessage(
       formattedPhone,
-      `⏳ UBRN তথ্য যাচাই করা হচ্ছে...\n\nUBRN: ${ubrn}\nপ্রয়াস: ${attempt}/3\n\nদয়া করে অপেক্ষা করুন...`,
+      `⏳ UBRN তথ্য যাচাই করা হচ্ছে...\n\nUBRN: ${ubrn}\n\nদয়া করে অপেক্ষা করুন...`,
     );
 
     await connectDB();
@@ -1512,9 +1594,8 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
       EnhancedLogger.info(`Calling UBRN API for: ${ubrn}`);
       const response = await axios.get(CONFIG.ubrnApiUrl, {
         params: { ubrn: ubrn.trim() },
-        timeout: 30000,
         headers: {
-          "User-Agent": "SignCopy-Bot/1.0",
+          "User-Agent": "Birthhelp-Bot/1.0",
         },
       });
       ubrnDataResult = response.data;
@@ -1550,19 +1631,10 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     await user.save();
 
     // Create transaction record
-    const transaction = await Transaction.create({
-      trxId: `UBRN-${Date.now()}`,
-      amount: CONFIG.ubrnServicePrice,
-      method: "balance",
-      status: "SUCCESS",
-      number: formattedPhone,
+    const transaction = await Spent.create({
       user: user._id,
-      metadata: {
-        ubrn: ubrn.trim(),
-        apiResponse: ubrnDataResult,
-        attempt: attempt,
-      },
-      createdAt: new Date(),
+      amount: CONFIG.ubrnServicePrice,
+      service: "UBRN Search",
     });
 
     // Format and send result
@@ -1609,7 +1681,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
     // Notify admin
     await notifyAdmin(
-      `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nUBRN: ${ubrn}\nমূল্য: ৳${CONFIG.ubrnServicePrice}\nপ্রয়াস: ${attempt}`,
+      `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nUBRN: ${ubrn}\nমূল্য: ৳${CONFIG.ubrnServicePrice}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
@@ -1618,7 +1690,6 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     EnhancedLogger.logFlowCompletion(formattedPhone, "ubrn_verification", {
       ubrn: ubrn,
       price: CONFIG.ubrnServicePrice,
-      attempt,
       transactionId: transaction._id,
       newBalance: user.balance,
     });
@@ -1985,11 +2056,13 @@ async function handleEditServiceData(phone: string): Promise<void> {
     }
 
     // Show fields to edit
-    const fieldRows = service.requiredFields.map((field: ServiceField, index: number) => ({
-      id: `edit_field_${index}`,
-      title: field.label,
-      description: `বর্তমান: ${serviceOrderData.collectedData?.[field.name] || "শূন্য"}`,
-    }));
+    const fieldRows = service.requiredFields.map(
+      (field: ServiceField, index: number) => ({
+        id: `edit_field_${index}`,
+        title: field.label,
+        description: `বর্তমান: ${serviceOrderData.collectedData?.[field.name] || "শূন্য"}`,
+      }),
+    );
 
     await sendListMenu(
       formattedPhone,
@@ -2511,7 +2584,7 @@ async function handleAdminAddServiceStep(
         if (isNaN(price) || price <= 0 || price > 1000000) {
           await sendTextMessage(
             phone,
-            "❌ দয়া করে ১ থেকে ১০,০০,०০০ এর মধ্যে সঠিক মূল্য লিখুন!",
+            "❌ দয়া করে ১ থেকে ১০,০০,০০০ এর মধ্যে সঠিক মূল্য লিখুন!",
           );
           return;
         }
@@ -2907,7 +2980,6 @@ async function handleAdminViewServices(phone: string): Promise<void> {
     message += `• মোট সার্ভিস: ${totalServices}\n`;
     message += `• সক্রিয় সার্ভিস: ${activeServices}\n`;
     message += `• মোট আয়: ৳${revenue}\n\n`;
-    message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(phone, message);
     await showMainMenu(phone, true);
@@ -3149,7 +3221,7 @@ async function handleAdminEditServiceUpdate(
       return;
     }
 
-    let updateData: any = {};
+    const updateData: any = {};
     let updateField = "";
     let newValue = "";
 
@@ -3280,7 +3352,7 @@ async function handleAdminDeleteServiceStart(phone: string): Promise<void> {
         id: `delete_${service._id}`,
         title: `${service.name} - ৳${service.price}`,
         description: `অর্ডার: ${await Order.countDocuments({ serviceId: service._id })}টি`,
-      }))
+      })),
     );
 
     await stateManager.setUserState(formattedPhone, {
@@ -3712,29 +3784,25 @@ async function handleAdminProcessOrderStatus(
       adminProcessOrder: {
         orderId: actualOrderId,
         order: order,
+        step: 1,
       },
     });
 
     const statusRows = [
       {
-        id: "status_processing",
-        title: "🔄 প্রসেসিং",
-        description: "অর্ডারটি প্রসেস করা হচ্ছে",
-      },
-      {
         id: "status_completed",
         title: "✅ কমপ্লিটেড",
-        description: "অর্ডারটি সম্পন্ন হয়েছে",
+        description: "ফাইল/টেক্সট পাঠিয়ে অর্ডারটি কমপ্লিট করুন",
       },
       {
         id: "status_failed",
         title: "❌ ফেইলড",
-        description: "অর্ডারটি ব্যর্থ হয়েছে",
+        description: "কারণ লিখে অর্ডারটি ব্যর্থ ঘোষণা করুন",
       },
       {
         id: "status_cancelled",
         title: "🚫 ক্যান্সেলড",
-        description: "অর্ডারটি বাতিল করা হয়েছে",
+        description: "কারণ লিখে অর্ডারটি বাতিল করুন",
       },
     ];
 
@@ -3756,11 +3824,13 @@ async function handleAdminProcessOrderStatus(
 async function handleAdminProcessOrderUpdate(
   phone: string,
   statusId: string,
+  input?: string,
 ): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   const state = await stateManager.getUserState(formattedPhone);
   const orderId = state?.data?.adminProcessOrder?.orderId;
   const order = state?.data?.adminProcessOrder?.order;
+  const step = state?.data?.adminProcessOrder?.step || 1;
 
   if (!orderId || !order) {
     await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
@@ -3769,47 +3839,245 @@ async function handleAdminProcessOrderUpdate(
   }
 
   const newStatus = statusId.replace("status_", "");
-  EnhancedLogger.info(`Updating order ${orderId} to status: ${newStatus}`);
+  EnhancedLogger.info(
+    `Admin updating order ${orderId} to status: ${newStatus}`,
+    { step },
+  );
+
+  try {
+    if (newStatus === "completed") {
+      if (step === 1) {
+        // Handle delivery type selection from quick reply menu
+        const deliveryType = statusId.replace("delivery_", "");
+        
+        await stateManager.updateStateData(formattedPhone, {
+          adminProcessOrder: {
+            ...state.data?.adminProcessOrder,
+            step: 2,
+            deliveryType: deliveryType,
+          },
+        });
+
+        if (deliveryType === "text" || deliveryType === "both") {
+          await sendTextWithCancelButton(
+            phone,
+            `📝 ডেলিভারি টেক্সট\n\nঅর্ডার: ${order.orderId}\n\nইউজারকে পাঠাতে চান এমন টেক্সট লিখুন:\n\n📌 টিপস:\n• ধন্যবাদ জানান\n• পরবর্তী নির্দেশনা দিন\n• সার্ভিসের ডিটেইলস দিন\n\nস্কিপ করতে 'skip' লিখুন`,
+          );
+        } else {
+          // deliveryType === "file"
+          await sendTextWithCancelButton(
+            phone,
+            `📁 ফাইল আপলোড\n\nঅর্ডার: ${order.orderId}\n\nডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
+          );
+        }
+      } else if (step === 2) {
+        // Handle text input or file upload
+        if (!input) {
+          await sendTextMessage(phone, "❌ দয়া করে টেক্সট লিখুন বা ফাইল আপলোড করুন!");
+          return;
+        }
+
+        const deliveryType = state?.data?.adminProcessOrder?.deliveryType;
+
+        if (deliveryType === "text" || deliveryType === "both") {
+          // Store text input
+          await stateManager.updateStateData(formattedPhone, {
+            adminProcessOrder: {
+              ...state.data?.adminProcessOrder,
+              deliveryData: {
+                ...state.data?.adminProcessOrder?.deliveryData,
+                text: input.toLowerCase() === "skip" ? "" : input.trim(),
+              },
+              step: deliveryType === "both" ? 3 : 4,
+            },
+          });
+
+          if (deliveryType === "both") {
+            await sendTextWithCancelButton(
+              phone,
+              `📁 ফাইল আপলোড\n\nঅর্ডার: ${order.orderId}\n\nডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
+            );
+          } else {
+            await completeOrderDelivery(phone);
+          }
+        } else {
+          // deliveryType === "file" - This will be handled by file upload function
+          await completeOrderDelivery(phone);
+        }
+      } else if (step === 3) {
+        // File upload for "both" delivery type (handled separately in handleAdminFileUpload)
+        await completeOrderDelivery(phone);
+      }
+    } else if (newStatus === "failed" || newStatus === "cancelled") {
+      if (step === 1) {
+        await stateManager.updateStateData(formattedPhone, {
+          adminProcessOrder: {
+            ...state.data?.adminProcessOrder,
+            step: 2,
+            deliveryType: newStatus,
+          },
+        });
+
+        await sendTextWithCancelButton(
+          phone,
+          `📝 ${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ\n\nঅর্ডার: ${order.orderId}\nইউজার: ${(order.userId as any)?.name || "N/A"}\n\n${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ লিখুন:\n\n📌 নোট:\n• কারণটি পরিষ্কার ও বোধগম্য হোক\n• ইউজারকে এই কারণটি দেখানো হবে\n• মিনিমাম ১০ ক্যারেক্টার`,
+        );
+      } else if (step === 2) {
+        if (!input || !input.trim() || input.trim().length < 5) {
+          await sendTextMessage(
+            phone,
+            `❌ দয়া করে কমপক্ষে 5 ক্যারেক্টারের কারণ লিখুন!`,
+          );
+          return;
+        }
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminProcessOrder: {
+            ...state.data?.adminProcessOrder,
+            deliveryData: {
+              reason: input.trim(),
+            },
+            step: 3,
+          },
+        });
+
+        await completeOrderDelivery(phone);
+      }
+    }
+  } catch (err) {
+    EnhancedLogger.error(`Failed to update order status:`, err);
+    await sendTextMessage(phone, "❌ স্ট্যাটাস আপডেট করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
+  }
+}
+
+async function completeOrderDelivery(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const orderId = state?.data?.adminProcessOrder?.orderId;
+  const order = state?.data?.adminProcessOrder?.order;
+  const deliveryType = state?.data?.adminProcessOrder?.deliveryType;
+  const deliveryData = state?.data?.adminProcessOrder?.deliveryData;
+
+  if (!orderId || !order) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
 
   try {
     await connectDB();
+    const updatedOrder = await Order.findById(orderId);
 
-    // Update order status
-    await Order.findByIdAndUpdate(orderId, {
-      status: newStatus,
-      updatedAt: new Date(),
-    });
+    if (!updatedOrder) {
+      await sendTextMessage(phone, "❌ অর্ডার পাওয়া যায়নি!");
+      await cancelFlow(phone, true);
+      return;
+    }
 
-    // Notify user about status change
+    // Update order status and delivery data
+    updatedOrder.status =
+      deliveryType === "completed" ? "completed" : deliveryType;
+
+    if (deliveryType === "completed") {
+      updatedOrder.deliveryData = {
+        deliveredAt: new Date(),
+        deliveryMethod: "whatsapp",
+        text: deliveryData?.text || "",
+        fileUrl: deliveryData?.fileUrl || "",
+        fileName: deliveryData?.fileName || "",
+        fileType: deliveryData?.fileType || "",
+        deliveredBy: formattedPhone,
+      };
+    } else {
+      updatedOrder.cancellationData = {
+        cancelledAt: new Date(),
+        reason: deliveryData?.reason || "",
+        cancelledBy: formattedPhone,
+      };
+    }
+
+    updatedOrder.updatedAt = new Date();
+    await updatedOrder.save();
+
+    // Notify user
     const user = order.userId as any;
     if (user && user.whatsapp) {
-      const statusMessages = {
-        processing:
-          "🔄 আপনার অর্ডারটি এখন প্রসেস করা হচ্ছে। শীঘ্রই সম্পন্ন হবে।",
-        completed:
-          "✅ আপনার অর্ডারটি সম্পন্ন হয়েছে! ধন্যবাদ আমাদের সার্ভিস ব্যবহার করার জন্য।",
-        failed:
-          "❌ দুঃখিত, আপনার অর্ডারটি সম্পন্ন করতে ব্যর্থ হয়েছে। দয়া করে সাপোর্টে যোগাযোগ করুন।",
-        cancelled:
-          "🚫 আপনার অর্ডারটি বাতিল করা হয়েছে। প্রয়োজনে সাপোর্টে যোগাযোগ করুন।",
-      };
+      if (deliveryType === "completed") {
+        let notification = `✅ *আপনার অর্ডার সম্পন্ন হয়েছে!*\n\n`;
+        notification += `🆔 অর্ডার আইডি: ${updatedOrder.orderId}\n`;
+        notification += `📦 সার্ভিস: ${updatedOrder.serviceName}\n`;
+        notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
+        notification += `📅 সম্পূর্ণ হয়েছে: ${new Date().toLocaleString()}\n\n`;
 
-      const message = statusMessages[newStatus as keyof typeof statusMessages];
-      if (message) {
-        await sendTextMessage(
-          user.whatsapp,
-          `📦 *অর্ডার স্ট্যাটাস আপডেট*\n\nঅর্ডার আইডি: ${order.orderId}\nসার্ভিস: ${order.serviceName}\nনতুন স্ট্যাটাস: ${newStatus}\n\n${message}\n\n📞 সাপোর্ট: ${CONFIG.supportNumber}\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-        );
+        if (deliveryData?.text) {
+          notification += `📝 *ডেলিভারি নোট:*\n${deliveryData.text}\n\n`;
+        }
+
+        if (deliveryData?.fileUrl) {
+          notification += `📁 *ডেলিভারি ফাইল:*\n${deliveryData.fileName}\n\n`;
+        }
+
+        notification += `🎉 আপনার অর্ডার সফলভাবে সম্পন্ন হয়েছে!\n`;
+        notification += `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}\n\n`;
+        notification += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+        await sendTextMessage(user.whatsapp, notification);
+
+        // Send file if available
+        if (deliveryData?.fileUrl && deliveryData?.fileType) {
+          try {
+            // Here you would implement file sending via WhatsApp
+            // This requires additional WhatsApp Business API setup
+            EnhancedLogger.info(`File should be sent to ${user.whatsapp}`, {
+              fileName: deliveryData.fileName,
+              fileType: deliveryData.fileType,
+            });
+          } catch (fileError) {
+            EnhancedLogger.error(`Failed to send file to user:`, fileError);
+          }
+        }
+      } else {
+        const statusText = deliveryType === "failed" ? "ব্যর্থ" : "বাতিল";
+        let notification = `❌ *আপনার অর্ডার ${statusText} হয়েছে*\n\n`;
+        notification += `🆔 অর্ডার আইডি: ${updatedOrder.orderId}\n`;
+        notification += `📦 সার্ভিস: ${updatedOrder.serviceName}\n`;
+        notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
+        notification += `📅 ${statusText} হয়েছে: ${new Date().toLocaleString()}\n\n`;
+
+        if (deliveryData?.reason) {
+          notification += `📝 *কারণ:*\n${deliveryData.reason}\n\n`;
+        }
+
+        notification += `😞 দুঃখিত আপনার অর্ডারটি ${statusText} হয়েছে।\n`;
+        notification += `📞 বিস্তারিত জানতে সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}\n`;
+        notification += `🔄 নতুন অর্ডার করতে 'সার্ভিস' লিখুন\n\n`;
+        notification += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+        await sendTextMessage(user.whatsapp, notification);
       }
     }
 
-    await sendTextMessage(
-      phone,
-      `✅ *অর্ডার স্ট্যাটাস আপডেট করা হয়েছে*\n\nঅর্ডার আইডি: ${order.orderId}\nসার্ভিস: ${order.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"}\nনতুন স্ট্যাটাস: ${newStatus}\n\n✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-    );
+    // Send confirmation to admin
+    let adminMessage = `✅ *অর্ডার আপডেট সম্পন্ন*\n\n`;
+    adminMessage += `🆔 অর্ডার: ${updatedOrder.orderId}\n`;
+    adminMessage += `👤 ইউজার: ${(order.userId as any)?.name || "N/A"} (${(order.userId as any)?.whatsapp || "N/A"})\n`;
+    adminMessage += `📦 সার্ভিস: ${updatedOrder.serviceName}\n`;
+    adminMessage += `📊 নতুন স্ট্যাটাস: ${updatedOrder.status}\n`;
+
+    if (deliveryType === "completed") {
+      adminMessage += `📝 টেক্সট পাঠানো: ${deliveryData?.text ? "✅ হ্যাঁ" : "❌ না"}\n`;
+      adminMessage += `📁 ফাইল আপলোড: ${deliveryData?.fileUrl ? "✅ হ্যাঁ" : "❌ না"}\n`;
+    } else {
+      adminMessage += `📝 কারণ: ${deliveryData?.reason || "N/A"}\n`;
+    }
+
+    adminMessage += `\n✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, adminMessage);
 
     await notifyAdmin(
-      `🔄 অর্ডার স্ট্যাটাস আপডেট\n\nঅর্ডার: ${order.orderId}\nসার্ভিস: ${order.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"} (${(order.userId as any)?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${newStatus}\nআপডেট করেছেন: ${formattedPhone}`,
+      `🔄 অর্ডার আপডেট সম্পন্ন\n\nঅর্ডার: ${updatedOrder.orderId}\nসার্ভিস: ${updatedOrder.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"} (${(order.userId as any)?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${updatedOrder.status}\nআপডেট করেছেন: ${formattedPhone}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
@@ -3817,13 +4085,93 @@ async function handleAdminProcessOrderUpdate(
 
     EnhancedLogger.logFlowCompletion(formattedPhone, "admin_process_order", {
       orderId,
-      orderStatus: newStatus,
+      orderStatus: updatedOrder.status,
       userId: (order.userId as any)?._id,
+      deliveryType,
+      hasText: !!deliveryData?.text,
+      hasFile: !!deliveryData?.fileUrl,
+      reason: deliveryData?.reason,
     });
   } catch (err) {
-    EnhancedLogger.error(`Failed to update order status:`, err);
-    await sendTextMessage(phone, "❌ স্ট্যাটাস আপডেট করতে সমস্যা হয়েছে!");
-    await showMainMenu(phone, true);
+    EnhancedLogger.error(`Failed to complete order delivery:`, err);
+    await sendTextMessage(phone, "❌ অর্ডার আপডেট করতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+// Handle file upload for order delivery
+async function handleAdminFileUpload(
+  phone: string,
+  message: WhatsAppMessage,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const orderId = state?.data?.adminProcessOrder?.orderId;
+
+  if (!orderId) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  try {
+    if (message.type === "image" || message.type === "document") {
+      const mediaId =
+        message.type === "image" ? message.image?.id : message.document?.id;
+      const fileName =
+        message.type === "image"
+          ? `order_${orderId}_${Date.now()}.jpg`
+          : message.document?.filename || `order_${orderId}_${Date.now()}`;
+
+      if (!mediaId) {
+        await sendTextMessage(phone, "❌ ফাইল আইডি পাওয়া যায়নি!");
+        return;
+      }
+
+      // Download media from WhatsApp
+      const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
+
+      // Check file size
+      if (buffer.length > CONFIG.maxFileSize) {
+        await sendTextMessage(
+          phone,
+          `❌ ফাইল সাইজ খুব বড়! সর্বোচ্চ সাইজ: ${CONFIG.maxFileSize / 1024 / 1024}MB`,
+        );
+        return;
+      }
+
+      // Upload to your server
+      const fileUrl = await uploadFile(buffer, fileName, mimeType);
+
+      // Update state with file info
+      await stateManager.updateStateData(formattedPhone, {
+        adminProcessOrder: {
+          ...state.data?.adminProcessOrder,
+          deliveryData: {
+            ...state.data?.adminProcessOrder?.deliveryData,
+            fileUrl: fileUrl,
+            fileName: fileName,
+            fileType: mimeType,
+          },
+        },
+      });
+
+      await sendTextMessage(
+        phone,
+        `✅ *ফাইল আপলোড সফল*\n\n📁 ফাইল: ${fileName}\n📊 সাইজ: ${(buffer.length / 1024).toFixed(2)}KB\n🔗 লিংক: ${fileUrl}\n\nফাইল সফলভাবে আপলোড হয়েছে!`,
+      );
+
+      // Continue with order completion
+      await completeOrderDelivery(phone);
+    } else {
+      await sendTextMessage(
+        phone,
+        "❌ দয়া করে একটি ইমেজ বা ডকুমেন্ট ফাইল আপলোড করুন!",
+      );
+    }
+  } catch (err) {
+    EnhancedLogger.error(`Failed to handle file upload:`, err);
+    await sendTextMessage(phone, "❌ ফাইল আপলোড করতে সমস্যা হয়েছে!");
   }
 }
 
@@ -3972,7 +4320,7 @@ async function handleAdminBroadcastSend(
         try {
           await sendTextMessage(
             user.whatsapp,
-            `📢 *SignCopy নোটিফিকেশন*\n\n${message}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন\n📞 সাপোর্ট: ${CONFIG.supportNumber}`,
+            `📢 *Birth Help নোটিফিকেশন*\n\n${message}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন\n📞 সাপোর্ট: ${CONFIG.supportNumber}`,
           );
           successCount++;
           EnhancedLogger.debug(`Broadcast sent to ${user.whatsapp}`);
@@ -4182,6 +4530,7 @@ async function handleAdminStats(phone: string): Promise<void> {
 }
 
 // --- Admin User Management ---
+// --- Admin User Management ---
 async function handleAdminUsers(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   EnhancedLogger.info(`Admin user management for ${formattedPhone}`);
@@ -4279,18 +4628,14 @@ async function handleAdminViewUsers(phone: string): Promise<void> {
   }
 }
 
-// --- Admin Add Balance ---
-async function handleAdminAddBalanceStart(phone: string): Promise<void> {
+async function handleAdminUserSearchStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  EnhancedLogger.info(`Admin starting add balance for ${formattedPhone}`);
+  EnhancedLogger.info(`Admin starting user search for ${formattedPhone}`);
 
   await stateManager.setUserState(formattedPhone, {
-    currentState: "admin_add_balance_phone",
-    flowType: "admin_add_balance",
+    currentState: "admin_search_user_input",
+    flowType: "admin_user_search",
     data: {
-      adminAddBalance: {
-        step: 1,
-      },
       lastActivity: Date.now(),
       sessionId: Date.now().toString(36),
     },
@@ -4298,16 +4643,16 @@ async function handleAdminAddBalanceStart(phone: string): Promise<void> {
 
   await sendTextWithCancelButton(
     phone,
-    "💰 *ব্যালেন্স যোগ করুন*\n\nযে ইউজারের ব্যালেন্স যোগ করতে চান, তার ফোন নম্বর লিখুন:\n\nফরম্যাট:\n• 017XXXXXXXX\n• 88017XXXXXXXX\n• +88017XXXXXXXX\n\n📌 নোট: ইউজারটি সিস্টেমে থাকতে হবে",
+    "🔍 *ইউজার খুঁজুন*\n\nখুঁজতে চান এমন ইউজারের ফোন নম্বর লিখুন:\n\nফরম্যাট:\n• 017XXXXXXXX\n• 88017XXXXXXXX\n• +88017XXXXXXXX\n\n📌 নোট: ইউজারটি সিস্টেমে থাকতে হবে",
   );
 }
 
-async function handleAdminAddBalancePhone(
+async function handleAdminUserSearch(
   phone: string,
   userPhone: string,
 ): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  EnhancedLogger.info(`Admin adding balance for user: ${userPhone}`);
+  EnhancedLogger.info(`Admin searching for user: ${userPhone}`);
 
   try {
     const formattedUserPhone = formatPhoneNumber(userPhone);
@@ -4318,318 +4663,184 @@ async function handleAdminAddBalancePhone(
     if (!user) {
       await sendTextMessage(
         phone,
-        `❌ ইউজার পাওয়া যায়নি: ${formattedUserPhone}\n\nদয়া করে সঠিক ফোন নম্বর দিন অথবা ইউজারকে প্রথমে সিস্টেমে রেজিস্টার করতে বলুন।`,
+        `❌ ইউজার পাওয়া যায়নি: ${formattedUserPhone}\n\nদয়া করে সঠিক ফোন নম্বর দিন।`,
       );
-      await cancelFlow(phone, true);
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(phone, true);
       return;
     }
 
-    if (user.isBanned) {
-      await sendTextMessage(
-        phone,
-        `❌ ইউজারটি ব্যান্ড করা হয়েছে: ${formattedUserPhone}\n\nনাম: ${user.name}\nস্ট্যাটাস: 🚫 ব্যান্ড\n\nপ্রথমে ইউজার আনবান করুন।`,
-      );
-      await cancelFlow(phone, true);
-      return;
+    // Get user stats
+    const totalOrders = await Order.countDocuments({ userId: user._id });
+    const totalSpentResult = await Order.aggregate([
+      { $match: { userId: user._id } },
+      { $group: { _id: null, total: { $sum: "$totalPrice" } } },
+    ]);
+    const totalSpent = totalSpentResult[0]?.total || 0;
+
+    const recentOrders = await Order.find({ userId: user._id })
+      .sort({ createdAt: -1 })
+      .limit(3);
+
+    let message = `📋 *ইউজার ডিটেইলস*\n\n`;
+    message += `📛 নাম: ${user.name}\n`;
+    message += `📱 ফোন: ${user.whatsapp}\n`;
+    message += `💰 ব্যালেন্স: ৳${user.balance}\n`;
+    message += `📊 মোট মেসেজ: ${user.whatsappMessageCount}\n`;
+    message += `🚫 ব্যান্ড স্ট্যাটাস: ${user.isBanned ? "হ্যাঁ" : "না"}\n`;
+    message += `📅 যোগদান: ${new Date(user.createdAt).toLocaleDateString()}\n`;
+    message += `⏰ সর্বশেষ একটিভ: ${user.whatsappLastActive ? new Date(user.whatsappLastActive).toLocaleString() : "কখনো না"}\n\n`;
+
+    message += `📊 *ইউজার স্ট্যাটস:*\n`;
+    message += `• মোট অর্ডার: ${totalOrders}\n`;
+    message += `• মোট খরচ: ৳${totalSpent}\n`;
+    message += `• গড় অর্ডার মূল্য: ৳${totalOrders > 0 ? (totalSpent / totalOrders).toFixed(2) : "0.00"}\n\n`;
+
+    if (recentOrders.length > 0) {
+      message += `📦 *সাম্প্রতিক অর্ডার:*\n`;
+      recentOrders.forEach((order, index) => {
+        message += `${index + 1}. ${order.serviceName}\n`;
+        message += `   🆔: ${order.orderId}\n`;
+        message += `   💰: ৳${order.totalPrice}\n`;
+        message += `   📊: ${order.status}\n`;
+        message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
+      });
     }
 
-    await stateManager.updateStateData(formattedPhone, {
-      adminAddBalance: {
-        phone: formattedUserPhone,
-        userId: user._id,
-        step: 2,
-      },
-    });
+    message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
-    await sendTextWithCancelButton(
-      phone,
-      `💰 *পরিমাণ লিখুন*\n\nইউজার: ${user.name}\nফোন: ${formattedUserPhone}\nবর্তমান ব্যালেন্স: ৳${user.balance}\n\nযোগ করতে চান এমন পরিমাণ লিখুন:\n\n📌 শুধু সংখ্যা লিখুন (দশমিক চিহ্ন ছাড়া)\nউদাহরণ: 100`,
-    );
-  } catch (err) {
-    EnhancedLogger.error(`Failed to find user for balance add:`, err);
-    await sendTextMessage(phone, "❌ ইউজার খুঁজতে সমস্যা হয়েছে!");
-    await cancelFlow(phone, true);
-  }
-}
-
-async function handleAdminAddBalanceAmount(
-  phone: string,
-  amountStr: string,
-): Promise<void> {
-  const formattedPhone = formatPhoneNumber(phone);
-  const state = await stateManager.getUserState(formattedPhone);
-  const userPhone = state?.data?.adminAddBalance?.phone;
-
-  if (!userPhone) {
-    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
-    await cancelFlow(phone, true);
-    return;
-  }
-
-  const amount = parseFloat(amountStr);
-  if (isNaN(amount) || amount <= 0 || amount > 100000) {
-    await sendTextMessage(
-      phone,
-      "❌ দয়া করে ১ থেকে ১,০০,০০০ এর মধ্যে সঠিক পরিমাণ লিখুন!",
-    );
-    await sendTextWithCancelButton(phone, "পরিমাণ লিখুন:");
-    return;
-  }
-
-  await stateManager.updateStateData(formattedPhone, {
-    adminAddBalance: {
-      ...state.data?.adminAddBalance,
-      amount: amount,
-      step: 3,
-    },
-  });
-
-  await sendTextWithCancelButton(
-    phone,
-    `📝 *কারণ লিখুন*\n\nপরিমাণ: ৳${amount}\nইউজার: ${userPhone}\n\nকারণ লিখুন (ঐচ্ছিক):\n\nউদাহরণ: 'রেফারেল বোনাস', 'সাপোর্ট রিকোয়েস্ট'\n\nস্কিপ করতে 'skip' লিখুন`,
-  );
-}
-
-async function handleAdminAddBalanceReason(
-  phone: string,
-  reason: string,
-): Promise<void> {
-  const formattedPhone = formatPhoneNumber(phone);
-  const state = await stateManager.getUserState(formattedPhone);
-  const userPhone = state?.data?.adminAddBalance?.phone;
-  const amount = state?.data?.adminAddBalance?.amount;
-  const userId = state?.data?.adminAddBalance?.userId;
-
-  if (!userPhone || !amount || !userId) {
-    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
-    await cancelFlow(phone, true);
-    return;
-  }
-
-  try {
-    await connectDB();
-    const user = await User.findById(userId);
-
-    if (!user) {
-      await sendTextMessage(phone, `❌ ইউজার পাওয়া যায়নি: ${userPhone}`);
-      await cancelFlow(phone, true);
-      return;
-    }
-
-    // Add balance
-    const oldBalance = user.balance;
-    user.balance += amount;
-    await user.save();
-
-    // Create transaction record
-    const transaction = await Transaction.create({
-      trxId: `ADMIN-ADD-${Date.now()}`,
-      amount: amount,
-      method: "admin_add",
-      status: "SUCCESS",
-      number: userPhone,
-      user: user._id,
-      metadata: {
-        addedBy: formattedPhone,
-        reason: reason === "skip" ? "Admin manual add" : reason,
-        oldBalance: oldBalance,
-        newBalance: user.balance,
-      },
-      createdAt: new Date(),
-    });
-
-    // Notify user
-    await sendTextMessage(
-      userPhone,
-      `💰 *ব্যালেন্স যোগ করা হয়েছে*\n\nপরিমাণ: +৳${amount}\nপুরোনো ব্যালেন্স: ৳${oldBalance}\nনতুন ব্যালেন্স: ৳${user.balance}\nকারণ: ${reason === "skip" ? "Admin manual add" : reason}\nসময়: ${new Date().toLocaleString()}\n\n🎉 আপনার অ্যাকাউন্টে ব্যালেন্স যোগ করা হয়েছে!\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-    );
-
-    await sendTextMessage(
-      phone,
-      `✅ *ব্যালেন্স যোগ করা হয়েছে*\n\nইউজার: ${user.name} (${userPhone})\nপরিমাণ: +৳${amount}\nপুরোনো ব্যালেন্স: ৳${oldBalance}\nনতুন ব্যালেন্স: ৳${user.balance}\nকারণ: ${reason === "skip" ? "Admin manual add" : reason}\n\n✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-    );
-
-    await notifyAdmin(
-      `💰 ব্যালেন্স যোগ করা হয়েছে\n\nযোগ করেছেন: ${formattedPhone}\nইউজার: ${user.name} (${userPhone})\nপরিমাণ: ৳${amount}\nপুরোনো ব্যালেন্স: ৳${oldBalance}\nনতুন ব্যালেন্স: ৳${user.balance}\nকারণ: ${reason === "skip" ? "Admin manual add" : reason}\nট্রান্সাকশন: ${transaction._id}`,
-    );
-
+    await sendTextMessage(phone, message);
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(phone, true);
 
-    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_add_balance", {
-      userId,
-      userPhone,
-      amount,
-      oldBalance,
-      newBalance: user.balance,
-      reason,
-      transactionId: transaction._id,
+    EnhancedLogger.info(`User details sent to admin ${formattedPhone}`, {
+      userId: user._id,
+      userPhone: formattedUserPhone,
     });
   } catch (err) {
-    EnhancedLogger.error(`Failed to add balance:`, err);
-    await sendTextMessage(phone, "❌ ব্যালেন্স যোগ করতে সমস্যা হয়েছে!");
-    await cancelFlow(phone, true);
-  }
-}
-
-// --- Admin Ban User ---
-async function handleAdminBanUserStart(phone: string): Promise<void> {
-  const formattedPhone = formatPhoneNumber(phone);
-  EnhancedLogger.info(`Admin starting ban user for ${formattedPhone}`);
-
-  await stateManager.setUserState(formattedPhone, {
-    currentState: "admin_ban_user_phone",
-    flowType: "admin_ban_user",
-    data: {
-      adminBanUser: {
-        step: 1,
-      },
-      lastActivity: Date.now(),
-      sessionId: Date.now().toString(36),
-    },
-  });
-
-  await sendTextWithCancelButton(
-    phone,
-    "🚫 *ইউজার ব্যান/আনবান করুন*\n\nযে ইউজারকে ব্যান বা আনবান করতে চান, তার ফোন নম্বর লিখুন:\n\nফরম্যাট:\n• 017XXXXXXXX\n• 88017XXXXXXXX\n\n📌 নোট: ইউজারটি সিস্টেমে থাকতে হবে",
-  );
-}
-
-async function handleAdminBanUserPhone(
-  phone: string,
-  userPhone: string,
-): Promise<void> {
-  const formattedPhone = formatPhoneNumber(phone);
-  EnhancedLogger.info(`Admin banning user: ${userPhone}`);
-
-  try {
-    const formattedUserPhone = formatPhoneNumber(userPhone);
-
-    await connectDB();
-    const user = await User.findOne({ whatsapp: formattedUserPhone });
-
-    if (!user) {
-      await sendTextMessage(
-        phone,
-        `❌ ইউজার পাওয়া যায়নি: ${formattedUserPhone}`,
-      );
-      await cancelFlow(phone, true);
-      return;
-    }
-
-    await stateManager.updateStateData(formattedPhone, {
-      adminBanUser: {
-        phone: formattedUserPhone,
-        userId: user._id,
-        step: 2,
-      },
-    });
-
-    const action = user.isBanned ? "আনবান" : "ব্যান";
-    const actionText = user.isBanned ? "আনবান করতে" : "ব্যান করতে";
-
-    await sendQuickReplyMenu(
-      phone,
-      `🚫 ${action} কনফার্মেশন\n\nইউজার: ${user.name}\nফোন: ${formattedUserPhone}\nবর্তমান স্ট্যাটাস: ${user.isBanned ? "🚫 ব্যান্ড" : "✅ সক্রিয়"}\nব্যালেন্স: ৳${user.balance}\n\nআপনি কি এই ইউজারকে ${actionText} চান?`,
-      [
-        { id: `confirm_${action}`, title: `✅ ${action} করুন` },
-        { id: "cancel_action", title: "❌ বাতিল করুন" },
-      ],
-    );
-  } catch (err) {
-    EnhancedLogger.error(`Failed to find user for ban:`, err);
+    EnhancedLogger.error(`Failed to search for user:`, err);
     await sendTextMessage(phone, "❌ ইউজার খুঁজতে সমস্যা হয়েছে!");
-    await cancelFlow(phone, true);
-  }
-}
-
-async function handleAdminBanUserConfirm(
-  phone: string,
-  action: string,
-): Promise<void> {
-  const formattedPhone = formatPhoneNumber(phone);
-  const state = await stateManager.getUserState(formattedPhone);
-  const userPhone = state?.data?.adminBanUser?.phone;
-  const userId = state?.data?.adminBanUser?.userId;
-
-  if (!userPhone || !userId) {
-    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
-    await cancelFlow(phone, true);
-    return;
-  }
-
-  if (action === "cancel_action") {
-    await sendTextMessage(phone, "🚫 অপারেশন বাতিল করা হয়েছে।");
-    await cancelFlow(phone, true);
-    return;
-  }
-
-  const shouldBan = action === "confirm_ব্যান";
-  const shouldUnban = action === "confirm_আনবান";
-
-  if (!shouldBan && !shouldUnban) {
-    await sendTextMessage(phone, "❌ অজানা একশন!");
-    await cancelFlow(phone, true);
-    return;
-  }
-
-  try {
-    await connectDB();
-    const user = await User.findById(userId);
-
-    if (!user) {
-      await sendTextMessage(phone, `❌ ইউজার পাওয়া যায়নি!`);
-      await cancelFlow(phone, true);
-      return;
-    }
-
-    const newStatus = shouldBan;
-    const actionText = shouldBan ? "ব্যান" : "আনবান";
-    const oldStatus = user.isBanned ? "ব্যান্ড" : "সক্রিয়";
-
-    // Update user status
-    user.isBanned = newStatus;
-    await user.save();
-
-    // Notify user if unbanned
-    if (shouldUnban) {
-      await sendTextMessage(
-        userPhone,
-        `✅ *আপনার অ্যাকাউন্ট আনবান করা হয়েছে*\n\nআপনার SignCopy অ্যাকাউন্টটি আনবান করা হয়েছে। আপনি এখন আবার আমাদের সার্ভিস ব্যবহার করতে পারবেন।\n\n📞 সাপোর্ট: ${CONFIG.supportNumber}\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-      );
-    } else if (shouldBan) {
-      await sendTextMessage(
-        userPhone,
-        `🚫 *আপনার অ্যাকাউন্ট ব্যান্ড করা হয়েছে*\n\nআপনার SignCopy অ্যাকাউন্টটি ব্যান্ড করা হয়েছে।\n\n📞 বিস্তারিত জানতে সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}`,
-      );
-    }
-
-    await sendTextMessage(
-      phone,
-      `✅ *ইউজার ${actionText} করা হয়েছে*\n\nইউজার: ${user.name} (${userPhone})\nপুরোনো স্ট্যাটাস: ${oldStatus}\nনতুন স্ট্যাটাস: ${newStatus ? "🚫 ব্যান্ড" : "✅ সক্রিয়"}\n\n${shouldBan ? "⚠️ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।" : "✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।"}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-    );
-
-    await notifyAdmin(
-      `🚫 ইউজার ${actionText} করা হয়েছে\n\n${actionText} করেছেন: ${formattedPhone}\nইউজার: ${user.name} (${userPhone})\nপুরোনো স্ট্যাটাস: ${oldStatus}\nনতুন স্ট্যাটাস: ${newStatus ? "ব্যান্ড" : "সক্রিয়"}\nসময়: ${new Date().toLocaleString()}`,
-    );
-
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(phone, true);
+  }
+}
 
-    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_ban_user", {
-      userId,
-      userPhone,
-      action: actionText,
-      oldStatus,
-      newStatus,
+async function handleAdminUserDetails(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin viewing user details for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+
+    // Get top users by balance
+    const topUsersByBalance = await User.find()
+      .sort({ balance: -1 })
+      .limit(5)
+      .select("name whatsapp balance whatsappLastActive");
+
+    // Get top users by orders
+    const topUsersByOrders = await User.aggregate([
+      {
+        $lookup: {
+          from: "orders",
+          localField: "_id",
+          foreignField: "userId",
+          as: "orders",
+        },
+      },
+      {
+        $addFields: {
+          orderCount: { $size: "$orders" },
+          totalSpent: { $sum: "$orders.totalPrice" },
+        },
+      },
+      { $sort: { orderCount: -1 } },
+      { $limit: 5 },
+      {
+        $project: {
+          name: 1,
+          whatsapp: 1,
+          balance: 1,
+          orderCount: 1,
+          totalSpent: 1,
+        },
+      },
+    ]);
+
+    // Get recent new users
+    const recentNewUsers = await User.find()
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .select("name whatsapp balance createdAt");
+
+    let message = `📊 *ইউজার স্ট্যাটিসটিক্স*\n\n`;
+
+    // Total user stats
+    const totalUsers = await User.countDocuments();
+    const activeUsers = await User.countDocuments({
+      whatsappLastActive: {
+        $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+      },
+    });
+    const newUsers = await User.countDocuments({
+      createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+    });
+    const bannedUsers = await User.countDocuments({ isBanned: true });
+
+    message += `📈 *সারাংশ:*\n`;
+    message += `• মোট ইউজার: ${totalUsers}\n`;
+    message += `• সক্রিয় ইউজার: ${activeUsers}\n`;
+    message += `• নতুন ইউজার: ${newUsers}\n`;
+    message += `• ব্যান্ড ইউজার: ${bannedUsers}\n\n`;
+
+    // Top users by balance
+    if (topUsersByBalance.length > 0) {
+      message += `💰 *টপ ৫ ইউজার (ব্যালেন্স):*\n`;
+      topUsersByBalance.forEach((user, index) => {
+        message += `${index + 1}. ${user.name} (${user.whatsapp})\n`;
+        message += `   ব্যালেন্স: ৳${user.balance}\n\n`;
+      });
+    }
+
+    // Top users by orders
+    if (topUsersByOrders.length > 0) {
+      message += `🛒 *টপ ৫ ইউজার (অর্ডার):*\n`;
+      topUsersByOrders.forEach((user, index) => {
+        message += `${index + 1}. ${user.name} (${user.whatsapp})\n`;
+        message += `   অর্ডার: ${user.orderCount}টি\n`;
+        message += `   খরচ: ৳${user.totalSpent || 0}\n\n`;
+      });
+    }
+
+    // Recent new users
+    if (recentNewUsers.length > 0) {
+      message += `🆕 *সাম্প্রতিক নতুন ইউজার:*\n`;
+      recentNewUsers.forEach((user, index) => {
+        const joinDate = new Date(user.createdAt).toLocaleDateString();
+        message += `${index + 1}. ${user.name} (${user.whatsapp})\n`;
+        message += `   ব্যালেন্স: ৳${user.balance}\n`;
+        message += `   যোগদান: ${joinDate}\n\n`;
+      });
+    }
+
+    message += `📅 রিপোর্ট সময়: ${new Date().toLocaleString()}\n\n`;
+    message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, message);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.info(`User statistics sent to admin ${formattedPhone}`, {
+      totalUsers,
+      activeUsers,
+      newUsers,
     });
   } catch (err) {
-    EnhancedLogger.error(`Failed to ${shouldBan ? "ban" : "unban"} user:`, err);
-    await sendTextMessage(
-      phone,
-      `❌ ইউজার ${shouldBan ? "ব্যান" : "আনবান"} করতে সমস্যা হয়েছে!`,
+    EnhancedLogger.error(
+      `Failed to get user statistics for admin ${formattedPhone}:`,
+      err,
     );
-    await cancelFlow(phone, true);
+    await sendTextMessage(phone, "❌ ইউজার স্ট্যাটস লোড করতে সমস্যা হয়েছে!");
+    await showMainMenu(phone, true);
   }
 }
 
@@ -4885,6 +5096,13 @@ async function handleUserMessage(
         return;
       }
 
+      // Admin User Search
+      if (currentState === "admin_search_user_input") {
+        EnhancedLogger.info(`[${requestId}] Admin user search`);
+        await handleAdminUserSearch(formattedPhone, userText);
+        return;
+      }
+
       // ========================================
       // MENU COMMANDS (works anytime)
       // ========================================
@@ -5057,7 +5275,7 @@ async function handleUserMessage(
         EnhancedLogger.info(`[${requestId}] Sending default welcome message`);
         await sendTextMessage(
           formattedPhone,
-          "👋 *নমস্কার! SignCopy তে আপনাকে স্বাগতম!*\n\nআমাদের সার্ভিস সম্পর্কে জানতে 'Menu' লিখুন।\n\n📌 *দ্রুত গাইড:*\n• রিচার্জ করতে: 'রিচার্জ'\n• সার্ভিস দেখতে: 'সার্ভিস'\n• অর্ডার দেখতে: 'অর্ডার'\n• অ্যাকাউন্ট দেখতে: 'অ্যাকাউন্ট'\n• সাপোর্ট পেতে: 'সাপোর্ট'\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
+          "👋 *নমস্কার! Birth Help তে আপনাকে স্বাগতম!*\n\nআমাদের সার্ভিস সম্পর্কে জানতে 'Menu' লিখুন।\n\n📌 *দ্রুত গাইড:*\n• রিচার্জ করতে: 'রিচার্জ'\n• সার্ভিস দেখতে: 'সার্ভিস'\n• অর্ডার দেখতে: 'অর্ডার'\n• অ্যাকাউন্ট দেখতে: 'অ্যাকাউন্ট'\n• সাপোর্ট পেতে: 'সাপোর্ট'\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
         );
         await showMainMenu(formattedPhone, isAdmin);
       } else {
@@ -5264,19 +5482,11 @@ async function handleUserMessage(
               break;
             case "admin_search_user":
               EnhancedLogger.info(`[${requestId}] Admin selected search user`);
-              await sendTextMessage(
-                formattedPhone,
-                "🔍 *ইউজার খুঁজুন*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
-              );
-              await showMainMenu(formattedPhone, true);
+              await handleAdminUserSearchStart(formattedPhone);
               break;
             case "admin_user_details":
               EnhancedLogger.info(`[${requestId}] Admin selected user details`);
-              await sendTextMessage(
-                formattedPhone,
-                "📋 *ইউজার ডিটেইলস*\n\nএই ফিচারটি শীঘ্রই আসছে...\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
-              );
-              await showMainMenu(formattedPhone, true);
+              await handleAdminUserDetails(formattedPhone);
               break;
             case "admin_user_stats":
               EnhancedLogger.info(`[${requestId}] Admin selected user stats`);
@@ -5480,9 +5690,12 @@ async function handleUserMessage(
         } else if (selectedId.startsWith("broadcast_")) {
           await handleAdminBroadcastSend(formattedPhone, selectedId);
         } else if (selectedId.startsWith("status_")) {
-          await handleAdminProcessOrderUpdate(formattedPhone, selectedId);
+          await handleAdminProcessOrderUpdate(formattedPhone, selectedId, message.text?.body.trim());
         } else if (selectedId.startsWith("edit_")) {
           await handleAdminEditServiceOption(formattedPhone, selectedId);
+        } else if (selectedId.startsWith("delivery_")) {
+          // Handle delivery type selection
+          await handleAdminProcessOrderUpdate(formattedPhone, selectedId, message.text?.body.trim());
         } else {
           EnhancedLogger.warn(`[${requestId}] Unknown button selected`, {
             selectedId,
@@ -5493,6 +5706,25 @@ async function handleUserMessage(
           );
           await showMainMenu(formattedPhone, isAdmin);
         }
+      }
+    } else if (message.type === "image" || message.type === "document") {
+      // Handle file uploads for order delivery
+      const state = await stateManager.getUserState(formattedPhone);
+      if (
+        state?.currentState === "admin_process_order_status" &&
+        state?.flowType === "admin_process_order" &&
+        state?.data?.adminProcessOrder?.step === 4
+      ) {
+        EnhancedLogger.info(
+          `[${requestId}] Handling file upload for order delivery`,
+        );
+        await handleAdminFileUpload(formattedPhone, message);
+      } else {
+        await sendTextMessage(
+          formattedPhone,
+          "❌ এই ধরনের মেসেজ এখন গ্রহণযোগ্য নয়।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+        );
+        await showMainMenu(formattedPhone, isAdmin);
       }
     } else {
       EnhancedLogger.warn(`[${requestId}] Unhandled message type`, {
@@ -5657,3 +5889,345 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   });
   return new NextResponse("Method Not Allowed", { status: 405 });
 }
+// --- Admin Add Balance ---
+async function handleAdminAddBalanceStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin starting add balance for ${formattedPhone}`);
+
+  await stateManager.setUserState(formattedPhone, {
+    currentState: "admin_add_balance_phone",
+    flowType: "admin_add_balance",
+    data: {
+      adminAddBalance: {
+        step: 1,
+      },
+      lastActivity: Date.now(),
+      sessionId: Date.now().toString(36),
+    },
+  });
+
+  await sendTextWithCancelButton(
+    phone,
+    "💰 *ইউজারকে ব্যালেন্স যোগ করুন*\n\nপ্রথমে ইউজারের ফোন নম্বর লিখুন:\n\nফরম্যাট:\n• 017XXXXXXXX\n• 88017XXXXXXXX\n• +88017XXXXXXXX\n\n📌 নোট: ইউজারটি সিস্টেমে থাকতে হবে",
+  );
+}
+
+
+
+async function handleAdminAddBalanceAmount(
+  phone: string,
+  amountStr: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin adding balance amount: ${amountStr}`);
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const userPhone = state?.data?.adminAddBalance?.phone;
+
+    if (!userPhone) {
+      await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    const amount = parseFloat(amountStr);
+    if (isNaN(amount) || amount <= 0 || amount > 1000000) {
+      await sendTextMessage(
+        phone,
+        "❌ দয়া করে ১ থেকে ১০,০০,০০০ এর মধ্যে সঠিক পরিমাণ লিখুন!",
+      );
+      return;
+    }
+
+    await stateManager.updateStateData(formattedPhone, {
+      adminAddBalance: {
+        phone: userPhone,
+        amount: amount,
+        step: 3,
+      },
+    });
+
+    await sendTextWithCancelButton(
+      phone,
+      `💰 *ব্যালেন্স যোগ করার কারণ লিখুন*\n\nযোগ করার পরিমাণ: ৳${amount}\n\nকারণ লিখুন:\n\nউদাহরণ:\n• রিফান্ড\n• প্রচারণা বোনাস\n• সমস্যা সমাধান\n• প্রিমিয়াম সুবিধা\n\n📌 কারণটি পরিষ্কার ও বর্ণনামূলক হোক`,
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to process add balance amount:`, err);
+    await sendTextMessage(phone, "❌ পরিমাণ প্রসেস করতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+async function handleAdminAddBalanceReason(
+  phone: string,
+  reason: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin adding balance with reason: ${reason}`);
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const userData = state?.data?.adminAddBalance as
+      | AdminAddBalanceStateData
+      | undefined;
+    const userPhone = userData?.phone;
+    const amount = userData?.amount;
+
+    if (!userPhone || !amount) {
+      await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    if (!reason.trim() || reason.trim().length < 3) {
+      await sendTextMessage(
+        phone,
+        "❌ দয়া করে কমপক্ষে 3 ক্যারেক্টারের কারণ লিখুন!",
+      );
+      return;
+    }
+
+    await connectDB();
+    const user = await User.findOne({ whatsapp: userPhone });
+
+    if (!user) {
+      await sendTextMessage(phone, "❌ ইউজার পাওয়া যায়নি!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    // Add balance
+    user.balance += amount;
+    await user.save();
+
+    // Create transaction record
+    const transaction = await Transaction.create({
+      trxId: `ADMIN-ADD-${Date.now()}`,
+      amount: amount,
+      method: "admin_add",
+      status: "SUCCESS",
+      number: userPhone,
+      user: user._id,
+      metadata: {
+        reason: reason.trim(),
+        addedBy: formattedPhone,
+        addedAt: new Date().toISOString(),
+      },
+      createdAt: new Date(),
+    });
+
+    // Notify user
+    const notificationMessage =
+      `💰 *ব্যালেন্স যোগ করা হয়েছে*\n\n` +
+      `যোগ করা পরিমাণ: +৳${amount}\n` +
+      `কারণ: ${reason.trim()}\n` +
+      `নতুন ব্যালেন্স: ৳${user.balance}\n` +
+      `📅 সময়: ${new Date().toLocaleString()}\n\n` +
+      `🎉 আপনার অ্যাকাউন্টে ব্যালেন্স যোগ করা হয়েছে!\n\n` +
+      `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(userPhone, notificationMessage);
+
+    // Send confirmation to admin
+    const confirmMessage =
+      `✅ *ব্যালেন্স যোগ সম্পন্ন*\n\n` +
+      `ইউজার: ${user.name} (${userPhone})\n` +
+      `যোগ করা পরিমাণ: +৳${amount}\n` +
+      `পূর্ববর্তী ব্যালেন্স: ৳${user.balance - amount}\n` +
+      `নতুন ব্যালেন্স: ৳${user.balance}\n` +
+      `কারণ: ${reason.trim()}\n` +
+      `ট্রান্সাকশন আইডি: ${transaction._id}\n\n` +
+      `✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n\n` +
+      `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, confirmMessage);
+
+    await notifyAdmin(
+      `💰 ব্যালেন্স যোগ করা হয়েছে\n\nইউজার: ${user.name} (${userPhone})\nপরিমাণ: +৳${amount}\nকারণ: ${reason.trim()}\nনতুন ব্যালেন্স: ৳${user.balance}\nযোগ করেছেন: ${formattedPhone}\nসময়: ${new Date().toLocaleString()}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_add_balance", {
+      userPhone,
+      amount,
+      reason: reason.trim(),
+      transactionId: transaction._id,
+      newBalance: user.balance,
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to add balance:`, err);
+    await sendTextMessage(phone, "❌ ব্যালেন্স যোগ করতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+// --- Admin Ban User ---
+async function handleAdminBanUserStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin starting ban user for ${formattedPhone}`);
+
+  await stateManager.setUserState(formattedPhone, {
+    currentState: "admin_ban_user_phone",
+    flowType: "admin_ban_user",
+    data: {
+      adminBanUser: {
+        step: 1,
+      },
+      lastActivity: Date.now(),
+      sessionId: Date.now().toString(36),
+    },
+  });
+
+  await sendTextWithCancelButton(
+    phone,
+    "🚫 *ইউজার ব্যান করুন*\n\nব্যান করতে চান এমন ইউজারের ফোন নম্বর লিখুন:\n\nফরম্যাট:\n• 017XXXXXXXX\n• 88017XXXXXXXX\n• +88017XXXXXXXX\n\n⚠️ সতর্কতা: এটি পার্মানেন্ট অ্যাকশন!",
+  );
+}
+
+async function handleAdminBanUserPhone(
+  phone: string,
+  userPhone: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin banning user: ${userPhone}`);
+
+  try {
+    const formattedUserPhone = formatPhoneNumber(userPhone);
+
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedUserPhone });
+
+    if (!user) {
+      await sendTextMessage(
+        phone,
+        `❌ ইউজার পাওয়া যায়নি: ${formattedUserPhone}\n\nদয়া করে সঠিক ফোন নম্বর দিন।`,
+      );
+      return;
+    }
+
+    if (user.isBanned) {
+      await sendTextMessage(
+        phone,
+        `⚠️ এই ইউজার ইতিমধ্যে ব্যান করা আছে।\n\nফোন: ${formattedUserPhone}\nনাম: ${user.name}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+      );
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    await stateManager.updateStateData(formattedPhone, {
+      adminBanUser: {
+        phone: formattedUserPhone,
+        userId: user._id.toString(),
+        step: 2,
+      },
+    });
+
+    await sendTextWithCancelButton(
+      phone,
+      `✅ *ইউজার নিশ্চিত করা হয়েছে*\n\nনাম: ${user.name}\nফোন: ${formattedUserPhone}\nব্যালেন্স: ৳${user.balance}\nযোগদান: ${new Date(user.createdAt).toLocaleDateString()}\n\nব্যান করার কারণ লিখুন:\n\nউদাহরণ:\n• জালিয়াতি\n• শর্তভঙ্গ\n• অপব্যবহার\n• সন্দেহজনক কার্যকলাপ\n\n⚠️ এটি ইউজারকে সিস্টেম থেকে চিরতরে বাদ দেবে!`,
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to process ban user phone:`, err);
+    await sendTextMessage(phone, "❌ ইউজার খুঁজতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+
+async function handleAdminBanUserConfirm(
+  phone: string,
+  reason: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Admin banning user with reason: ${reason}`);
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const banData = state?.data?.adminBanUser as AdminBanUserStateData | undefined;
+    const userPhone = banData?.phone;
+    const userId = banData?.userId;
+
+    if (!userPhone || !userId) {
+      await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    if (!reason.trim() || reason.trim().length < 3) {
+      await sendTextMessage(
+        phone,
+        "❌ দয়া করে কমপক্ষে 3 ক্যারেক্টারের কারণ লিখুন!",
+      );
+      return;
+    }
+
+    await connectDB();
+    const user = await User.findByIdAndUpdate(
+      userId,
+      {
+        isBanned: true,
+        banReason: reason.trim(),
+        bannedAt: new Date(),
+        bannedBy: formattedPhone,
+      },
+      { new: true },
+    );
+
+    if (!user) {
+      await sendTextMessage(phone, "❌ ইউজার পাওয়া যায়নি!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    // Notify banned user
+    const banNotification =
+      `🚫 *আপনার অ্যাকাউন্ট ব্যান করা হয়েছে*\n\n` +
+      `কারণ: ${reason.trim()}\n` +
+      `ব্যান করা হয়েছে: ${new Date().toLocaleString()}\n\n` +
+      `❌ আপনার Birth Help অ্যাকাউন্ট অ্যাক্সেস বন্ধ করা হয়েছে।\n` +
+      `📞 এপিল করতে সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}`;
+
+    try {
+      await sendTextMessage(userPhone, banNotification);
+    } catch (notifyErr) {
+      EnhancedLogger.error(`Failed to notify banned user:`, notifyErr);
+    }
+
+    // Send confirmation to admin
+    const confirmMessage =
+      `✅ *ইউজার ব্যান সম্পন্ন*\n\n` +
+      `ইউজার: ${user.name}\n` +
+      `ফোন: ${userPhone}\n` +
+      `কারণ: ${reason.trim()}\n` +
+      `ব্যান করা হয়েছে: ${new Date().toLocaleString()}\n\n` +
+      `🚫 ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n` +
+      `এই ইউজার এখন সিস্টেম ব্যবহার করতে পারবে না।\n\n` +
+      `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, confirmMessage);
+
+    await notifyAdmin(
+      `🚫 ইউজার ব্যান করা হয়েছে\n\nইউজার: ${user.name} (${userPhone})\nকারণ: ${reason.trim()}\nব্যান করেছেন: ${formattedPhone}\nসময়: ${new Date().toLocaleString()}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_ban_user", {
+      userId,
+      userPhone,
+      reason: reason.trim(),
+      bannedAt: new Date(),
+    });
+  } catch (err) {
+    EnhancedLogger.error(`Failed to ban user:`, err);
+    await sendTextMessage(phone, "❌ ইউজার ব্যান করতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
+function handleAdminAddBalancePhone(formattedPhone: string, userText: string) {
+  throw new Error("Function not implemented.");
+}
+
