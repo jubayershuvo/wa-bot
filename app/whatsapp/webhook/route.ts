@@ -722,7 +722,9 @@ async function uploadFile(
 
     // Check if file upload URL is configured
     if (!CONFIG.fileUploadUrl || CONFIG.fileUploadUrl === "/api/upload") {
-      EnhancedLogger.warn(`File upload URL not properly configured, using mock URL`);
+      EnhancedLogger.warn(
+        `File upload URL not properly configured, using mock URL`,
+      );
       // Return a mock URL for testing
       return `https://example.com/uploads/${fileName}`;
     }
@@ -749,11 +751,13 @@ async function uploadFile(
         status: response.status,
         error: errorText,
       });
-      throw new Error(`File upload failed: ${response.statusText} - ${errorText}`);
+      throw new Error(
+        `File upload failed: ${response.statusText} - ${errorText}`,
+      );
     }
 
     const result = await response.json();
-    
+
     if (!result.fileUrl) {
       EnhancedLogger.error(`No fileUrl in response`, { result });
       throw new Error("No file URL returned from upload server");
@@ -762,7 +766,7 @@ async function uploadFile(
     EnhancedLogger.info(`File upload successful`, {
       fileUrl: result.fileUrl,
     });
-    
+
     return result.fileUrl;
   } catch (error: any) {
     EnhancedLogger.error(`Failed to upload file:`, {
@@ -815,10 +819,13 @@ async function downloadWhatsAppMedia(
 
     if (!downloadResponse.ok) {
       const errorText = await downloadResponse.text();
-      EnhancedLogger.error(`Failed to download media: ${downloadResponse.statusText}`, {
-        status: downloadResponse.status,
-        error: errorText,
-      });
+      EnhancedLogger.error(
+        `Failed to download media: ${downloadResponse.statusText}`,
+        {
+          status: downloadResponse.status,
+          error: errorText,
+        },
+      );
       throw new Error(
         `Failed to download media: ${downloadResponse.statusText}`,
       );
@@ -3950,7 +3957,7 @@ async function handleAdminProcessOrderUpdate(
               adminProcessOrder: {
                 ...state.data?.adminProcessOrder,
                 step: 2,
-                deliveryType: newStatus,
+                status: newStatus, // Store status separately
               },
               lastActivity: Date.now(),
               sessionId: Date.now().toString(36),
@@ -3980,7 +3987,7 @@ async function handleAdminProcessOrderUpdate(
             },
           });
 
-          await completeOrderDelivery(phone);
+          await completeFailedOrCancelledOrder(phone);
         }
       }
     }
@@ -4114,38 +4121,7 @@ async function handleAdminProcessOrderUpdate(
         },
       });
 
-      await completeOrderDelivery(phone);
-    }
-    // Handle text input for delivery type (if someone types instead of clicking)
-    else if (currentState === "admin_process_order_delivery_type" && input) {
-      // Convert text input to delivery type
-      let deliveryType = "";
-      if (input.includes("text") || input.includes("টেক্সট") || input === "1") {
-        deliveryType = "text";
-      } else if (
-        input.includes("file") ||
-        input.includes("ফাইল") ||
-        input === "2"
-      ) {
-        deliveryType = "file";
-      } else if (
-        input.includes("both") ||
-        input.includes("উভয়") ||
-        input === "3"
-      ) {
-        deliveryType = "both";
-      } else {
-        await sendTextMessage(
-          phone,
-          "❌ দয়া করে একটি বৈধ অপশন সিলেক্ট করুন:\n\n1. টেক্সট\n2. ফাইল\n3. উভয়",
-        );
-        return;
-      }
-
-      await handleAdminProcessOrderUpdate(
-        formattedPhone,
-        `delivery_${deliveryType}`,
-      );
+      await completeFailedOrCancelledOrder(phone);
     }
   } catch (err) {
     EnhancedLogger.error(`Failed to update order status:`, err);
@@ -4153,7 +4129,101 @@ async function handleAdminProcessOrderUpdate(
     await showMainMenu(phone, true);
   }
 }
+async function completeFailedOrCancelledOrder(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  const state = await stateManager.getUserState(formattedPhone);
+  const orderId = state?.data?.adminProcessOrder?.orderId;
+  const order = state?.data?.adminProcessOrder?.order;
+  const status = state?.data?.adminProcessOrder?.status; // Should be "failed" or "cancelled"
+  const deliveryData = state?.data?.adminProcessOrder?.deliveryData;
 
+  if (!orderId || !order || !status) {
+    await sendTextMessage(phone, "❌ সেশন শেষ হয়েছে!");
+    await cancelFlow(phone, true);
+    return;
+  }
+
+  try {
+    await connectDB();
+    const updatedOrder = await Order.findById(orderId);
+
+    if (!updatedOrder) {
+      await sendTextMessage(phone, "❌ অর্ডার পাওয়া যায়নি!");
+      await cancelFlow(phone, true);
+      return;
+    }
+
+    // Update order status
+    updatedOrder.status = status;
+
+    // Add cancellation data
+    updatedOrder.cancellationData = {
+      cancelledAt: new Date(),
+      reason: deliveryData?.reason || "",
+      cancelledBy: formattedPhone,
+    };
+
+    updatedOrder.updatedAt = new Date();
+    await updatedOrder.save();
+
+    // Notify user
+    const user = order.userId as any;
+    if (user && user.whatsapp) {
+      const statusText = status === "failed" ? "ব্যর্থ" : "বাতিল";
+      let notification = `❌ *আপনার অর্ডার ${statusText} হয়েছে*\n\n`;
+      notification += `🆔 অর্ডার আইডি: ${orderId.slice(-8)}\n`;
+      notification += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
+      notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
+      notification += `📅 ${statusText} হয়েছে: ${new Date().toLocaleString()}\n\n`;
+
+      if (deliveryData?.reason) {
+        notification += `📝 *কারণ:*\n${deliveryData.reason}\n\n`;
+      }
+
+      notification += `😞 দুঃখিত আপনার অর্ডারটি ${statusText} হয়েছে।\n`;
+      notification += `📞 বিস্তারিত জানতে সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}\n`;
+      notification += `🔄 নতুন অর্ডার করতে 'সার্ভিস' লিখুন\n\n`;
+      notification += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+      await sendTextMessage(user.whatsapp, notification);
+    }
+
+    // Send confirmation to admin
+    let adminMessage = `✅ *অর্ডার আপডেট সম্পন্ন*\n\n`;
+    adminMessage += `🆔 অর্ডার: ${orderId.slice(-8)}\n`;
+    adminMessage += `👤 ইউজার: ${order.userId?.name || "User"} (${order.userId?.whatsapp || "N/A"})\n`;
+    adminMessage += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
+    adminMessage += `📊 নতুন স্ট্যাটাস: ${updatedOrder.status}\n`;
+    adminMessage += `📝 কারণ: ${deliveryData?.reason || "N/A"}\n`;
+
+    adminMessage += `\n✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(phone, adminMessage);
+
+    await notifyAdmin(
+      `🔄 অর্ডার আপডেট সম্পন্ন\n\nঅর্ডার: ${orderId}\nসার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\nইউজার: ${order.userId?.name || "User"} (${order.userId?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${updatedOrder.status}\nআপডেট করেছেন: ${formattedPhone}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(phone, true);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "admin_process_order", {
+      orderId,
+      orderStatus: updatedOrder.status,
+      userId: order.userId?._id,
+      reason: deliveryData?.reason,
+    });
+  } catch (err: any) {
+    EnhancedLogger.error(`Failed to complete failed/cancelled order:`, {
+      error: err?.message || err,
+      stack: err?.stack,
+      orderId,
+      status,
+    });
+    await sendTextMessage(phone, "❌ অর্ডার আপডেট করতে সমস্যা হয়েছে!");
+    await cancelFlow(phone, true);
+  }
+}
 async function completeOrderDelivery(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   const state = await stateManager.getUserState(formattedPhone);
@@ -4178,74 +4248,66 @@ async function completeOrderDelivery(phone: string): Promise<void> {
       return;
     }
 
-    // Update order status and delivery data
-    const newStatus = deliveryType === "completed" ? "completed" : deliveryType;
+    // FIXED: Always set status to "completed" for delivery type "completed"
+    // deliveryType can be "text", "file", or "both" - but status should be "completed"
+    const newStatus = "completed"; // Always set to completed for successful deliveries
+
+    EnhancedLogger.info(`Updating order status to: ${newStatus}`, {
+      orderId,
+      deliveryType,
+      previousStatus: updatedOrder.status,
+    });
+
+    // Update order status
     updatedOrder.status = newStatus;
 
-    if (deliveryType === "completed") {
-      updatedOrder.deliveryData = {
-        deliveredAt: new Date(),
-        deliveryMethod: "whatsapp",
-        text: deliveryData?.text || "",
-        fileUrl: deliveryData?.fileUrl || "",
-        fileName: deliveryData?.fileName || "",
-        fileType: deliveryData?.fileType || "",
-        deliveredBy: formattedPhone,
-      };
-    } else {
-      updatedOrder.cancellationData = {
-        cancelledAt: new Date(),
-        reason: deliveryData?.reason || "",
-        cancelledBy: formattedPhone,
-      };
-    }
+    // Add delivery data
+    updatedOrder.deliveryData = {
+      deliveredAt: new Date(),
+      deliveryMethod: "whatsapp",
+      text: deliveryData?.text || "",
+      fileUrl: deliveryData?.fileUrl || "",
+      fileName: deliveryData?.fileName || "",
+      fileType: deliveryData?.fileType || "",
+      deliveryType: deliveryType || "file", // Store the delivery type separately
+      deliveredBy: formattedPhone,
+    };
 
     updatedOrder.updatedAt = new Date();
+
+    EnhancedLogger.info(`Saving order with delivery data`, {
+      deliveryData: updatedOrder.deliveryData,
+    });
+
     await updatedOrder.save();
+
+    EnhancedLogger.info(`Order saved successfully`, {
+      orderId,
+      newStatus,
+    });
 
     // Notify user
     const user = order.userId as any;
     if (user && user.whatsapp) {
-      if (deliveryType === "completed") {
-        let notification = `✅ *আপনার অর্ডার সম্পন্ন হয়েছে!*\n\n`;
-        notification += `🆔 অর্ডার আইডি: ${orderId.slice(-8)}\n`;
-        notification += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
-        notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
-        notification += `📅 সম্পূর্ণ হয়েছে: ${new Date().toLocaleString()}\n\n`;
+      let notification = `✅ *আপনার অর্ডার সম্পন্ন হয়েছে!*\n\n`;
+      notification += `🆔 অর্ডার আইডি: ${orderId.slice(-8)}\n`;
+      notification += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
+      notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
+      notification += `📅 সম্পূর্ণ হয়েছে: ${new Date().toLocaleString()}\n\n`;
 
-        if (deliveryData?.text) {
-          notification += `📝 *ডেলিভারি নোট:*\n${deliveryData.text}\n\n`;
-        }
-
-        if (deliveryData?.fileUrl) {
-          notification += `📁 *ডেলিভারি ফাইল:*\n${deliveryData.fileName}\n\n`;
-          notification += `📎 ফাইল ডাউনলোড করুন: ${deliveryData.fileUrl}\n\n`;
-        }
-
-        notification += `🎉 আপনার অর্ডার সফলভাবে সম্পন্ন হয়েছে!\n`;
-        notification += `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}\n\n`;
-        notification += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-        await sendTextMessage(user.whatsapp, notification);
-      } else {
-        const statusText = deliveryType === "failed" ? "ব্যর্থ" : "বাতিল";
-        let notification = `❌ *আপনার অর্ডার ${statusText} হয়েছে*\n\n`;
-        notification += `🆔 অর্ডার আইডি: ${orderId.slice(-8)}\n`;
-        notification += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
-        notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
-        notification += `📅 ${statusText} হয়েছে: ${new Date().toLocaleString()}\n\n`;
-
-        if (deliveryData?.reason) {
-          notification += `📝 *কারণ:*\n${deliveryData.reason}\n\n`;
-        }
-
-        notification += `😞 দুঃখিত আপনার অর্ডারটি ${statusText} হয়েছে।\n`;
-        notification += `📞 বিস্তারিত জানতে সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}\n`;
-        notification += `🔄 নতুন অর্ডার করতে 'সার্ভিস' লিখুন\n\n`;
-        notification += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-        await sendTextMessage(user.whatsapp, notification);
+      if (deliveryData?.text) {
+        notification += `📝 *ডেলিভারি নোট:*\n${deliveryData.text}\n\n`;
       }
+
+      if (deliveryData?.fileUrl) {
+        notification += `📁 *ডেলিভারি ফাইল:*\n${deliveryData.fileName}\n\n`;
+      }
+
+      notification += `🎉 আপনার অর্ডার সফলভাবে সম্পন্ন হয়েছে!\n`;
+      notification += `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}\n\n`;
+      notification += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+      await sendTextMessage(user.whatsapp, notification);
     }
 
     // Send confirmation to admin
@@ -4254,12 +4316,14 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     adminMessage += `👤 ইউজার: ${order.userId?.name || "User"} (${order.userId?.whatsapp || "N/A"})\n`;
     adminMessage += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
     adminMessage += `📊 নতুন স্ট্যাটাস: ${updatedOrder.status}\n`;
+    adminMessage += `📦 ডেলিভারি টাইপ: ${deliveryType === "text" ? "শুধু টেক্সট" : deliveryType === "file" ? "শুধু ফাইল" : "টেক্সট ও ফাইল"}\n`;
 
-    if (deliveryType === "completed") {
+    if (deliveryType === "text" || deliveryType === "both") {
       adminMessage += `📝 টেক্সট পাঠানো: ${deliveryData?.text ? "✅ হ্যাঁ" : "❌ না"}\n`;
+    }
+
+    if (deliveryType === "file" || deliveryType === "both") {
       adminMessage += `📁 ফাইল আপলোড: ${deliveryData?.fileUrl ? "✅ হ্যাঁ" : "❌ না"}\n`;
-    } else {
-      adminMessage += `📝 কারণ: ${deliveryData?.reason || "N/A"}\n`;
     }
 
     adminMessage += `\n✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
@@ -4267,7 +4331,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     await sendTextMessage(phone, adminMessage);
 
     await notifyAdmin(
-      `🔄 অর্ডার আপডেট সম্পন্ন\n\nঅর্ডার: ${orderId}\nসার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\nইউজার: ${order.userId?.name || "User"} (${order.userId?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${updatedOrder.status}\nআপডেট করেছেন: ${formattedPhone}`,
+      `🔄 অর্ডার আপডেট সম্পন্ন\n\nঅর্ডার: ${orderId}\nসার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\nইউজার: ${order.userId?.name || "User"} (${order.userId?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${updatedOrder.status}\nডেলিভারি টাইপ: ${deliveryType}\nআপডেট করেছেন: ${formattedPhone}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
@@ -4280,10 +4344,14 @@ async function completeOrderDelivery(phone: string): Promise<void> {
       deliveryType,
       hasText: !!deliveryData?.text,
       hasFile: !!deliveryData?.fileUrl,
-      reason: deliveryData?.reason,
     });
-  } catch (err) {
-    EnhancedLogger.error(`Failed to complete order delivery:`, err);
+  } catch (err: any) {
+    EnhancedLogger.error(`Failed to complete order delivery:`, {
+      error: err?.message || err,
+      stack: err?.stack,
+      orderId,
+      deliveryType,
+    });
     await sendTextMessage(phone, "❌ অর্ডার আপডেট করতে সমস্যা হয়েছে!");
     await cancelFlow(phone, true);
   }
@@ -4344,43 +4412,35 @@ async function handleAdminFileUpload(
         mimeType,
       });
 
-      try {
-        // Upload to your server
-        const fileUrl = await uploadFile(buffer, fileName, mimeType);
+      // Upload to your server
+      const fileUrl = await uploadFile(buffer, fileName, mimeType);
 
-        EnhancedLogger.info(`File uploaded successfully`, {
-          fileUrl,
-          fileName,
-        });
+      EnhancedLogger.info(`File uploaded successfully`, {
+        fileUrl,
+        fileName,
+      });
 
-        // Update state with file info
-        await stateManager.updateStateData(formattedPhone, {
-          adminProcessOrder: {
-            ...state.data?.adminProcessOrder,
-            deliveryData: {
-              ...state.data?.adminProcessOrder?.deliveryData,
-              fileUrl: fileUrl,
-              fileName: fileName,
-              fileType: mimeType,
-            },
-            step: deliveryType === "both" ? 5 : 4,
+      // Update state with file info
+      await stateManager.updateStateData(formattedPhone, {
+        adminProcessOrder: {
+          ...state.data?.adminProcessOrder,
+          deliveryData: {
+            ...state.data?.adminProcessOrder?.deliveryData,
+            fileUrl: fileUrl,
+            fileName: fileName,
+            fileType: mimeType,
           },
-        });
+          step: 5, // Always go to step 5 after file upload for completed orders
+        },
+      });
 
-        await sendTextMessage(
-          phone,
-          `✅ *ফাইল আপলোড সফল*\n\n📁 ফাইল: ${fileName}\n📊 সাইজ: ${(buffer.length / 1024).toFixed(2)}KB\n\nফাইল সফলভাবে আপলোড হয়েছে!`,
-        );
+      await sendTextMessage(
+        phone,
+        `✅ *ফাইল আপলোড সফল*\n\n📁 ফাইল: ${fileName}\n📊 সাইজ: ${(buffer.length / 1024).toFixed(2)}KB\n\nফাইল সফলভাবে আপলোড হয়েছে!`,
+      );
 
-        // Continue with order completion
-        await completeOrderDelivery(phone);
-      } catch (uploadError) {
-        EnhancedLogger.error(`Failed to upload file to server:`, uploadError);
-        await sendTextMessage(
-          phone,
-          "❌ ফাইল সার্ভারে আপলোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
-        );
-      }
+      // Continue with order completion
+      await completeOrderDelivery(phone);
     } else {
       await sendTextMessage(
         phone,

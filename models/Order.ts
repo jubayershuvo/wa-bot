@@ -14,6 +14,22 @@ export interface IOrder extends Document {
     | "failed"
     | "refunded"
     | "cancelled";
+  deliveryData?: {
+    deliveredAt?: Date;
+    deliveryMethod?: string;
+    deliveryAddress?: string;
+    text?: string;
+    fileUrl?: string;
+    fileName?: string;
+    fileType?: string;
+    deliveryType?: string; // "text", "file", or "both"
+    deliveredBy?: string;
+  };
+  cancellationData?: {
+    cancelledAt?: Date;
+    reason?: string;
+    cancelledBy?: string;
+  };
   transactionId: Types.ObjectId;
   placedAt: Date;
   processedAt?: Date;
@@ -30,7 +46,8 @@ const OrderSchema = new Schema(
       type: String,
       required: true,
       unique: true,
-      default: () => `ORD-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`,
+      default: () =>
+        `ORD-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`,
       index: true,
     },
     serviceName: {
@@ -65,17 +82,25 @@ const OrderSchema = new Schema(
     },
     status: {
       type: String,
-      enum: [
-        "pending",
-        "processing",
-        "completed",
-        "failed",
-        "refunded",
-        "cancelled",
-      ],
+      enum: ["pending", "processing", "completed", "failed", "cancelled"],
       default: "pending",
-      index: true,
     },
+    deliveryData: {
+      deliveredAt: Date,
+      deliveryMethod: String,
+      text: String,
+      fileUrl: String,
+      fileName: String,
+      fileType: String,
+      deliveryType: String, // Add this field to store "text", "file", or "both"
+      deliveredBy: String,
+    },
+    cancellationData: {
+      cancelledAt: Date,
+      reason: String,
+      cancelledBy: String,
+    },
+
     transactionId: {
       type: Schema.Types.ObjectId,
       ref: "Transaction",
@@ -104,7 +129,7 @@ const OrderSchema = new Schema(
     timestamps: true,
     toJSON: { virtuals: true },
     toObject: { virtuals: true },
-  }
+  },
 );
 
 // Indexes for better query performance
@@ -139,9 +164,7 @@ OrderSchema.virtual("transaction", {
 });
 
 // Pre-save hook to generate orderId if not provided
-OrderSchema.pre("save", async function (
-  this: HydratedDocument<IOrder>
-) {
+OrderSchema.pre("save", async function (this: HydratedDocument<IOrder>) {
   if (!this.orderId) {
     this.orderId = `ORD-${Date.now()}-${Math.random().toString(36).substring(2, 10)}`;
   }
@@ -150,7 +173,7 @@ OrderSchema.pre("save", async function (
 // Method to update order status with timestamp
 OrderSchema.methods.updateStatus = async function (
   newStatus: IOrder["status"],
-  notes?: string
+  notes?: string,
 ) {
   this.status = newStatus;
   const now = new Date();
