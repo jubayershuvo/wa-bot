@@ -4215,153 +4215,67 @@ async function sendDeliveryFile(
   fileUrl: string,
   fileName: string,
   fileType: string,
-  caption?: string,
+  caption?: string
 ): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
-  
-  EnhancedLogger.info(`Sending delivery file to ${formattedTo}`, {
-    fileName,
-    fileType,
-    fileUrl,
-    caption: caption || "No caption",
-  });
 
-  try {
-    // First, download the file from our server to verify it exists
-    EnhancedLogger.info(`Downloading file for verification: ${fileUrl}`);
-    
-    const fileResponse = await fetch(fileUrl);
-    if (!fileResponse.ok) {
-      throw new Error(`File not found or inaccessible: ${fileResponse.status} ${fileResponse.statusText}`);
-    }
+  const PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID!;
+  const ACCESS_TOKEN = process.env.WA_ACCESS_TOKEN!;
 
-    const fileBuffer = await fileResponse.arrayBuffer();
-    const fileSize = fileBuffer.byteLength;
-    
-    EnhancedLogger.info(`File downloaded successfully`, {
-      fileName,
-      fileSize,
-      contentType: fileResponse.headers.get("content-type"),
-    });
+  const ext = fileName.toLowerCase().split(".").pop() || "";
 
-    // Determine WhatsApp media type based on file extension/content type
-    const fileExt = fileName.toLowerCase().split(".").pop() || "";
-    const contentType = fileResponse.headers.get("content-type") || fileType;
-    
-    let whatsappMediaType: "image" | "document" = "document";
-    let mediaConfig: any = {};
-    
-    // Check if it's an image
-    if (
-      contentType.startsWith("image/") ||
-      ["jpg", "jpeg", "png", "gif", "webp", "bmp"].includes(fileExt)
-    ) {
-      whatsappMediaType = "image";
-      mediaConfig = {
-        link: fileUrl,
-        caption: caption || fileName,
-      };
-    } 
-    // Check if it's a PDF
-    else if (contentType === "application/pdf" || fileExt === "pdf") {
-      whatsappMediaType = "document";
-      mediaConfig = {
-        link: fileUrl,
-        caption: caption || fileName,
-        filename: fileName,
-      };
-    }
-    // Check if it's a document
-    else if (
-      contentType.includes("document") ||
-      contentType.includes("msword") ||
-      contentType.includes("excel") ||
-      contentType.includes("powerpoint") ||
-      ["doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv"].includes(fileExt)
-    ) {
-      whatsappMediaType = "document";
-      mediaConfig = {
-        link: fileUrl,
-        caption: caption || fileName,
-        filename: fileName,
-      };
-    }
-    // Default to document
-    else {
-      whatsappMediaType = "document";
-      mediaConfig = {
-        link: fileUrl,
-        caption: caption || fileName,
-        filename: fileName,
-      };
-    }
+  let type: "image" | "document" = "document";
+  let media: any = {};
 
-    // Check file size limits
-    // WhatsApp limits: Images 5MB, Documents 100MB
-    const maxSize = whatsappMediaType === "image" ? 5 * 1024 * 1024 : 100 * 1024 * 1024;
-    
-    if (fileSize > maxSize) {
-      throw new Error(`File too large: ${fileSize} bytes. Maximum size for ${whatsappMediaType} is ${maxSize / 1024 / 1024}MB`);
-    }
-
-    // Prepare the payload for WhatsApp API
-    const payload: any = {
-      messaging_product: "whatsapp",
-      recipient_type: "individual",
-      to: formattedTo,
-      type: whatsappMediaType,
-      [whatsappMediaType]: mediaConfig,
+  // Image
+  if (
+    fileType.startsWith("image/") ||
+    ["jpg", "jpeg", "png", "webp", "gif"].includes(ext)
+  ) {
+    type = "image";
+    media = {
+      link: fileUrl,
+      caption: caption || undefined,
     };
-
-    EnhancedLogger.info(`Sending ${whatsappMediaType} via WhatsApp API`, {
-      payload: {
-        ...payload,
-        [whatsappMediaType]: {
-          ...mediaConfig,
-          link: `${mediaConfig.link?.substring(0, 50)}...`, // Truncate for logging
-        },
-      },
-    });
-
-    // Send via WhatsApp API
-    const result = await callWhatsAppApi("messages", payload);
-    
-    EnhancedLogger.info(`Delivery file sent successfully to ${formattedTo}`, {
-      messageId: result?.messages?.[0]?.id,
-      fileName,
-      whatsappMediaType,
-      fileSize,
-    });
-    
-    return result;
-    
-  } catch (error: any) {
-    EnhancedLogger.error(`Failed to send delivery file to ${formattedTo}:`, {
-      error: error?.message || error,
-      stack: error?.stack,
-      fileUrl,
-      fileName,
-      fileType,
-    });
-
-    // Fallback: Send download link if file sending fails
-    try {
-      const fallbackMessage = `📁 *ডেলিভারি ফাইল*\n\n` +
-        `ফাইল: ${fileName}\n` +
-        `আকার: ${(await getFileSize(fileUrl))}\n\n` +
-        `📎 ডাউনলোড লিঙ্ক:\n${fileUrl}\n\n` +
-        `ফাইলটি ডাউনলোড করতে উপরের লিঙ্কে ক্লিক করুন।`;
-      
-      await sendTextMessage(formattedTo, fallbackMessage);
-      
-      EnhancedLogger.info(`Sent fallback download link to ${formattedTo}`);
-      
-      return { fallback: true, message: "Sent download link instead of file" };
-    } catch (fallbackError: any) {
-      EnhancedLogger.error(`Failed to send fallback message:`, fallbackError);
-      throw new Error(`Failed to send file and fallback: ${error.message}`);
-    }
   }
+  // Document (pdf, doc, xls, etc)
+  else {
+    type = "document";
+    media = {
+      link: fileUrl,
+      filename: fileName,
+      caption: caption || undefined,
+    };
+  }
+
+  const payload = {
+    messaging_product: "whatsapp",
+    to: formattedTo,
+    type,
+    [type]: media,
+  };
+
+  const res = await fetch(
+    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+
+  const data = await res.json();
+
+  if (!res.ok) {
+    throw new Error(
+      `WhatsApp API error: ${data?.error?.message || "Unknown error"}`
+    );
+  }
+
+  return data;
 }
 
 // Helper function to get file size in readable format
