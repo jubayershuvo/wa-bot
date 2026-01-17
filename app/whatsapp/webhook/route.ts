@@ -2164,18 +2164,18 @@ async function confirmServiceOrder(phone: string): Promise<void> {
 
     await sendTextMessage(
       formattedPhone,
-      `✅ *অর্ডার সফল*\n\n📦 সার্ভিস: ${service.name}\n🆔 অর্ডার আইডি: ${order.orderId}\n💰 খরচ: ৳${serviceOrderData.price}\n🆕 ব্যালেন্স: ৳${user.balance}\n📅 সময়: ${new Date().toLocaleString()}\n\n🎉 আপনার অর্ডারটি সফলভাবে প্লেস করা হয়েছে!\n\nআমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+      `✅ *অর্ডার সফল*\n\n📦 সার্ভিস: ${service.name}\n🆔 অর্ডার আইডি: ${order._id}\n💰 খরচ: ৳${serviceOrderData.price}\n🆕 ব্যালেন্স: ৳${user.balance}\n📅 সময়: ${new Date().toLocaleString()}\n\n🎉 আপনার অর্ডারটি সফলভাবে প্লেস করা হয়েছে!\n\nআমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
     );
 
     await notifyAdmin(
-      `🛒 নতুন অর্ডার\n\nব্যবহারকারী: ${formattedPhone}\nনাম: ${user.name}\nঅর্ডার আইডি: ${order.orderId}\nসার্ভিস: ${service.name}\nমূল্য: ৳${serviceOrderData.price}\nইউজার ব্যালেন্স: ৳${user.balance}`,
+      `🛒 নতুন অর্ডার\n\nব্যবহারকারী: ${formattedPhone}\nনাম: ${user.name}\nঅর্ডার আইডি: ${order._id}\nসার্ভিস: ${service.name}\nমূল্য: ৳${serviceOrderData.price}\nইউজার ব্যালেন্স: ৳${user.balance}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
 
     EnhancedLogger.logFlowCompletion(formattedPhone, "service_order", {
-      orderId: order.orderId,
+      orderId: order._id,
       serviceId: serviceOrderData.serviceId,
       serviceName: serviceOrderData.serviceName,
       price: serviceOrderData.price,
@@ -2238,7 +2238,7 @@ async function showOrderHistory(phone: string): Promise<void> {
         statusMap[order.status as keyof typeof statusMap] || "📝 অজানা";
 
       message += `${index + 1}. ${serviceName}\n`;
-      message += `   🆔: ${order.orderId}\n`;
+      message += `   🆔: ${order._id}\n`;
       message += `   📊: ${statusText}\n`;
       message += `   💰: ৳${order.totalPrice}\n`;
       message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
@@ -3668,7 +3668,7 @@ async function handleAdminViewOrders(phone: string): Promise<void> {
       const user = order.userId as any;
 
       message += `${index + 1}. ${statusEmoji} ${order.serviceName}\n`;
-      message += `   🆔: ${order.orderId}\n`;
+      message += `   🆔: ${order._id}\n`;
       message += `   👤: ${user?.name || "N/A"} (${user?.whatsapp || "N/A"})\n`;
       message += `   💰: ৳${order.totalPrice}\n`;
       message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
@@ -3728,7 +3728,7 @@ async function handleAdminProcessOrderStart(phone: string): Promise<void> {
 
     const orderRows = orders.map((order) => ({
       id: `process_${order._id}`,
-      title: `🆔 ${order.orderId} - ৳${order.totalPrice}`,
+      title: `🆔 ${order._id} - ৳${order.totalPrice}`,
       description: `${order.serviceName} - ${(order.userId as any)?.name || "N/A"} (${order.status})`,
     }));
 
@@ -3808,7 +3808,7 @@ async function handleAdminProcessOrderStatus(
 
     await sendListMenu(
       phone,
-      `🔄 ${order.orderId} - স্ট্যাটাস পরিবর্তন`,
+      `🔄 ${order._id} - স্ট্যাটাস পরিবর্তন`,
       `বর্তমান স্ট্যাটাস: ${order.status}\nসার্ভিস: ${order.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"}\nমূল্য: ৳${order.totalPrice}\n\nনতুন স্ট্যাটাস সিলেক্ট করুন:`,
       statusRows,
       "স্ট্যাটাস অপশন",
@@ -3861,13 +3861,13 @@ async function handleAdminProcessOrderUpdate(
         if (deliveryType === "text" || deliveryType === "both") {
           await sendTextWithCancelButton(
             phone,
-            `📝 ডেলিভারি টেক্সট\n\nঅর্ডার: ${order.orderId}\n\nইউজারকে পাঠাতে চান এমন টেক্সট লিখুন:\n\n📌 টিপস:\n• ধন্যবাদ জানান\n• পরবর্তী নির্দেশনা দিন\n• সার্ভিসের ডিটেইলস দিন\n\nস্কিপ করতে 'skip' লিখুন`,
+            `📝 ডেলিভারি টেক্সট\n\nঅর্ডার: ${order._id}\n\nইউজারকে পাঠাতে চান এমন টেক্সট লিখুন:\n\n📌 টিপস:\n• ধন্যবাদ জানান\n• পরবর্তী নির্দেশনা দিন\n• সার্ভিসের ডিটেইলস দিন\n\nস্কিপ করতে 'skip' লিখুন`,
           );
         } else {
           // deliveryType === "file"
           await sendTextWithCancelButton(
             phone,
-            `📁 ফাইল আপলোড\n\nঅর্ডার: ${order.orderId}\n\nডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
+            `📁 ফাইল আপলোড\n\nঅর্ডার: ${order._id}\n\nডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
           );
         }
       } else if (step === 2) {
@@ -3895,7 +3895,7 @@ async function handleAdminProcessOrderUpdate(
           if (deliveryType === "both") {
             await sendTextWithCancelButton(
               phone,
-              `📁 ফাইল আপলোড\n\nঅর্ডার: ${order.orderId}\n\nডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
+              `📁 ফাইল আপলোড\n\nঅর্ডার: ${order._id}\n\nডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
             );
           } else {
             await completeOrderDelivery(phone);
@@ -3920,7 +3920,7 @@ async function handleAdminProcessOrderUpdate(
 
         await sendTextWithCancelButton(
           phone,
-          `📝 ${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ\n\nঅর্ডার: ${order.orderId}\nইউজার: ${(order.userId as any)?.name || "N/A"}\n\n${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ লিখুন:\n\n📌 নোট:\n• কারণটি পরিষ্কার ও বোধগম্য হোক\n• ইউজারকে এই কারণটি দেখানো হবে\n• মিনিমাম ১০ ক্যারেক্টার`,
+          `📝 ${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ\n\nঅর্ডার: ${order._id}\nইউজার: ${(order.userId as any)?.name || "N/A"}\n\n${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ লিখুন:\n\n📌 নোট:\n• কারণটি পরিষ্কার ও বোধগম্য হোক\n• ইউজারকে এই কারণটি দেখানো হবে\n• মিনিমাম ১০ ক্যারেক্টার`,
         );
       } else if (step === 2) {
         if (!input || !input.trim() || input.trim().length < 5) {
@@ -4005,7 +4005,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     if (user && user.whatsapp) {
       if (deliveryType === "completed") {
         let notification = `✅ *আপনার অর্ডার সম্পন্ন হয়েছে!*\n\n`;
-        notification += `🆔 অর্ডার আইডি: ${updatedOrder.orderId}\n`;
+        notification += `🆔 অর্ডার আইডি: ${updatedOrder._id}\n`;
         notification += `📦 সার্ভিস: ${updatedOrder.serviceName}\n`;
         notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
         notification += `📅 সম্পূর্ণ হয়েছে: ${new Date().toLocaleString()}\n\n`;
@@ -4040,7 +4040,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
       } else {
         const statusText = deliveryType === "failed" ? "ব্যর্থ" : "বাতিল";
         let notification = `❌ *আপনার অর্ডার ${statusText} হয়েছে*\n\n`;
-        notification += `🆔 অর্ডার আইডি: ${updatedOrder.orderId}\n`;
+        notification += `🆔 অর্ডার আইডি: ${updatedOrder._id}\n`;
         notification += `📦 সার্ভিস: ${updatedOrder.serviceName}\n`;
         notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
         notification += `📅 ${statusText} হয়েছে: ${new Date().toLocaleString()}\n\n`;
@@ -4060,7 +4060,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
 
     // Send confirmation to admin
     let adminMessage = `✅ *অর্ডার আপডেট সম্পন্ন*\n\n`;
-    adminMessage += `🆔 অর্ডার: ${updatedOrder.orderId}\n`;
+    adminMessage += `🆔 অর্ডার: ${updatedOrder._id}\n`;
     adminMessage += `👤 ইউজার: ${(order.userId as any)?.name || "N/A"} (${(order.userId as any)?.whatsapp || "N/A"})\n`;
     adminMessage += `📦 সার্ভিস: ${updatedOrder.serviceName}\n`;
     adminMessage += `📊 নতুন স্ট্যাটাস: ${updatedOrder.status}\n`;
@@ -4077,7 +4077,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     await sendTextMessage(phone, adminMessage);
 
     await notifyAdmin(
-      `🔄 অর্ডার আপডেট সম্পন্ন\n\nঅর্ডার: ${updatedOrder.orderId}\nসার্ভিস: ${updatedOrder.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"} (${(order.userId as any)?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${updatedOrder.status}\nআপডেট করেছেন: ${formattedPhone}`,
+      `🔄 অর্ডার আপডেট সম্পন্ন\n\nঅর্ডার: ${updatedOrder._id}\nসার্ভিস: ${updatedOrder.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"} (${(order.userId as any)?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${updatedOrder.status}\nআপডেট করেছেন: ${formattedPhone}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
@@ -4700,7 +4700,7 @@ async function handleAdminUserSearch(
       message += `📦 *সাম্প্রতিক অর্ডার:*\n`;
       recentOrders.forEach((order, index) => {
         message += `${index + 1}. ${order.serviceName}\n`;
-        message += `   🆔: ${order.orderId}\n`;
+        message += `   🆔: ${order._id}\n`;
         message += `   💰: ৳${order.totalPrice}\n`;
         message += `   📊: ${order.status}\n`;
         message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
