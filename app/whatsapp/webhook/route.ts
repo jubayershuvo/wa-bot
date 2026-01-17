@@ -8,6 +8,8 @@ import { sessionMonitor } from "@/lib/sessionMonitor";
 import { connectDB } from "@/lib/mongodb-bot";
 import axios from "axios";
 import Spent from "@/models/Spent";
+import path from "path";
+import fs from "fs";
 
 // --- Enhanced Logging Configuration ---
 const LOG_CONFIG = {
@@ -720,58 +722,42 @@ async function uploadFile(
       bufferSize: fileBuffer.length,
     });
 
-    // Check if file upload URL is configured
-    if (!CONFIG.fileUploadUrl || CONFIG.fileUploadUrl === "/api/upload") {
-      EnhancedLogger.warn(
-        `File upload URL not properly configured, using mock URL`,
-      );
-      // Return a mock URL for testing
-      return `https://example.com/uploads/${fileName}`;
+    // Create uploads directory if it doesn't exist
+    const uploadsDir = path.join(process.cwd(), "uploads");
+
+    if (!fs.existsSync(uploadsDir)) {
+      EnhancedLogger.info(`Creating uploads directory: ${uploadsDir}`);
+      fs.mkdirSync(uploadsDir, { recursive: true });
     }
 
-    // Create FormData
-    const formData = new FormData();
-    const uint8Array = new Uint8Array(fileBuffer);
-    const blob = new Blob([uint8Array], { type: fileType });
-    formData.append("file", blob, fileName);
-    formData.append("fileName", fileName);
-    formData.append("fileType", fileType);
+    // Generate unique filename to avoid conflicts
+    const uniqueFileName = `${Date.now()}_${fileName.replace(/[^a-zA-Z0-9.-]/g, "_")}`;
+    const filePath = path.join(uploadsDir, uniqueFileName);
 
-    EnhancedLogger.info(`Uploading to: ${CONFIG.fileUploadUrl}`);
+    EnhancedLogger.info(`Saving file to: ${filePath}`);
 
-    // Upload to your file upload endpoint
-    const response = await fetch(CONFIG.fileUploadUrl, {
-      method: "POST",
-      body: formData,
+    // Save file to disk
+    fs.writeFileSync(filePath, fileBuffer);
+
+    // Verify file was saved
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Failed to save file to ${filePath}`);
+    }
+
+    const stats = fs.statSync(filePath);
+    EnhancedLogger.info(`File saved successfully`, {
+      filePath,
+      fileSize: stats.size,
+      savedSize: fileBuffer.length,
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      EnhancedLogger.error(`File upload failed: ${response.statusText}`, {
-        status: response.status,
-        error: errorText,
-      });
-      throw new Error(
-        `File upload failed: ${response.statusText} - ${errorText}`,
-      );
-    }
-
-    const result = await response.json();
-
-    if (!result.fileUrl) {
-      EnhancedLogger.error(`No fileUrl in response`, { result });
-      throw new Error("No file URL returned from upload server");
-    }
-
-    EnhancedLogger.info(`File upload successful`, {
-      fileUrl: result.fileUrl,
-    });
-
-    return result.fileUrl;
+    return filePath;
   } catch (error: any) {
     EnhancedLogger.error(`Failed to upload file:`, {
       error: error?.message || error,
       stack: error?.stack,
+      fileName,
+      fileType,
     });
     throw error;
   }
@@ -4224,6 +4210,189 @@ async function completeFailedOrCancelledOrder(phone: string): Promise<void> {
     await cancelFlow(phone, true);
   }
 }
+async function sendDeliveryFile(
+  to: string,
+  fileUrl: string,
+  fileName: string,
+  fileType: string,
+  caption?: string,
+): Promise<any> {
+  const formattedTo = formatPhoneNumber(to);
+  
+  EnhancedLogger.info(`Sending delivery file to ${formattedTo}`, {
+    fileName,
+    fileType,
+    fileUrl,
+    caption: caption || "No caption",
+  });
+
+  try {
+    // First, download the file from our server to verify it exists
+    EnhancedLogger.info(`Downloading file for verification: ${fileUrl}`);
+    
+    const fileResponse = await fetch(fileUrl);
+    if (!fileResponse.ok) {
+      throw new Error(`File not found or inaccessible: ${fileResponse.status} ${fileResponse.statusText}`);
+    }
+
+    const fileBuffer = await fileResponse.arrayBuffer();
+    const fileSize = fileBuffer.byteLength;
+    
+    EnhancedLogger.info(`File downloaded successfully`, {
+      fileName,
+      fileSize,
+      contentType: fileResponse.headers.get("content-type"),
+    });
+
+    // Determine WhatsApp media type based on file extension/content type
+    const fileExt = fileName.toLowerCase().split(".").pop() || "";
+    const contentType = fileResponse.headers.get("content-type") || fileType;
+    
+    let whatsappMediaType: "image" | "document" = "document";
+    let mediaConfig: any = {};
+    
+    // Check if it's an image
+    if (
+      contentType.startsWith("image/") ||
+      ["jpg", "jpeg", "png", "gif", "webp", "bmp"].includes(fileExt)
+    ) {
+      whatsappMediaType = "image";
+      mediaConfig = {
+        link: fileUrl,
+        caption: caption || fileName,
+      };
+    } 
+    // Check if it's a PDF
+    else if (contentType === "application/pdf" || fileExt === "pdf") {
+      whatsappMediaType = "document";
+      mediaConfig = {
+        link: fileUrl,
+        caption: caption || fileName,
+        filename: fileName,
+      };
+    }
+    // Check if it's a document
+    else if (
+      contentType.includes("document") ||
+      contentType.includes("msword") ||
+      contentType.includes("excel") ||
+      contentType.includes("powerpoint") ||
+      ["doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv"].includes(fileExt)
+    ) {
+      whatsappMediaType = "document";
+      mediaConfig = {
+        link: fileUrl,
+        caption: caption || fileName,
+        filename: fileName,
+      };
+    }
+    // Default to document
+    else {
+      whatsappMediaType = "document";
+      mediaConfig = {
+        link: fileUrl,
+        caption: caption || fileName,
+        filename: fileName,
+      };
+    }
+
+    // Check file size limits
+    // WhatsApp limits: Images 5MB, Documents 100MB
+    const maxSize = whatsappMediaType === "image" ? 5 * 1024 * 1024 : 100 * 1024 * 1024;
+    
+    if (fileSize > maxSize) {
+      throw new Error(`File too large: ${fileSize} bytes. Maximum size for ${whatsappMediaType} is ${maxSize / 1024 / 1024}MB`);
+    }
+
+    // Prepare the payload for WhatsApp API
+    const payload: any = {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: formattedTo,
+      type: whatsappMediaType,
+      [whatsappMediaType]: mediaConfig,
+    };
+
+    EnhancedLogger.info(`Sending ${whatsappMediaType} via WhatsApp API`, {
+      payload: {
+        ...payload,
+        [whatsappMediaType]: {
+          ...mediaConfig,
+          link: `${mediaConfig.link?.substring(0, 50)}...`, // Truncate for logging
+        },
+      },
+    });
+
+    // Send via WhatsApp API
+    const result = await callWhatsAppApi("messages", payload);
+    
+    EnhancedLogger.info(`Delivery file sent successfully to ${formattedTo}`, {
+      messageId: result?.messages?.[0]?.id,
+      fileName,
+      whatsappMediaType,
+      fileSize,
+    });
+    
+    return result;
+    
+  } catch (error: any) {
+    EnhancedLogger.error(`Failed to send delivery file to ${formattedTo}:`, {
+      error: error?.message || error,
+      stack: error?.stack,
+      fileUrl,
+      fileName,
+      fileType,
+    });
+
+    // Fallback: Send download link if file sending fails
+    try {
+      const fallbackMessage = `📁 *ডেলিভারি ফাইল*\n\n` +
+        `ফাইল: ${fileName}\n` +
+        `আকার: ${(await getFileSize(fileUrl))}\n\n` +
+        `📎 ডাউনলোড লিঙ্ক:\n${fileUrl}\n\n` +
+        `ফাইলটি ডাউনলোড করতে উপরের লিঙ্কে ক্লিক করুন।`;
+      
+      await sendTextMessage(formattedTo, fallbackMessage);
+      
+      EnhancedLogger.info(`Sent fallback download link to ${formattedTo}`);
+      
+      return { fallback: true, message: "Sent download link instead of file" };
+    } catch (fallbackError: any) {
+      EnhancedLogger.error(`Failed to send fallback message:`, fallbackError);
+      throw new Error(`Failed to send file and fallback: ${error.message}`);
+    }
+  }
+}
+
+// Helper function to get file size in readable format
+async function getFileSize(fileUrl: string): Promise<string> {
+  try {
+    const response = await fetch(fileUrl, { method: "HEAD" });
+    const contentLength = response.headers.get("content-length");
+    
+    if (contentLength) {
+      const bytes = parseInt(contentLength, 10);
+      if (bytes < 1024) return `${bytes} bytes`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+      return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    }
+    return "Unknown size";
+  } catch {
+    return "Unknown size";
+  }
+}
+
+// Helper function to check if URL is accessible
+async function isUrlAccessible(fileUrl: string): Promise<boolean> {
+  try {
+    const response = await fetch(fileUrl, { method: "HEAD" });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Updated completeOrderDelivery function to use sendDeliveryFile
 async function completeOrderDelivery(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   const state = await stateManager.getUserState(formattedPhone);
@@ -4248,10 +4417,9 @@ async function completeOrderDelivery(phone: string): Promise<void> {
       return;
     }
 
-    // FIXED: Always set status to "completed" for delivery type "completed"
-    // deliveryType can be "text", "file", or "both" - but status should be "completed"
-    const newStatus = "completed"; // Always set to completed for successful deliveries
-
+    // Always set status to "completed" for successful deliveries
+    const newStatus = "completed";
+    
     EnhancedLogger.info(`Updating order status to: ${newStatus}`, {
       orderId,
       deliveryType,
@@ -4269,16 +4437,16 @@ async function completeOrderDelivery(phone: string): Promise<void> {
       fileUrl: deliveryData?.fileUrl || "",
       fileName: deliveryData?.fileName || "",
       fileType: deliveryData?.fileType || "",
-      deliveryType: deliveryType || "file", // Store the delivery type separately
+      deliveryType: deliveryType || "file",
       deliveredBy: formattedPhone,
     };
 
     updatedOrder.updatedAt = new Date();
-
+    
     EnhancedLogger.info(`Saving order with delivery data`, {
       deliveryData: updatedOrder.deliveryData,
     });
-
+    
     await updatedOrder.save();
 
     EnhancedLogger.info(`Order saved successfully`, {
@@ -4289,6 +4457,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     // Notify user
     const user = order.userId as any;
     if (user && user.whatsapp) {
+      // Step 1: Send notification message
       let notification = `✅ *আপনার অর্ডার সম্পন্ন হয়েছে!*\n\n`;
       notification += `🆔 অর্ডার আইডি: ${orderId.slice(-8)}\n`;
       notification += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
@@ -4299,15 +4468,60 @@ async function completeOrderDelivery(phone: string): Promise<void> {
         notification += `📝 *ডেলিভারি নোট:*\n${deliveryData.text}\n\n`;
       }
 
-      if (deliveryData?.fileUrl) {
-        notification += `📁 *ডেলিভারি ফাইল:*\n${deliveryData.fileName}\n\n`;
+      await sendTextMessage(user.whatsapp, notification);
+
+      // Step 2: Send file if available
+      if (deliveryData?.fileUrl && deliveryData?.fileName && deliveryData?.fileType) {
+        // Check if URL is accessible before trying to send
+        const publicUrl = deliveryData.fileUrl;
+        const isAccessible = await isUrlAccessible(publicUrl);
+        
+        if (isAccessible) {
+          try {
+            // Create caption for the file
+            const fileCaption = `📦 ${updatedOrder.serviceName || "Service"} - Delivery File\n🆔 Order: ${orderId.slice(-8)}`;
+            
+            // Send the file using WhatsApp's media API
+            await sendDeliveryFile(
+              user.whatsapp,
+              publicUrl,
+              deliveryData.fileName,
+              deliveryData.fileType,
+              fileCaption
+            );
+            
+            EnhancedLogger.info(`File sent successfully to user ${user.whatsapp}`);
+          } catch (fileError: any) {
+            EnhancedLogger.error(`Failed to send file via WhatsApp API:`, {
+              error: fileError?.message || fileError,
+              fileUrl: deliveryData.fileUrl,
+            });
+            
+            // Fallback: Send download link
+            const downloadMessage = `📁 *ডেলিভারি ফাইল:*\n\n` +
+              `ফাইল: ${deliveryData.fileName}\n` +
+              `📎 ডাউনলোড লিঙ্ক: ${publicUrl}\n\n` +
+              `ফাইলটি ডাউনলোড করতে উপরের লিঙ্কে ক্লিক করুন।`;
+            
+            await sendTextMessage(user.whatsapp, downloadMessage);
+          }
+        } else {
+          // URL not accessible, send direct link
+          const inaccessibleMessage = `📁 *ডেলিভারি ফাইল:*\n\n` +
+            `ফাইল: ${deliveryData.fileName}\n` +
+            `📎 ডাউনলোড লিঙ্ক: ${publicUrl}\n\n` +
+            `ফাইলটি ডাউনলোড করতে উপরের লিঙ্কে ক্লিক করুন।`;
+          
+          await sendTextMessage(user.whatsapp, inaccessibleMessage);
+        }
       }
 
-      notification += `🎉 আপনার অর্ডার সফলভাবে সম্পন্ন হয়েছে!\n`;
-      notification += `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}\n\n`;
-      notification += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-      await sendTextMessage(user.whatsapp, notification);
+      // Step 3: Send final message
+      const finalMessage = `🎉 আপনার অর্ডার সফলভাবে সম্পন্ন হয়েছে!\n` +
+        `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}\n\n` +
+        `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+      
+      await sendTextMessage(user.whatsapp, finalMessage);
     }
 
     // Send confirmation to admin
@@ -4321,9 +4535,9 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     if (deliveryType === "text" || deliveryType === "both") {
       adminMessage += `📝 টেক্সট পাঠানো: ${deliveryData?.text ? "✅ হ্যাঁ" : "❌ না"}\n`;
     }
-
+    
     if (deliveryType === "file" || deliveryType === "both") {
-      adminMessage += `📁 ফাইল আপলোড: ${deliveryData?.fileUrl ? "✅ হ্যাঁ" : "❌ না"}\n`;
+      adminMessage += `📁 ফাইল পাঠানো: ${deliveryData?.fileName ? "✅ হ্যাঁ" : "❌ না"}\n`;
     }
 
     adminMessage += `\n✅ ইউজারকে নোটিফিকেশন পাঠানো হয়েছে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
