@@ -3729,7 +3729,7 @@ async function handleAdminProcessOrderStart(phone: string): Promise<void> {
     const orderRows = orders.map((order) => ({
       id: `process_${order._id}`,
       title: `🆔 ${order._id.toString().slice(-8)} - ৳${order.totalPrice}`,
-      description: `${order.serviceName} - ${(order.userId as any)?.name || "N/A"} (${order.status})`,
+      description: `${order.serviceName || "Unknown Service"} - ${(order.userId as any)?.name || "N/A"} (${order.status})`,
     }));
 
     await stateManager.setUserState(formattedPhone, {
@@ -3787,7 +3787,17 @@ async function handleAdminProcessOrderStatus(
       data: {
         adminProcessOrder: {
           orderId: actualOrderId,
-          order: order.toObject(),
+          order: {
+            _id: order._id,
+            serviceName: order.serviceName,
+            totalPrice: order.totalPrice,
+            status: order.status,
+            userId: {
+              _id: (order.userId as any)?._id,
+              name: (order.userId as any)?.name || "User",
+              whatsapp: (order.userId as any)?.whatsapp,
+            },
+          },
           step: 1,
         },
         lastActivity: Date.now(),
@@ -3816,7 +3826,7 @@ async function handleAdminProcessOrderStatus(
     await sendListMenu(
       phone,
       `🔄 অর্ডার স্ট্যাটাস পরিবর্তন`,
-      `অর্ডার আইডি: ${order._id.toString().slice(-8)}\nসার্ভিস: ${order.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"}\nবর্তমান স্ট্যাটাস: ${order.status}\nমূল্য: ৳${order.totalPrice}\n\nনতুন স্ট্যাটাস সিলেক্ট করুন:`,
+      `অর্ডার আইডি: ${actualOrderId.slice(-8)}\nসার্ভিস: ${order.serviceName || "Unknown Service"}\nইউজার: ${(order.userId as any)?.name || "User"}\nবর্তমান স্ট্যাটাস: ${order.status}\nমূল্য: ৳${order.totalPrice}\n\nনতুন স্ট্যাটাস সিলেক্ট করুন:`,
       statusRows,
       "স্ট্যাটাস অপশন",
       "স্ট্যাটাস সিলেক্ট করুন",
@@ -3835,6 +3845,7 @@ async function handleAdminProcessOrderUpdate(
 ): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   const state = await stateManager.getUserState(formattedPhone);
+  const currentState = state?.currentState;
   const orderId = state?.data?.adminProcessOrder?.orderId;
   const order = state?.data?.adminProcessOrder?.order;
   const step = state?.data?.adminProcessOrder?.step || 1;
@@ -3845,41 +3856,100 @@ async function handleAdminProcessOrderUpdate(
     return;
   }
 
-  const newStatus = statusId.replace("status_", "");
-  EnhancedLogger.info(
-    `Admin updating order ${orderId} to status: ${newStatus}`,
-    { step, statusId, input: input?.substring(0, 50) },
-  );
+  EnhancedLogger.info(`Admin processing order update: ${statusId}`, {
+    step,
+    currentState,
+    orderId,
+    input: input?.substring(0, 50),
+  });
 
   try {
-    if (newStatus === "completed") {
-      if (step === 1) {
-        // Ask for delivery type selection
-        await stateManager.setUserState(formattedPhone, {
-          currentState: "admin_process_order_delivery_type",
-          flowType: "admin_process_order",
-          data: {
+    // Handle status selection (completed, failed, cancelled)
+    if (statusId.startsWith("status_")) {
+      const newStatus = statusId.replace("status_", "");
+
+      if (newStatus === "completed") {
+        if (step === 1) {
+          // Ask for delivery type selection
+          await stateManager.setUserState(formattedPhone, {
+            currentState: "admin_process_order_delivery_type",
+            flowType: "admin_process_order",
+            data: {
+              adminProcessOrder: {
+                ...state.data?.adminProcessOrder,
+                step: 2,
+              },
+              lastActivity: Date.now(),
+              sessionId: Date.now().toString(36),
+            },
+          });
+
+          await sendQuickReplyMenu(
+            phone,
+            `📦 ডেলিভারি টাইপ\n\nঅর্ডার: ${orderId.slice(-8)}\nইউজার: ${order.userId?.name || "User"}\nসার্ভিস: ${order.serviceName || "Unknown Service"}\n\nকিভাবে ডেলিভারি করতে চান?`,
+            [
+              { id: "delivery_text", title: "📝 শুধু টেক্সট" },
+              { id: "delivery_file", title: "📁 শুধু ফাইল" },
+              { id: "delivery_both", title: "📝📁 টেক্সট ও ফাইল" },
+            ],
+          );
+        }
+      } else if (newStatus === "failed" || newStatus === "cancelled") {
+        if (step === 1) {
+          await stateManager.setUserState(formattedPhone, {
+            currentState: "admin_process_order_reason_input",
+            flowType: "admin_process_order",
+            data: {
+              adminProcessOrder: {
+                ...state.data?.adminProcessOrder,
+                step: 2,
+                deliveryType: newStatus,
+              },
+              lastActivity: Date.now(),
+              sessionId: Date.now().toString(36),
+            },
+          });
+
+          await sendTextWithCancelButton(
+            phone,
+            `📝 ${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ\n\nঅর্ডার: ${orderId.slice(-8)}\nইউজার: ${order.userId?.name || "User"}\n\n${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ লিখুন:\n\n📌 নোট:\n• কারণটি পরিষ্কার ও বোধগম্য হোক\n• ইউজারকে এই কারণটি দেখানো হবে\n• মিনিমাম ৫ ক্যারেক্টার`,
+          );
+        } else if (step === 2) {
+          if (!input || !input.trim() || input.trim().length < 5) {
+            await sendTextMessage(
+              phone,
+              `❌ দয়া করে কমপক্ষে 5 ক্যারেক্টারের কারণ লিখুন!`,
+            );
+            return;
+          }
+
+          await stateManager.updateStateData(formattedPhone, {
             adminProcessOrder: {
               ...state.data?.adminProcessOrder,
-              step: 2,
+              deliveryData: {
+                reason: input.trim(),
+              },
+              step: 3,
             },
-            lastActivity: Date.now(),
-            sessionId: Date.now().toString(36),
+          });
+
+          await completeOrderDelivery(phone);
+        }
+      }
+    }
+    // Handle delivery type selection
+    else if (statusId.startsWith("delivery_")) {
+      const deliveryType = statusId.replace("delivery_", "");
+
+      if (step === 2) {
+        // Handle delivery type selection from quick reply menu
+        await stateManager.updateStateData(formattedPhone, {
+          adminProcessOrder: {
+            ...state.data?.adminProcessOrder,
+            step: 3,
+            deliveryType: deliveryType,
           },
         });
-
-        await sendQuickReplyMenu(
-          phone,
-          `📦 ডেলিভারি টাইপ\n\nঅর্ডার: ${orderId.slice(-8)}\nইউজার: ${(order.userId as any)?.name || "N/A"}\nসার্ভিস: ${order.serviceName}\n\nকিভাবে ডেলিভারি করতে চান?`,
-          [
-            { id: "delivery_text", title: "📝 শুধু টেক্সট" },
-            { id: "delivery_file", title: "📁 শুধু ফাইল" },
-            { id: "delivery_both", title: "📝📁 টেক্সট ও ফাইল" },
-          ],
-        );
-      } else if (step === 2) {
-        // Handle delivery type selection
-        const deliveryType = statusId.replace("delivery_", "");
 
         if (deliveryType === "text" || deliveryType === "both") {
           await stateManager.setUserState(formattedPhone, {
@@ -3898,7 +3968,7 @@ async function handleAdminProcessOrderUpdate(
 
           await sendTextWithCancelButton(
             phone,
-            `📝 ডেলিভারি টেক্সট\n\nঅর্ডার: ${orderId.slice(-8)}\nইউজার: ${(order.userId as any)?.name || "N/A"}\n\nইউজারকে পাঠাতে চান এমন টেক্সট লিখুন:\n\n📌 টিপস:\n• ধন্যবাদ জানান\n• পরবর্তী নির্দেশনা দিন\n• সার্ভিসের ডিটেইলস দিন\n\nস্কিপ করতে 'skip' লিখুন`,
+            `📝 ডেলিভারি টেক্সট\n\nঅর্ডার: ${orderId.slice(-8)}\nইউজার: ${order.userId?.name || "User"}\n\nইউজারকে পাঠাতে চান এমন টেক্সট লিখুন:\n\n📌 টিপস:\n• ধন্যবাদ জানান\n• পরবর্তী নির্দেশনা দিন\n• সার্ভিসের ডিটেইলস দিন\n\nস্কিপ করতে 'skip' লিখুন`,
           );
         } else {
           // deliveryType === "file"
@@ -3918,105 +3988,86 @@ async function handleAdminProcessOrderUpdate(
 
           await sendTextWithCancelButton(
             phone,
-            `📁 ফাইল আপলোড\n\nঅর্ডার: ${orderId.slice(-8)}\nইউজার: ${(order.userId as any)?.name || "N/A"}\n\nডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
+            `📁 ফাইল আপলোড\n\nঅর্ডার: ${orderId.slice(-8)}\nইউজার: ${order.userId?.name || "User"}\n\nডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
           );
-        }
-      } else if (step === 3) {
-        // Handle text input for text or both delivery types
-        const deliveryType = state?.data?.adminProcessOrder?.deliveryType;
-
-        if (deliveryType === "text" || deliveryType === "both") {
-          if (!input && statusId !== "skip") {
-            await sendTextMessage(
-              phone,
-              "❌ দয়া করে টেক্সট লিখুন বা 'skip' লিখুন!",
-            );
-            return;
-          }
-
-          const text = input && input.toLowerCase() === "skip" ? "" : input?.trim() || "";
-          
-          await stateManager.updateStateData(formattedPhone, {
-            adminProcessOrder: {
-              ...state.data?.adminProcessOrder,
-              deliveryData: {
-                ...state.data?.adminProcessOrder?.deliveryData,
-                text: text,
-              },
-              step: deliveryType === "both" ? 4 : 5,
-            },
-          });
-
-          if (deliveryType === "both") {
-            await stateManager.setUserState(formattedPhone, {
-              currentState: "admin_process_order_file_upload",
-              flowType: "admin_process_order",
-              data: {
-                adminProcessOrder: {
-                  ...state.data?.adminProcessOrder,
-                  step: 4,
-                  deliveryType: deliveryType,
-                  deliveryData: {
-                    ...state.data?.adminProcessOrder?.deliveryData,
-                    text: text,
-                  },
-                },
-                lastActivity: Date.now(),
-                sessionId: Date.now().toString(36),
-              },
-            });
-
-            await sendTextWithCancelButton(
-              phone,
-              `✅ টেক্সট সংরক্ষণ করা হয়েছে।\n\nএখন ডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
-            );
-          } else {
-            // deliveryType === "text" only
-            await completeOrderDelivery(phone);
-          }
         }
       }
-    } else if (newStatus === "failed" || newStatus === "cancelled") {
-      if (step === 1) {
-        await stateManager.setUserState(formattedPhone, {
-          currentState: "admin_process_order_reason_input",
-          flowType: "admin_process_order",
-          data: {
-            adminProcessOrder: {
-              ...state.data?.adminProcessOrder,
-              step: 2,
-              deliveryType: newStatus,
-            },
-            lastActivity: Date.now(),
-            sessionId: Date.now().toString(36),
-          },
-        });
+    }
+    // Handle text input for text or both delivery types
+    else if (
+      currentState === "admin_process_order_text_input" &&
+      input !== undefined
+    ) {
+      const deliveryType = state?.data?.adminProcessOrder?.deliveryType;
 
-        await sendTextWithCancelButton(
-          phone,
-          `📝 ${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ\n\nঅর্ডার: ${orderId.slice(-8)}\nইউজার: ${(order.userId as any)?.name || "N/A"}\n\n${newStatus === "failed" ? "ব্যর্থতার" : "বাতিলের"} কারণ লিখুন:\n\n📌 নোট:\n• কারণটি পরিষ্কার ও বোধগম্য হোক\n• ইউজারকে এই কারণটি দেখানো হবে\n• মিনিমাম ৫ ক্যারেক্টার`,
-        );
-      } else if (step === 2) {
-        if (!input || !input.trim() || input.trim().length < 5) {
-          await sendTextMessage(
-            phone,
-            `❌ দয়া করে কমপক্ষে 5 ক্যারেক্টারের কারণ লিখুন!`,
-          );
-          return;
-        }
+      if (deliveryType === "text" || deliveryType === "both") {
+        const text =
+          input && input.toLowerCase() === "skip" ? "" : input.trim();
 
         await stateManager.updateStateData(formattedPhone, {
           adminProcessOrder: {
             ...state.data?.adminProcessOrder,
             deliveryData: {
-              reason: input.trim(),
+              ...state.data?.adminProcessOrder?.deliveryData,
+              text: text,
             },
-            step: 3,
+            step: deliveryType === "both" ? 4 : 5,
           },
         });
 
-        await completeOrderDelivery(phone);
+        if (deliveryType === "both") {
+          await stateManager.setUserState(formattedPhone, {
+            currentState: "admin_process_order_file_upload",
+            flowType: "admin_process_order",
+            data: {
+              adminProcessOrder: {
+                ...state.data?.adminProcessOrder,
+                step: 4,
+                deliveryType: deliveryType,
+                deliveryData: {
+                  ...state.data?.adminProcessOrder?.deliveryData,
+                  text: text,
+                },
+              },
+              lastActivity: Date.now(),
+              sessionId: Date.now().toString(36),
+            },
+          });
+
+          await sendTextWithCancelButton(
+            phone,
+            `✅ টেক্সট সংরক্ষণ করা হয়েছে।\n\nএখন ডেলিভারি ফাইল আপলোড করুন:\n\n📌 সমর্থিত ফাইল:\n• ইমেজ (JPG, PNG)\n• PDF\n• ডকুমেন্ট (DOC, DOCX)\n\nফাইল আপলোড করুন...`,
+          );
+        } else {
+          // deliveryType === "text" only
+          await completeOrderDelivery(phone);
+        }
       }
+    }
+    // Handle reason input for failed/cancelled orders
+    else if (
+      currentState === "admin_process_order_reason_input" &&
+      input !== undefined
+    ) {
+      if (!input || !input.trim() || input.trim().length < 5) {
+        await sendTextMessage(
+          phone,
+          `❌ দয়া করে কমপক্ষে 5 ক্যারেক্টারের কারণ লিখুন!`,
+        );
+        return;
+      }
+
+      await stateManager.updateStateData(formattedPhone, {
+        adminProcessOrder: {
+          ...state.data?.adminProcessOrder,
+          deliveryData: {
+            reason: input.trim(),
+          },
+          step: 3,
+        },
+      });
+
+      await completeOrderDelivery(phone);
     }
   } catch (err) {
     EnhancedLogger.error(`Failed to update order status:`, err);
@@ -4050,8 +4101,8 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     }
 
     // Update order status and delivery data
-    updatedOrder.status =
-      deliveryType === "completed" ? "completed" : deliveryType;
+    const newStatus = deliveryType === "completed" ? "completed" : deliveryType;
+    updatedOrder.status = newStatus;
 
     if (deliveryType === "completed") {
       updatedOrder.deliveryData = {
@@ -4080,7 +4131,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
       if (deliveryType === "completed") {
         let notification = `✅ *আপনার অর্ডার সম্পন্ন হয়েছে!*\n\n`;
         notification += `🆔 অর্ডার আইডি: ${orderId.slice(-8)}\n`;
-        notification += `📦 সার্ভিস: ${updatedOrder.serviceName}\n`;
+        notification += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
         notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
         notification += `📅 সম্পূর্ণ হয়েছে: ${new Date().toLocaleString()}\n\n`;
 
@@ -4102,7 +4153,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
         const statusText = deliveryType === "failed" ? "ব্যর্থ" : "বাতিল";
         let notification = `❌ *আপনার অর্ডার ${statusText} হয়েছে*\n\n`;
         notification += `🆔 অর্ডার আইডি: ${orderId.slice(-8)}\n`;
-        notification += `📦 সার্ভিস: ${updatedOrder.serviceName}\n`;
+        notification += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
         notification += `💰 মূল্য: ৳${updatedOrder.totalPrice}\n`;
         notification += `📅 ${statusText} হয়েছে: ${new Date().toLocaleString()}\n\n`;
 
@@ -4122,8 +4173,8 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     // Send confirmation to admin
     let adminMessage = `✅ *অর্ডার আপডেট সম্পন্ন*\n\n`;
     adminMessage += `🆔 অর্ডার: ${orderId.slice(-8)}\n`;
-    adminMessage += `👤 ইউজার: ${(order.userId as any)?.name || "N/A"} (${(order.userId as any)?.whatsapp || "N/A"})\n`;
-    adminMessage += `📦 সার্ভিস: ${updatedOrder.serviceName}\n`;
+    adminMessage += `👤 ইউজার: ${order.userId?.name || "User"} (${order.userId?.whatsapp || "N/A"})\n`;
+    adminMessage += `📦 সার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\n`;
     adminMessage += `📊 নতুন স্ট্যাটাস: ${updatedOrder.status}\n`;
 
     if (deliveryType === "completed") {
@@ -4138,7 +4189,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     await sendTextMessage(phone, adminMessage);
 
     await notifyAdmin(
-      `🔄 অর্ডার আপডেট সম্পন্ন\n\nঅর্ডার: ${orderId}\nসার্ভিস: ${updatedOrder.serviceName}\nইউজার: ${(order.userId as any)?.name || "N/A"} (${(order.userId as any)?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${updatedOrder.status}\nআপডেট করেছেন: ${formattedPhone}`,
+      `🔄 অর্ডার আপডেট সম্পন্ন\n\nঅর্ডার: ${orderId}\nসার্ভিস: ${updatedOrder.serviceName || "Unknown Service"}\nইউজার: ${order.userId?.name || "User"} (${order.userId?.whatsapp || "N/A"})\nনতুন স্ট্যাটাস: ${updatedOrder.status}\nআপডেট করেছেন: ${formattedPhone}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
@@ -4147,7 +4198,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     EnhancedLogger.logFlowCompletion(formattedPhone, "admin_process_order", {
       orderId,
       orderStatus: updatedOrder.status,
-      userId: (order.userId as any)?._id,
+      userId: order.userId?._id,
       deliveryType,
       hasText: !!deliveryData?.text,
       hasFile: !!deliveryData?.fileUrl,
@@ -5285,7 +5336,6 @@ async function handleAdminBanUserConfirm(
 }
 
 // --- Main Message Handler ---
-// --- Main Message Handler ---
 async function handleUserMessage(
   phone: string,
   name: string,
@@ -5492,15 +5542,17 @@ async function handleUserMessage(
         return;
       }
 
-      if (currentState === "admin_process_order_text_input") {
-        EnhancedLogger.info(`[${requestId}] Admin process order text input`);
-        await handleAdminProcessOrderUpdate(formattedPhone, "", userText);
+      if (currentState === "admin_process_order_delivery_type") {
+        EnhancedLogger.info(
+          `[${requestId}] Admin process order delivery type (text)`,
+        );
+        await handleAdminProcessOrderUpdate(formattedPhone, userText);
         return;
       }
 
-      if (currentState === "admin_process_order_delivery_type") {
-        EnhancedLogger.info(`[${requestId}] Admin process order delivery type`);
-        await handleAdminProcessOrderUpdate(formattedPhone, userText);
+      if (currentState === "admin_process_order_text_input") {
+        EnhancedLogger.info(`[${requestId}] Admin process order text input`);
+        await handleAdminProcessOrderUpdate(formattedPhone, "", userText);
         return;
       }
 
@@ -6158,6 +6210,7 @@ async function handleUserMessage(
           EnhancedLogger.info(`[${requestId}] Admin selected delivery type`, {
             selectedId,
           });
+          // Call the update function with delivery type
           await handleAdminProcessOrderUpdate(formattedPhone, selectedId);
         } else if (selectedId.startsWith("field_")) {
           // Handle field type selection
@@ -6206,7 +6259,7 @@ async function handleUserMessage(
       const state = await stateManager.getUserState(formattedPhone);
       const currentState = state?.currentState;
       const flowType = state?.flowType;
-      
+
       EnhancedLogger.info(`[${requestId}] File/media received`, {
         messageType: message.type,
         currentState,
@@ -6216,10 +6269,9 @@ async function handleUserMessage(
       // Check if we're in file upload state for order delivery
       if (
         flowType === "admin_process_order" &&
-        (currentState === "admin_process_order_file_upload" || 
-         state?.data?.adminProcessOrder?.deliveryType === "completed" ||
-         state?.data?.adminProcessOrder?.deliveryType === "file" ||
-         state?.data?.adminProcessOrder?.deliveryType === "both")
+        (currentState === "admin_process_order_file_upload" ||
+          state?.data?.adminProcessOrder?.deliveryType === "file" ||
+          state?.data?.adminProcessOrder?.deliveryType === "both")
       ) {
         EnhancedLogger.info(
           `[${requestId}] Handling file upload for order delivery`,
