@@ -4636,12 +4636,21 @@ async function completeOrderDelivery(phone: string): Promise<void> {
         newData,
       });
       // Step 2: Send file if available
-      if (
-        newData?.deliveryData?.fileUrl
-      ) {
+      if (newData?.deliveryData?.fileUrl) {
         // Check if URL is accessible before trying to send
         const publicUrl = `${process.env.NEXT_PUBLIC_URL}/file/${orderId}`;
+        //log the publicUrl
+        EnhancedLogger.info(`Preparing to send delivery file`, {
+          orderId,
+          fileUrl: newData.deliveryData.fileUrl,
+          publicUrl,
+        });
         const isAccessible = await isUrlAccessible(publicUrl);
+        //log the accessibility status
+        EnhancedLogger.info(`File URL accessibility check`, {
+          orderId,
+          isAccessible,
+        });
 
         if (isAccessible) {
           try {
