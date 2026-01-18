@@ -4465,15 +4465,30 @@ async function sendDeliveryFile(
 ): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
 
-  const PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID!;
-  const ACCESS_TOKEN = process.env.WA_ACCESS_TOKEN!;
+  const PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;
+  const ACCESS_TOKEN = process.env.WA_ACCESS_TOKEN;
+
+  // Validate environment variables
+  if (!PHONE_NUMBER_ID || !ACCESS_TOKEN) {
+    throw new Error("Missing WhatsApp API credentials. Check WA_PHONE_NUMBER_ID and WA_ACCESS_TOKEN.");
+  }
+
+  // Validate phone number
+  if (!formattedTo) {
+    throw new Error("Invalid phone number format");
+  }
+
+  // Validate file URL
+  if (!fileUrl || !fileUrl.startsWith("http")) {
+    throw new Error("Invalid file URL. Must be a valid HTTP/HTTPS URL.");
+  }
 
   const ext = fileName.toLowerCase().split(".").pop() || "";
-
+  
   let type: "image" | "document" = "document";
   let media: any = {};
 
-  // Image
+  // Check for images
   if (
     fileType.startsWith("image/") ||
     ["jpg", "jpeg", "png", "webp", "gif"].includes(ext)
@@ -4483,9 +4498,8 @@ async function sendDeliveryFile(
       link: fileUrl,
       caption: caption || undefined,
     };
-  }
-  // Document (pdf, doc, xls, etc)
-  else {
+  } else {
+    // For documents
     type = "document";
     media = {
       link: fileUrl,
@@ -4496,32 +4510,47 @@ async function sendDeliveryFile(
 
   const payload = {
     messaging_product: "whatsapp",
+    recipient_type: "individual", // Added recipient_type
     to: formattedTo,
-    type,
+    type: type,
     [type]: media,
   };
 
-  const res = await fetch(
-    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
+  try {
+    const res = await fetch(
+      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
       },
-      body: JSON.stringify(payload),
-    },
-  );
-
-  const data = await res.json();
-
-  if (!res.ok) {
-    throw new Error(
-      `WhatsApp API error: ${data?.error?.message || "Unknown error"}`,
     );
-  }
 
-  return data;
+    const data = await res.json();
+
+    if (!res.ok) {
+      console.error("WhatsApp API Error:", {
+        status: res.status,
+        statusText: res.statusText,
+        error: data.error,
+        payload: payload
+      });
+      
+      throw new Error(
+        `WhatsApp API error (${res.status}): ${data?.error?.message || data?.error?.error_user_msg || "Unknown error"}`,
+      );
+    }
+
+    return data;
+  } catch (error) {
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error(`Network or unknown error: ${error}`);
+  }
 }
 
 // Helper function to get file size in readable format
