@@ -1,389 +1,300 @@
-import mongoose, { Schema, Document, Model, Types } from "mongoose";
+import mongoose, { Schema, Document, Model, Types } from 'mongoose';
 
-// Order Status Types
-export type OrderStatus =
-  | "pending"
-  | "processing"
-  | "completed"
-  | "failed"
-  | "cancelled";
+// File Information Interface
+export interface FileInfo {
+  fileName: string;
+  filePath: string;
+  fileType: string;
+  fileSize: string;
+  uploadedAt: Date;
+}
+
+// Service Data Field Interface
+export interface ServiceDataField {
+  field: string;
+  label: string;
+  type: 'text' | 'file';
+  data: string | FileInfo;
+  createdAt: Date;
+}
 
 // Delivery Data Interface
 export interface DeliveryData {
-  deliveredAt?: Date;
-  deliveryMethod?: string; // "whatsapp", "email", "direct"
+  deliveredAt: Date;
+  deliveryMethod: 'whatsapp' | 'email' | 'download';
+  deliveryType: 'text' | 'file' | 'both';
   text?: string;
   fileUrl?: string;
   fileName?: string;
   fileType?: string;
-  deliveryType?: string; // "text", "file", "both"
-  deliveredBy?: string; // Admin phone number
+  deliveredBy?: string;
 }
 
 // Cancellation Data Interface
 export interface CancellationData {
-  cancelledAt?: Date;
-  reason?: string;
-  cancelledBy?: string; // Admin phone number
+  cancelledAt: Date;
+  reason: string;
+  cancelledBy: string;
 }
 
 // Order Interface
 export interface IOrder extends Document {
-  orderId: string; // Public order ID
+  _id: Types.ObjectId;
+  orderId: string;
   userId: Types.ObjectId;
   serviceId: Types.ObjectId;
   serviceName: string;
   quantity: number;
   unitPrice: number;
   totalPrice: number;
-  serviceData: [
-    {
-      field: string; // Field name (e.g., "full_name")
-      label: string; // User-facing label
-      type: string; // "text" or "file"
-      data: Schema.Types.Mixed; // Can be string (for text) or object (for file)
-    },
-  ]; // Data collected from service fields
-  status: OrderStatus;
+  serviceData: ServiceDataField[];
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
+  transactionId?: Types.ObjectId;
   deliveryData?: DeliveryData;
   cancellationData?: CancellationData;
   notes?: string;
-  transactionId?: Types.ObjectId;
-
-  // Admin fields
-  assignedTo?: string; // Admin assigned to process order
-  priority: "low" | "medium" | "high";
-
-  // Timestamps
+  adminNotes?: string;
   placedAt: Date;
-  processedAt?: Date;
   completedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
 
-// Order Schema
-const DeliveryDataSchema = new Schema<DeliveryData>(
-  {
-    deliveredAt: Date,
-    deliveryMethod: String,
-    text: String,
-    fileUrl: String,
-    fileName: String,
-    fileType: String,
-    deliveryType: String,
-    deliveredBy: String,
-  },
-  { _id: false },
-);
+// File Info Schema
+const fileInfoSchema = new Schema<FileInfo>({
+  fileName: { type: String, required: true },
+  filePath: { type: String, required: true },
+  fileType: { type: String, required: true },
+  fileSize: { type: String, required: true },
+  uploadedAt: { type: Date, default: Date.now }
+});
 
-const CancellationDataSchema = new Schema<CancellationData>(
-  {
-    cancelledAt: Date,
-    reason: String,
-    cancelledBy: String,
+// Service Data Field Schema
+const serviceDataFieldSchema = new Schema<ServiceDataField>({
+  field: { type: String, required: true },
+  label: { type: String, required: true },
+  type: { 
+    type: String, 
+    required: true, 
+    enum: ['text', 'file'] 
   },
-  { _id: false },
-);
-
-const OrderSchema = new Schema<IOrder>(
-  {
-    orderId: {
-      type: String,
-      required: [true, "Order ID is required"],
-      unique: true,
-      index: true,
-      default: () =>
-        `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
-    },
-    userId: {
-      type: Schema.Types.ObjectId,
-      ref: "User",
-      required: [true, "User ID is required"],
-      index: true,
-    },
-    serviceId: {
-      type: Schema.Types.ObjectId,
-      ref: "Service",
-      required: [true, "Service ID is required"],
-      index: true,
-    },
-    serviceName: {
-      type: String,
-      required: [true, "Service name is required"],
-      trim: true,
-    },
-    quantity: {
-      type: Number,
-      required: true,
-      default: 1,
-      min: [1, "Quantity must be at least 1"],
-    },
-    unitPrice: {
-      type: Number,
-      required: [true, "Unit price is required"],
-      min: [1, "Unit price must be at least 1"],
-    },
-    totalPrice: {
-      type: Number,
-      required: [true, "Total price is required"],
-      min: [1, "Total price must be at least 1"],
-    },
-    serviceData: [
-      {
-        field: String, // Field name (e.g., "full_name")
-        label: String, // User-facing label
-        type: String, // "text" or "file"
-        data: Schema.Types.Mixed, // Can be string (for text) or object (for file)
+  data: { 
+    type: Schema.Types.Mixed, 
+    required: true,
+    validate: {
+      validator: function(value: any): boolean {
+        if ((this as any).type === 'file') {
+          return value && typeof value === 'object' && value.fileName && value.filePath;
+        }
+        return typeof value === 'string';
       },
-    ],
-    status: {
-      type: String,
-      required: true,
-      enum: ["pending", "processing", "completed", "failed", "cancelled"],
-      default: "pending",
-      index: true,
-    },
-    deliveryData: DeliveryDataSchema,
-    cancellationData: CancellationDataSchema,
-    notes: {
-      type: String,
-      trim: true,
-    },
-    transactionId: {
-      type: Schema.Types.ObjectId,
-      ref: "Transaction",
-      index: true,
-    },
-
-    // Admin fields
-    assignedTo: {
-      type: String,
-      trim: true,
-    },
-    priority: {
-      type: String,
-      enum: ["low", "medium", "high"],
-      default: "medium",
-    },
-
-    // Timestamps
-    placedAt: {
-      type: Date,
-      default: Date.now,
-    },
-    processedAt: Date,
-    completedAt: Date,
-  },
-  {
-    timestamps: true, // Adds createdAt and updatedAt automatically
-    toJSON: { virtuals: true },
-    toObject: { virtuals: true },
-  },
-);
-
-// Indexes for better query performance
-OrderSchema.index({ userId: 1, createdAt: -1 });
-OrderSchema.index({ serviceId: 1, createdAt: -1 });
-OrderSchema.index({ status: 1, createdAt: -1 });
-OrderSchema.index({ "deliveryData.deliveredAt": -1 });
-OrderSchema.index({ totalPrice: -1 });
-OrderSchema.index({ priority: 1, createdAt: -1 });
-
-// Virtual fields
-OrderSchema.virtual("user", {
-  ref: "User",
-  localField: "userId",
-  foreignField: "_id",
-  justOne: true,
-});
-
-OrderSchema.virtual("service", {
-  ref: "Service",
-  localField: "serviceId",
-  foreignField: "_id",
-  justOne: true,
-});
-
-OrderSchema.virtual("transaction", {
-  ref: "Transaction",
-  localField: "transactionId",
-  foreignField: "_id",
-  justOne: true,
-});
-
-// Calculate duration in hours
-OrderSchema.virtual("durationHours").get(function () {
-  if (this.completedAt && this.placedAt) {
-    const diffMs = this.completedAt.getTime() - this.placedAt.getTime();
-    return Math.round(diffMs / (1000 * 60 * 60));
-  }
-  return null;
-});
-
-// Check if order is active
-OrderSchema.virtual("isActive").get(function () {
-  return ["pending", "processing"].includes(this.status);
-});
-
-// Pre-save middleware
-OrderSchema.pre("save", function (next) {
-  // Auto-calculate total price if not set
-  if (!this.totalPrice) {
-    this.totalPrice = this.unitPrice * this.quantity;
-  }
-
-  // Update timestamps based on status
-  const now = new Date();
-
-  if (this.isModified("status")) {
-    switch (this.status) {
-      case "processing":
-        if (!this.processedAt) {
-          this.processedAt = now;
-        }
-        break;
-      case "completed":
-        if (!this.completedAt) {
-          this.completedAt = now;
-        }
-        break;
-      case "failed":
-      case "cancelled":
-        if (!this.cancellationData?.cancelledAt) {
-          this.cancellationData = {
-            ...this.cancellationData,
-            cancelledAt: now,
-          };
-        }
-        break;
+      message: 'Invalid data format for field type'
     }
-  }
-
-  // Set delivery timestamp if delivery data is added
-  if (this.deliveryData && !this.deliveryData.deliveredAt) {
-    this.deliveryData.deliveredAt = now;
-  }
-
-  this.save();
+  },
+  createdAt: { type: Date, default: Date.now }
 });
+
+// Delivery Data Schema
+const deliveryDataSchema = new Schema<DeliveryData>({
+  deliveredAt: { type: Date, default: Date.now },
+  deliveryMethod: { 
+    type: String, 
+    enum: ['whatsapp', 'email', 'download'],
+    default: 'whatsapp' 
+  },
+  deliveryType: { 
+    type: String, 
+    required: true,
+    enum: ['text', 'file', 'both'] 
+  },
+  text: String,
+  fileUrl: String,
+  fileName: String,
+  fileType: String,
+  deliveredBy: String
+});
+
+// Cancellation Data Schema
+const cancellationDataSchema = new Schema<CancellationData>({
+  cancelledAt: { type: Date, default: Date.now },
+  reason: { type: String, required: true },
+  cancelledBy: { type: String, required: true }
+});
+
+// Order Schema
+const orderSchema = new Schema<IOrder>({
+  orderId: {
+    type: String,
+    required: true,
+    unique: true,
+    index: true
+  },
+  userId: {
+    type: Schema.Types.ObjectId,
+    ref: 'User',
+    required: true,
+    index: true
+  },
+  serviceId: {
+    type: Schema.Types.ObjectId,
+    ref: 'Service',
+    required: true,
+    index: true
+  },
+  serviceName: {
+    type: String,
+    required: true
+  },
+  quantity: {
+    type: Number,
+    required: true,
+    default: 1,
+    min: 1
+  },
+  unitPrice: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  totalPrice: {
+    type: Number,
+    required: true,
+    min: 0
+  },
+  serviceData: [serviceDataFieldSchema],
+  status: {
+    type: String,
+    required: true,
+    enum: ['pending', 'processing', 'completed', 'failed', 'cancelled'],
+    default: 'pending',
+    index: true
+  },
+  transactionId: {
+    type: Schema.Types.ObjectId,
+    ref: 'Transaction'
+  },
+  deliveryData: deliveryDataSchema,
+  cancellationData: cancellationDataSchema,
+  notes: {
+    type: String,
+    maxlength: 500
+  },
+  adminNotes: {
+    type: String,
+    maxlength: 1000
+  },
+  placedAt: {
+    type: Date,
+    default: Date.now
+  },
+  completedAt: Date
+}, {
+  timestamps: true
+});
+
+// Type for Order model static methods
+interface OrderModel extends Model<IOrder> {
+  findByOrderId(orderId: string): Promise<IOrder | null>;
+  findByUserId(userId: Types.ObjectId | string, limit?: number): Promise<IOrder[]>;
+  findPendingOrders(limit?: number): Promise<IOrder[]>;
+}
 
 // Static methods
-OrderSchema.statics.findByUserId = function (userId: string | Types.ObjectId) {
-  return this.find({ userId }).sort({ createdAt: -1 });
+orderSchema.statics.findByOrderId = async function(orderId: string): Promise<IOrder | null> {
+  return this.findOne({ orderId })
+    .populate('userId', 'name whatsapp')
+    .populate('serviceId', 'name description price');
 };
 
-OrderSchema.statics.findByServiceId = function (
-  serviceId: string | Types.ObjectId,
-) {
-  return this.find({ serviceId }).sort({ createdAt: -1 });
+orderSchema.statics.findByUserId = async function(userId: Types.ObjectId | string, limit: number = 10): Promise<IOrder[]> {
+  return this.find({ userId })
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .populate('serviceId', 'name description price');
 };
 
-OrderSchema.statics.findActiveOrders = function () {
-  return this.find({ status: { $in: ["pending", "processing"] } });
-};
-
-OrderSchema.statics.findCompletedOrders = function () {
-  return this.find({ status: "completed" });
-};
-
-OrderSchema.statics.findByStatus = function (
-  status: OrderStatus | OrderStatus[],
-) {
-  const statuses = Array.isArray(status) ? status : [status];
-  return this.find({ status: { $in: statuses } });
-};
-
-OrderSchema.statics.getRevenueStats = async function (
-  startDate?: Date,
-  endDate?: Date,
-) {
-  const match: any = { status: "completed" };
-
-  if (startDate || endDate) {
-    match.placedAt = {};
-    if (startDate) match.placedAt.$gte = startDate;
-    if (endDate) match.placedAt.$lte = endDate;
-  }
-
-  return this.aggregate([
-    { $match: match },
-    {
-      $group: {
-        _id: null,
-        totalOrders: { $sum: 1 },
-        totalRevenue: { $sum: "$totalPrice" },
-        averageOrderValue: { $avg: "$totalPrice" },
-      },
-    },
-  ]);
+orderSchema.statics.findPendingOrders = async function(limit: number = 20): Promise<IOrder[]> {
+  return this.find({ 
+    status: { $in: ['pending', 'processing'] } 
+  })
+  .sort({ createdAt: 1 })
+  .limit(limit)
+  .populate('userId', 'name whatsapp');
 };
 
 // Instance methods
-OrderSchema.methods.markAsProcessing = async function (assignedTo?: string) {
-  this.status = "processing";
-  this.processedAt = new Date();
-  if (assignedTo) {
-    this.assignedTo = assignedTo;
+orderSchema.methods.getFormattedOrderInfo = function(): {
+  orderId: string;
+  serviceName: string;
+  totalPrice: string;
+  status: string;
+  placedAt: string;
+  hasFiles: boolean;
+} {
+  return {
+    orderId: this.orderId,
+    serviceName: this.serviceName,
+    totalPrice: `৳${this.totalPrice}`,
+    status: this.getStatusDisplay(),
+    placedAt: this.placedAt.toLocaleDateString(),
+    hasFiles: this.getFileFields().length > 0
+  };
+};
+
+orderSchema.methods.getFileFields = function(): ServiceDataField[] {
+  return this.serviceData.filter((data: ServiceDataField) => data.type === 'file');
+};
+
+orderSchema.methods.getTextFields = function(): ServiceDataField[] {
+  return this.serviceData.filter((data: ServiceDataField) => data.type === 'text');
+};
+
+orderSchema.methods.getStatusDisplay = function(): string {
+  const statusMap = {
+    pending: '⏳ Pending',
+    processing: '🔄 Processing',
+    completed: '✅ Completed',
+    failed: '❌ Failed',
+    cancelled: '🚫 Cancelled'
+  };
+  return statusMap[this.status as keyof typeof statusMap] || '📝 Unknown';
+};
+
+// Generate order ID before saving
+orderSchema.pre('save', function(next) {
+  if (!this.orderId) {
+    const timestamp = Date.now();
+    const random = Math.floor(Math.random() * 1000);
+    this.orderId = `ORD-${timestamp}-${random}`;
   }
-  return this.save();
-};
-
-OrderSchema.methods.markAsCompleted = async function (
-  deliveryData?: DeliveryData,
-) {
-  this.status = "completed";
-  this.completedAt = new Date();
-  if (deliveryData) {
-    this.deliveryData = deliveryData;
+  
+  if (this.status === 'completed' && !this.completedAt) {
+    this.completedAt = new Date();
   }
-  return this.save();
-};
+  
+  this.save();
+});
 
-OrderSchema.methods.markAsFailed = async function (
-  reason?: string,
-  cancelledBy?: string,
-) {
-  this.status = "failed";
-  this.cancellationData = {
-    cancelledAt: new Date(),
-    reason: reason || "Unknown reason",
-    cancelledBy: cancelledBy,
-  };
-  return this.save();
-};
+// Update service stats when order is completed
+orderSchema.post('save', async function(doc: IOrder) {
+  try {
+    if (doc.status === 'completed') {
+      const Service = mongoose.model('Service');
+      await (Service as any).updateStats(doc.serviceId, doc.totalPrice);
+    }
+  } catch (error) {
+    console.error('Error updating service stats:', error);
+  }
+});
 
-OrderSchema.methods.markAsCancelled = async function (
-  reason?: string,
-  cancelledBy?: string,
-) {
-  this.status = "cancelled";
-  this.cancellationData = {
-    cancelledAt: new Date(),
-    reason: reason || "Cancelled by user",
-    cancelledBy: cancelledBy,
-  };
-  return this.save();
-};
+// Indexes
+orderSchema.index({ userId: 1, status: 1 });
+orderSchema.index({ serviceId: 1, status: 1 });
+orderSchema.index({ status: 1, createdAt: 1 });
+orderSchema.index({ placedAt: -1 });
+orderSchema.index({ totalPrice: 1 });
 
-OrderSchema.methods.updateDelivery = async function (
-  deliveryData: DeliveryData,
-) {
-  this.deliveryData = {
-    ...this.deliveryData,
-    ...deliveryData,
-    deliveredAt: new Date(),
-  };
-  return this.save();
-};
-
-OrderSchema.methods.addNote = async function (note: string) {
-  this.notes = this.notes ? `${this.notes}\n${note}` : note;
-  return this.save();
-};
-
-// Create and export the model
-const Order: Model<IOrder> =
-  mongoose.models.Order || mongoose.model<IOrder>("Order", OrderSchema);
+// Export model
+const Order = mongoose.models.Order as OrderModel || mongoose.model<IOrder, OrderModel>('Order', orderSchema);
 
 export default Order;

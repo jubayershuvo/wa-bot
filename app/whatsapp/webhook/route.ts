@@ -2752,7 +2752,7 @@ async function handleAdminAddServiceStart(phone: string): Promise<void> {
     flowType: "admin_add_service",
     data: {
       adminAddService: {
-        step: 1,
+        step: 1, // Start at step 1 (service name)
         serviceData: {
           requiredFields: [],
         },
@@ -2878,9 +2878,8 @@ async function handleAdminAddServiceStep(
         if (input === "add_fields_yes") {
           await stateManager.updateStateData(formattedPhone, {
             adminAddService: {
-              step: 6,
+              step: 6, // Field name step
               serviceData: state?.data?.adminAddService?.serviceData,
-              fieldStep: 1, // Start field creation at step 1
             },
           });
 
@@ -2907,7 +2906,7 @@ async function handleAdminAddServiceStep(
             currentField: {
               name: fieldName,
             },
-            fieldStep: 2,
+            step: 7, // Move to field label step
           },
         });
 
@@ -2930,7 +2929,7 @@ async function handleAdminAddServiceStep(
               ...state?.data?.adminAddService?.currentField,
               label: input.trim(),
             },
-            fieldStep: 3,
+            step: 8, // Move to field type step
           },
         });
 
@@ -2957,7 +2956,7 @@ async function handleAdminAddServiceStep(
               ...state?.data?.adminAddService?.currentField,
               type: fieldType,
             },
-            fieldStep: 4,
+            step: 9, // Move to field required step
           },
         });
 
@@ -2998,13 +2997,12 @@ async function handleAdminAddServiceStep(
 
         await stateManager.updateStateData(formattedPhone, {
           adminAddService: {
-            step: 10,
+            step: 10, // Move to add more fields decision
             serviceData: {
               ...serviceData,
               requiredFields: updatedFields,
             },
-            fieldStep: undefined,
-            currentField: undefined,
+            currentField: undefined, // Clear current field
           },
         });
 
@@ -3012,19 +3010,18 @@ async function handleAdminAddServiceStep(
           phone,
           `✅ ফিল্ড যোগ করা হয়েছে\n\nফিল্ড: ${completedField.label}\nটাইপ: ${completedField.type}\nপ্রয়োজনীয়: ${completedField.required ? "হ্যাঁ" : "না"}\n\nআরেকটি ফিল্ড যোগ করবেন?`,
           [
-            { id: "add_more_fields", title: "➕ আরেকটি যোগ করুন" },
-            { id: "finish_fields", title: "✅ শেষ করুন" },
+            { id: "add_more_fields_yes", title: "➕ আরেকটি যোগ করুন" },
+            { id: "add_more_fields_no", title: "✅ শেষ করুন" },
           ],
         );
         break;
 
-      case 10: // Add More Fields or Finish
-        if (input === "add_more_fields") {
+      case 10: // Add More Fields Decision
+        if (input === "add_more_fields_yes") {
           await stateManager.updateStateData(formattedPhone, {
             adminAddService: {
               ...state?.data?.adminAddService,
               step: 6, // Go back to field name step
-              fieldStep: 1,
             },
           });
 
@@ -3088,22 +3085,37 @@ async function finalizeServiceCreation(phone: string): Promise<void> {
       instructions: serviceData.instructions || "",
       requiredFields: serviceData.requiredFields || [],
       isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
     });
 
-    const message =
+    let message =
       `✅ *সার্ভিস তৈরি সফল*\n\n` +
       `📦 সার্ভিস: ${serviceData.name}\n` +
       `💰 মূল্য: ৳${serviceData.price}\n` +
       `📝 বিবরণ: ${serviceData.description}\n` +
       `📋 ফিল্ড সংখ্যা: ${serviceData.requiredFields?.length || 0}\n` +
-      `🆔 সার্ভিস আইডি: ${newService._id}\n\n` +
+      `🆔 সার্ভিস আইডি: ${newService._id}\n\n`;
+
+    // List all fields
+    if (serviceData.requiredFields && serviceData.requiredFields.length > 0) {
+      message += `📋 *ফিল্ডসমূহ:*\n`;
+      serviceData.requiredFields.forEach(
+        (field: ServiceField, index: number) => {
+          message += `${index + 1}. ${field.label} (${field.type}) - ${field.required ? "প্রয়োজনীয়" : "ঐচ্ছিক"}\n`;
+        },
+      );
+      message += `\n`;
+    }
+
+    message +=
       `🎉 সার্ভিস সফলভাবে তৈরি করা হয়েছে!\n\n` +
       `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(phone, message);
 
     await notifyAdmin(
-      `📦 নতুন সার্ভিস তৈরি করা হয়েছে\n\nসার্ভিস: ${serviceData.name}\nমূল্য: ৳${serviceData.price}\nতৈরি করেছেন: ${formattedPhone}\nসার্ভিস আইডি: ${newService._id}`,
+      `📦 নতুন সার্ভিস তৈরি করা হয়েছে\n\nসার্ভিস: ${serviceData.name}\nমূল্য: ৳${serviceData.price}\nতৈরি করেছেন: ${formattedPhone}\nসার্ভিস আইডি: ${newService._id}\nফিল্ড সংখ্যা: ${serviceData.requiredFields?.length || 0}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
@@ -6741,7 +6753,8 @@ async function handleUserMessage(
             await showMainMenu(formattedPhone, isAdmin);
           }
         }
-      } else if (message.interactive?.type === "button_reply") {
+      } // In the handleUserMessage function, update the button reply section:
+      else if (message.interactive?.type === "button_reply") {
         const selectedId = message.interactive?.button_reply?.id || "";
 
         EnhancedLogger.info(`[${requestId}] Button reply received`, {
@@ -6760,39 +6773,25 @@ async function handleUserMessage(
           EnhancedLogger.info(`[${requestId}] Admin selected delivery type`, {
             selectedId,
           });
-          // Call the update function with delivery type
           await handleAdminProcessOrderUpdate(formattedPhone, selectedId);
-        } else if (selectedId.startsWith("field_")) {
+        } else if (selectedId.startsWith("field_type_")) {
           // Handle field type selection
           await handleAdminAddServiceStep(formattedPhone, selectedId);
-        } else if (selectedId.startsWith("required_")) {
+        } else if (selectedId.startsWith("field_required_")) {
           // Handle required field selection
           await handleAdminAddServiceStep(formattedPhone, selectedId);
         } else if (selectedId.startsWith("add_fields_")) {
           // Handle add fields decision
           await handleAdminAddServiceStep(formattedPhone, selectedId);
-        } else if (
-          selectedId.startsWith("add_more_") ||
-          selectedId.startsWith("finish_")
-        ) {
+        } else if (selectedId.startsWith("add_more_fields_")) {
           // Handle more fields or finish
           await handleAdminAddServiceStep(formattedPhone, selectedId);
-        } else if (selectedId.startsWith("confirm_")) {
-          // Handle confirm actions
-          if (selectedId === "confirm_delete") {
-            await handleAdminDeleteServiceExecute(formattedPhone, true);
-          } else if (selectedId.startsWith("confirm_")) {
-            await handleAdminBanUserConfirm(formattedPhone, selectedId);
-          }
-        } else if (
-          selectedId === "cancel_action" ||
-          selectedId === "cancel_delete"
-        ) {
+        } else if (selectedId === "confirm_delete") {
+          await handleAdminDeleteServiceExecute(formattedPhone, true);
+        } else if (selectedId === "cancel_delete") {
           await handleAdminDeleteServiceExecute(formattedPhone, false);
         } else if (selectedId.startsWith("broadcast_")) {
           await handleAdminBroadcastSend(formattedPhone, selectedId);
-        } else if (selectedId.startsWith("edit_")) {
-          await handleAdminEditServiceOption(formattedPhone, selectedId);
         } else {
           EnhancedLogger.warn(`[${requestId}] Unknown button selected`, {
             selectedId,
