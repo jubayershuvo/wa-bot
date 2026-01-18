@@ -4629,10 +4629,10 @@ async function completeOrderDelivery(phone: string): Promise<void> {
       }
 
       await sendTextMessage(user.whatsapp, notification);
-
+      const newData = await Order.findById(orderId);
       // Step 2: Send file if available
       if (
-        deliveryData?.fileUrl
+        newData?.deliveryData?.fileUrl
       ) {
         // Check if URL is accessible before trying to send
         const publicUrl = `${process.env.NEXT_PUBLIC_URL}/file/${orderId}`;
