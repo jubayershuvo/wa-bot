@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import User, { IUser } from "@/models/User";
 import Service, { IService, ServiceField } from "@/models/Service";
-import Order from "@/models/Order";
+import Order, { ServiceDataField } from "@/models/Order";
 import Transaction from "@/models/Transaction";
 import stateManager from "@/lib/whatsappState";
 import { sessionMonitor } from "@/lib/sessionMonitor";
@@ -1943,22 +1943,43 @@ async function askForServiceConfirmation(
 
   if (Object.keys(collectedData).length > 0) {
     message += `📋 প্রদত্ত তথ্য:\n`;
-    for (const [fieldName, fieldData] of Object.entries(collectedData)) {
-      const field = service.requiredFields?.find((f) => f.name === fieldName);
-      if (field) {
-        if (field.type === "file") {
-          message += `• ${field.label}: 📁 ফাইল আপলোড করা হয়েছে\n`;
-        } else {
-          message += `• ${field.label}: ${fieldData.data || "শূন্য"}\n`;
+
+    // First, collect all field data
+    const fieldsData: { label: string; value: string }[] = [];
+
+    if (service.requiredFields) {
+      service.requiredFields.forEach((field: ServiceField) => {
+        const fieldData = collectedData[field.name];
+        let displayValue = "শূন্য";
+
+        if (fieldData) {
+          if (field.type === "file") {
+            displayValue = "📁 ফাইল আপলোড করা হয়েছে";
+          } else if (typeof fieldData === "object" && fieldData.data) {
+            displayValue = fieldData.data;
+          } else if (typeof fieldData === "string") {
+            displayValue = fieldData;
+          }
         }
-      }
+
+        fieldsData.push({
+          label: field.label,
+          value: displayValue,
+        });
+      });
     }
+
+    // Now display all fields
+    fieldsData.forEach((field) => {
+      message += `• ${field.label}: ${field.value}\n`;
+    });
+
     message += `\n`;
   }
 
-  message += `✅ অর্ডার কনফার্ম করতে 'confirm' লিখুন\n`;
-  message += `✏️ তথ্য পরিবর্তন করতে 'edit' লিখুন\n`;
-  message += `🚫 বাতিল করতে 'cancel' লিখুন`;
+  if (service.instructions) {
+    message += `📝 নির্দেশনা: ${service.instructions}\n\n`;
+  }
 
   // Update state to awaiting confirmation
   await stateManager.updateStateData(formattedPhone, {
@@ -1968,7 +1989,12 @@ async function askForServiceConfirmation(
     currentState: "awaiting_service_confirmation",
   });
 
-  await sendTextWithCancelButton(formattedPhone, message);
+  // Send confirmation with buttons
+  await sendQuickReplyMenu(formattedPhone, message, [
+    { id: "order_confirm", title: "✅ কনফার্ম করুন" },
+    { id: "order_edit", title: "✏️ এডিট করুন" },
+    { id: "order_cancel", title: "🚫 বাতিল করুন" },
+  ]);
 }
 async function handleUserFileUpload(
   phone: string,
@@ -2257,11 +2283,29 @@ async function handleEditServiceData(phone: string): Promise<void> {
 
     // Create field selection menu
     const fieldRows = service.requiredFields.map(
-      (field: ServiceField, index: number) => ({
-        id: `edit_field_${index}`,
-        title: field.label,
-        description: `বর্তমান: ${serviceOrderData.collectedData?.[field.name] || "শূন্য"}`,
-      }),
+      (field: ServiceField, index: number) => {
+        const fieldData = serviceOrderData.collectedData?.[field.name];
+        let currentValue = "শূন্য";
+
+        if (fieldData) {
+          if (field.type === "file") {
+            currentValue = "📁 ফাইল আপলোড করা হয়েছে";
+          } else if (typeof fieldData === "object" && fieldData.data) {
+            currentValue =
+              fieldData.data.substring(0, 20) +
+              (fieldData.data.length > 20 ? "..." : "");
+          } else if (typeof fieldData === "string") {
+            currentValue =
+              fieldData.substring(0, 20) + (fieldData.length > 20 ? "..." : "");
+          }
+        }
+
+        return {
+          id: `edit_field_${index}`,
+          title: field.label,
+          description: `বর্তমান: ${currentValue}`,
+        };
+      },
     );
 
     // Add option to edit all fields
@@ -2340,7 +2384,7 @@ async function confirmServiceOrder(phone: string): Promise<void> {
         if (field.required && !serviceOrderData.collectedData?.[field.name]) {
           await sendTextMessage(
             formattedPhone,
-            `❌ প্রয়োজনীয় ফিল্ড '${field.label}' পূরণ করা হয়নি।\n\nদয়া করে অর্ডার সম্পূর্ণ করতে 'edit' লিখুন।`,
+            `❌ প্রয়োজনীয় ফিল্ড '${field.label}' পূরণ করা হয়নি।\n\nদয়া করে 'edit' বাটন ক্লিক করুন এবং তথ্য দিন।`,
           );
           return;
         }
@@ -2348,19 +2392,22 @@ async function confirmServiceOrder(phone: string): Promise<void> {
     }
 
     // Process collected data for storage
-    const processedServiceData: any[] = [];
+    // Process collected data for storage
+    const processedServiceData: ServiceDataField[] = [];
     if (serviceOrderData.collectedData) {
       for (const [fieldName, fieldData] of Object.entries(
         serviceOrderData.collectedData,
       )) {
         const field = service.requiredFields?.find((f) => f.name === fieldName);
-        if (field) {
-          processedServiceData.push({
+        if (field && (field.type === "text" || field.type === "file")) {
+          const dataField: ServiceDataField = {
             field: fieldName,
             label: field.label,
             type: field.type,
-            data: fieldData.data, // This contains either text or file information
-          });
+            data: fieldData.data || "",
+            createdAt: new Date(),
+          };
+          processedServiceData.push(dataField);
         }
       }
     }
@@ -2369,6 +2416,7 @@ async function confirmServiceOrder(phone: string): Promise<void> {
     user.balance -= Number(serviceOrderData.price);
     await user.save();
 
+    // Create transaction
     const transaction = await Transaction.create({
       trxId: `ORDER-${Date.now()}`,
       amount: serviceOrderData.price,
@@ -2379,38 +2427,54 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       metadata: {
         serviceId: serviceOrderData.serviceId,
         serviceName: serviceOrderData.serviceName,
-        collectedData: processedServiceData,
+        fieldCount: processedServiceData.length,
       },
       createdAt: new Date(),
     });
 
-    // CREATE ORDER
+    // Create order
     const order = await Order.create({
-      orderId: `ORD-${Date.now()}`,
+      orderId: `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       userId: user._id,
       serviceId: service._id,
       serviceName: service.name,
       quantity: 1,
       unitPrice: serviceOrderData.price,
       totalPrice: serviceOrderData.price,
-      serviceData: processedServiceData, // Store all field data here
+      serviceData: processedServiceData,
       status: "pending",
       transactionId: transaction._id,
       placedAt: new Date(),
       createdAt: new Date(),
     });
 
-    await sendTextMessage(
-      formattedPhone,
-      `✅ *অর্ডার সফল*\n\n📦 সার্ভিস: ${service.name}\n🆔 অর্ডার আইডি: ${order._id}\n💰 খরচ: ৳${serviceOrderData.price}\n🆕 ব্যালেন্স: ৳${user.balance}\n📅 সময়: ${new Date().toLocaleString()}\n\n🎉 আপনার অর্ডারটি সফলভাবে প্লেস করা হয়েছে!\n\nআমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-    );
+    // Send success message
+    const successMessage =
+      `✅ *অর্ডার সফল*\n\n` +
+      `📦 সার্ভিস: ${service.name}\n` +
+      `🆔 অর্ডার আইডি: ${order.orderId}\n` +
+      `💰 খরচ: ৳${serviceOrderData.price}\n` +
+      `🆕 ব্যালেন্স: ৳${user.balance}\n` +
+      `📅 সময়: ${new Date().toLocaleString()}\n\n` +
+      `🎉 আপনার অর্ডারটি সফলভাবে প্লেস করা হয়েছে!\n\n` +
+      `আমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n` +
+      `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
-    // Notify admin with field details
-    let adminMessage = `🛒 নতুন অর্ডার\n\nব্যবহারকারী: ${formattedPhone}\nনাম: ${user.name}\nঅর্ডার আইডি: ${order._id}\nসার্ভিস: ${service.name}\nমূল্য: ৳${serviceOrderData.price}\nইউজার ব্যালেন্স: ৳${user.balance}\n\n📋 *প্রদত্ত তথ্য:*\n`;
+    await sendTextMessage(formattedPhone, successMessage);
 
-    processedServiceData.forEach((fieldData: any) => {
+    // Notify admin
+    let adminMessage = `🛒 নতুন অর্ডার\n\n`;
+    adminMessage += `ব্যবহারকারী: ${formattedPhone}\n`;
+    adminMessage += `নাম: ${user.name}\n`;
+    adminMessage += `অর্ডার আইডি: ${order.orderId}\n`;
+    adminMessage += `সার্ভিস: ${service.name}\n`;
+    adminMessage += `মূল্য: ৳${serviceOrderData.price}\n`;
+    adminMessage += `ইউজার ব্যালেন্স: ৳${user.balance}\n\n`;
+    adminMessage += `📋 *প্রদত্ত তথ্য:*\n`;
+
+    processedServiceData.forEach((fieldData: ServiceDataField) => {
       if (fieldData.type === "file") {
-        adminMessage += `• ${fieldData.label}: 📁 ফাইল আপলোড করা হয়েছে\n`;
+        adminMessage += `• ${fieldData.label}: 📁 ফাইল\n`;
       } else {
         adminMessage += `• ${fieldData.label}: ${fieldData.data}\n`;
       }
@@ -2423,21 +2487,35 @@ async function confirmServiceOrder(phone: string): Promise<void> {
 
     EnhancedLogger.logFlowCompletion(formattedPhone, "service_order", {
       orderId: order._id,
+      orderNumber: order.orderId,
       serviceId: serviceOrderData.serviceId,
       serviceName: serviceOrderData.serviceName,
       price: serviceOrderData.price,
       newBalance: user.balance,
       fieldCount: processedServiceData.length,
     });
-  } catch (err) {
+  } catch (err: any) {
     EnhancedLogger.error(
       `Failed to confirm service order for ${formattedPhone}:`,
-      err,
+      {
+        error: err.message,
+        stack: err.stack,
+      },
     );
-    await sendTextMessage(
-      formattedPhone,
-      "❌ অর্ডার কনফার্ম করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
-    );
+
+    // More specific error message
+    let errorMessage =
+      "❌ অর্ডার কনফার্ম করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।";
+
+    if (err.message.includes("validation")) {
+      errorMessage = "❌ ডাটা ভ্যালিডেশন ত্রুটি হয়েছে। দয়া পরে চেষ্টা করুন।";
+    } else if (err.message.includes("duplicate")) {
+      errorMessage = "❌ ডুপ্লিকেট অর্ডার আইডি। দয়া পরে চেষ্টা করুন।";
+    } else if (err.message.includes("connection")) {
+      errorMessage = "❌ ডাটাবেজ কানেকশন সমস্যা। দয়া পরে চেষ্টা করুন।";
+    }
+
+    await sendTextMessage(formattedPhone, errorMessage);
     await showMainMenu(formattedPhone, false);
   }
 }
@@ -5984,17 +6062,21 @@ async function handleUserMessage(
       }
 
       if (currentState === "awaiting_service_confirmation") {
-        if (userText === "confirm") {
-          EnhancedLogger.info(`[${requestId}] Confirming service order`);
-          await confirmServiceOrder(formattedPhone);
-        } else if (userText === "edit") {
-          EnhancedLogger.info(`[${requestId}] Editing service data`);
-          await handleEditServiceData(formattedPhone);
-        } else {
-          await sendTextMessage(
-            formattedPhone,
-            "❌ দয়া করে 'confirm' বা 'edit' লিখুন।\n\n🚫 বাতিল করতে 'cancel' লিখুন",
-          );
+        // Don't process text for confirmation - only use buttons
+        await sendTextMessage(
+          formattedPhone,
+          "ℹ️ দয়া করে উপরের বাটনগুলো ব্যবহার করুন।\n\n✅ কনফার্ম করতে '✅ কনফার্ম করুন' বাটন ক্লিক করুন\n✏️ এডিট করতে '✏️ এডিট করুন' বাটন ক্লিক করুন\n🚫 বাতিল করতে '🚫 বাতিল করুন' বাটন ক্লিক করুন",
+        );
+        // Resend the confirmation menu
+        const state = await stateManager.getUserState(formattedPhone);
+        const serviceOrderData = state?.data
+          ?.serviceOrder as ServiceOrderStateData;
+        if (serviceOrderData?.serviceId) {
+          await connectDB();
+          const service = await Service.findById(serviceOrderData.serviceId);
+          if (service) {
+            await askForServiceConfirmation(formattedPhone, service);
+          }
         }
         return;
       }
@@ -6620,6 +6702,73 @@ async function handleUserMessage(
                   currentState: "admin_process_order_status",
                 });
                 await handleAdminProcessOrderStatus(formattedPhone, selectedId);
+              } else if (selectedId.startsWith("status_")) {
+                EnhancedLogger.info(
+                  `[${requestId}] Admin selected status update`,
+                  {
+                    selectedId,
+                  },
+                );
+                await handleAdminProcessOrderUpdate(formattedPhone, selectedId);
+              } else if (selectedId === "cancel_flow") {
+                EnhancedLogger.info(`[${requestId}] User cancelled flow`);
+                await cancelFlow(formattedPhone, isAdmin);
+              }
+              // Handle field editing options - ADDED HERE
+              else if (
+                selectedId.startsWith("edit_field_") ||
+                selectedId === "edit_all_fields"
+              ) {
+                EnhancedLogger.info(`[${requestId}] User selected field edit`, {
+                  selectedId,
+                });
+
+                const state = await stateManager.getUserState(formattedPhone);
+                const serviceOrderData = state?.data
+                  ?.serviceOrder as ServiceOrderStateData;
+
+                if (selectedId === "edit_all_fields") {
+                  // Reset to first field
+                  await stateManager.updateStateData(formattedPhone, {
+                    serviceOrder: {
+                      ...serviceOrderData,
+                      fieldIndex: 0,
+                    },
+                    currentState: "awaiting_service_data",
+                  });
+                } else {
+                  // Edit specific field
+                  const fieldIndex = parseInt(
+                    selectedId.replace("edit_field_", ""),
+                  );
+                  await stateManager.updateStateData(formattedPhone, {
+                    serviceOrder: {
+                      ...serviceOrderData,
+                      fieldIndex: fieldIndex,
+                    },
+                    currentState: "awaiting_service_data",
+                  });
+                }
+
+                // Get service info
+                await connectDB();
+                const service = await Service.findById(
+                  serviceOrderData?.serviceId,
+                );
+                if (service) {
+                  if (selectedId === "edit_all_fields") {
+                    await askForServiceField(formattedPhone, service, 0);
+                  } else {
+                    const fieldIndex = parseInt(
+                      selectedId.replace("edit_field_", ""),
+                    );
+                    await askForServiceField(
+                      formattedPhone,
+                      service,
+                      fieldIndex,
+                    );
+                  }
+                }
               } else {
                 EnhancedLogger.warn(`[${requestId}] Unknown option selected`, {
                   selectedId,
@@ -6697,11 +6846,15 @@ async function handleUserMessage(
             EnhancedLogger.info(`[${requestId}] User cancelled flow`);
             await cancelFlow(formattedPhone, isAdmin);
           }
-          // Handle field editing options
+          // Handle field editing options - ALSO ADDED HERE FOR NON-ADMIN/USER CONTEXTS
           else if (
             selectedId.startsWith("edit_field_") ||
             selectedId === "edit_all_fields"
           ) {
+            EnhancedLogger.info(`[${requestId}] User selected field edit`, {
+              selectedId,
+            });
+
             const state = await stateManager.getUserState(formattedPhone);
             const serviceOrderData = state?.data
               ?.serviceOrder as ServiceOrderStateData;
@@ -6725,7 +6878,7 @@ async function handleUserMessage(
                   ...serviceOrderData,
                   fieldIndex: fieldIndex,
                 },
-                currentState: "awaiting_service_data_edit",
+                currentState: "awaiting_service_data",
               });
             }
 
@@ -6753,17 +6906,22 @@ async function handleUserMessage(
             await showMainMenu(formattedPhone, isAdmin);
           }
         }
-      } // In the handleUserMessage function, update the button reply section:
-      else if (message.interactive?.type === "button_reply") {
+      } else if (message.interactive?.type === "button_reply") {
         const selectedId = message.interactive?.button_reply?.id || "";
 
         EnhancedLogger.info(`[${requestId}] Button reply received`, {
           selectedId,
         });
 
-        if (selectedId === "cancel_flow") {
+        if (selectedId === "cancel_flow" || selectedId === "order_cancel") {
           EnhancedLogger.info(`[${requestId}] User cancelled flow via button`);
           await cancelFlow(formattedPhone, isAdmin);
+        } else if (selectedId === "order_confirm") {
+          EnhancedLogger.info(`[${requestId}] User confirmed order via button`);
+          await confirmServiceOrder(formattedPhone);
+        } else if (selectedId === "order_edit") {
+          EnhancedLogger.info(`[${requestId}] User wants to edit order`);
+          await handleEditServiceData(formattedPhone);
         } else if (selectedId.startsWith("status_")) {
           EnhancedLogger.info(`[${requestId}] Admin selected status`, {
             selectedId,
@@ -6773,6 +6931,7 @@ async function handleUserMessage(
           EnhancedLogger.info(`[${requestId}] Admin selected delivery type`, {
             selectedId,
           });
+          // Call the update function with delivery type
           await handleAdminProcessOrderUpdate(formattedPhone, selectedId);
         } else if (selectedId.startsWith("field_type_")) {
           // Handle field type selection
@@ -6783,15 +6942,28 @@ async function handleUserMessage(
         } else if (selectedId.startsWith("add_fields_")) {
           // Handle add fields decision
           await handleAdminAddServiceStep(formattedPhone, selectedId);
-        } else if (selectedId.startsWith("add_more_fields_")) {
+        } else if (
+          selectedId.startsWith("add_more_") ||
+          selectedId.startsWith("finish_")
+        ) {
           // Handle more fields or finish
           await handleAdminAddServiceStep(formattedPhone, selectedId);
-        } else if (selectedId === "confirm_delete") {
-          await handleAdminDeleteServiceExecute(formattedPhone, true);
-        } else if (selectedId === "cancel_delete") {
+        } else if (selectedId.startsWith("confirm_")) {
+          // Handle confirm actions
+          if (selectedId === "confirm_delete") {
+            await handleAdminDeleteServiceExecute(formattedPhone, true);
+          } else if (selectedId.startsWith("confirm_")) {
+            await handleAdminBanUserConfirm(formattedPhone, selectedId);
+          }
+        } else if (
+          selectedId === "cancel_action" ||
+          selectedId === "cancel_delete"
+        ) {
           await handleAdminDeleteServiceExecute(formattedPhone, false);
         } else if (selectedId.startsWith("broadcast_")) {
           await handleAdminBroadcastSend(formattedPhone, selectedId);
+        } else if (selectedId.startsWith("edit_")) {
+          await handleAdminEditServiceOption(formattedPhone, selectedId);
         } else {
           EnhancedLogger.warn(`[${requestId}] Unknown button selected`, {
             selectedId,
