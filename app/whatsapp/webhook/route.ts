@@ -1595,10 +1595,10 @@ async function handleUbrnVerificationStart(phone: string): Promise<void> {
 async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   const trimmedUbrn = ubrn.trim();
-  
-  EnhancedLogger.info(`Starting UBRN processing for ${formattedPhone}`, { 
+
+  EnhancedLogger.info(`Starting UBRN processing for ${formattedPhone}`, {
     ubrn: trimmedUbrn,
-    timestamp: new Date().toISOString() 
+    timestamp: new Date().toISOString(),
   });
 
   try {
@@ -1606,7 +1606,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     await stateManager.updateStateData(formattedPhone, {
       ubrn: {
         ubrn: trimmedUbrn,
-        processingStart: new Date().toISOString()
+        processingStart: new Date().toISOString(),
       },
     });
 
@@ -1634,9 +1634,9 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     if (user.balance < CONFIG.ubrnServicePrice) {
       EnhancedLogger.warn(`Insufficient balance for ${formattedPhone}`, {
         balance: user.balance,
-        required: CONFIG.ubrnServicePrice
+        required: CONFIG.ubrnServicePrice,
       });
-      
+
       await sendTextMessage(
         formattedPhone,
         `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💰 ব্যালেন্স রিচার্জ করতে অ্যাডমিনের সাথে যোগাযোগ করুন।`,
@@ -1649,12 +1649,12 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     // Call UBRN API
     let apiResponse;
     const apiStartTime = Date.now();
-    
+
     try {
       EnhancedLogger.info(`Calling UBRN API`, {
         ubrn: trimmedUbrn,
         url: CONFIG.ubrnApiUrl,
-        startTime: new Date().toISOString()
+        startTime: new Date().toISOString(),
       });
 
       const response = await axios.get(CONFIG.ubrnApiUrl, {
@@ -1663,14 +1663,14 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
       const apiEndTime = Date.now();
       const apiDuration = apiEndTime - apiStartTime;
-      console.log(response)
+      console.log(response);
       EnhancedLogger.info(`UBRN API response received`, {
         ubrn: trimmedUbrn,
         status: response.status,
         statusText: response.statusText,
         duration: `${apiDuration}ms`,
         headers: response.headers,
-        dataKeys: response.data ? Object.keys(response.data) : 'no data'
+        dataKeys: response.data ? Object.keys(response.data) : "no data",
       });
 
       apiResponse = response.data;
@@ -1678,23 +1678,22 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
       // Log the actual response structure
       EnhancedLogger.debug(`UBRN API raw response`, {
         data: apiResponse,
-        dataType: typeof apiResponse
+        dataType: typeof apiResponse,
       });
-
     } catch (apiError: unknown) {
       const apiEndTime = Date.now();
       const apiDuration = apiEndTime - apiStartTime;
-      
+
       EnhancedLogger.error(`UBRN API call failed for ${trimmedUbrn}`, {
         error: apiError,
         duration: `${apiDuration}ms`,
         phone: formattedPhone,
-        stack: apiError instanceof Error ? apiError.stack : 'No stack trace'
+        stack: apiError instanceof Error ? apiError.stack : "No stack trace",
       });
 
       let errorMessage = "UBRN API তে সমস্যা হয়েছে।";
       let errorDetails = "";
-      
+
       if (axios.isAxiosError(apiError)) {
         EnhancedLogger.error(`Axios error details`, {
           code: apiError.code,
@@ -1704,23 +1703,28 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
           config: {
             url: apiError.config?.url,
             method: apiError.config?.method,
-            params: apiError.config?.params
-          }
+            params: apiError.config?.params,
+          },
         });
-        
+
         if (apiError.code === "ECONNABORTED" || apiError.code === "ETIMEDOUT") {
-          errorMessage = "UBRN API টাইমআউট হয়েছে। দয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।";
+          errorMessage =
+            "UBRN API টাইমআউট হয়েছে। দয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।";
         } else if (apiError.response?.status === 404) {
-          errorMessage = "❌ UBRN নম্বরটি পাওয়া যায়নি।\n\nদয়া করে নিশ্চিত করুন যে UBRN নম্বরটি সঠিক।";
+          errorMessage =
+            "❌ UBRN নম্বরটি পাওয়া যায়নি।\n\nদয়া করে নিশ্চিত করুন যে UBRN নম্বরটি সঠিক।";
         } else if (apiError.response?.status === 400) {
-          errorMessage = "❌ UBRN নম্বরটি সঠিক ফরম্যাটে নয়।\n\nদয়া করে ১৭ বা ১৮ ডিজিটের UBRN নম্বর দিন।";
+          errorMessage =
+            "❌ UBRN নম্বরটি সঠিক ফরম্যাটে নয়।\n\nদয়া করে ১৭ বা ১৮ ডিজিটের UBRN নম্বর দিন।";
         } else if (apiError.response?.status === 429) {
-          errorMessage = "❌ অনেকগুলো রিকোয়েস্ট করা হয়েছে।\n\nদয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।";
+          errorMessage =
+            "❌ অনেকগুলো রিকোয়েস্ট করা হয়েছে।\n\nদয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।";
         } else if (apiError.response?.data) {
           const errorData = apiError.response.data;
-          errorDetails = typeof errorData === 'object' 
-            ? JSON.stringify(errorData, null, 2)
-            : String(errorData);
+          errorDetails =
+            typeof errorData === "object"
+              ? JSON.stringify(errorData, null, 2)
+              : String(errorData);
         }
       } else if (apiError instanceof Error) {
         errorDetails = apiError.message;
@@ -1728,9 +1732,9 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
       await sendTextMessage(
         formattedPhone,
-        `${errorMessage}\n\n${errorDetails ? `বিস্তারিত: ${errorDetails}\n\n` : ''}আপনার ব্যালেন্স কাটা হয়নি।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+        `${errorMessage}\n\n${errorDetails ? `বিস্তারিত: ${errorDetails}\n\n` : ""}আপনার ব্যালেন্স কাটা হয়নি।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
       );
-      
+
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
       return;
@@ -1749,9 +1753,9 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     }
 
     // Parse API response
-    EnhancedLogger.debug(`Parsing API response`, { 
+    EnhancedLogger.debug(`Parsing API response`, {
       responseType: typeof apiResponse,
-      responseKeys: Object.keys(apiResponse)
+      responseKeys: Object.keys(apiResponse),
     });
 
     let resultData = null;
@@ -1763,42 +1767,47 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
       if (apiResponse.status === "success" && apiResponse.result) {
         apiStatus = "success";
         resultData = apiResponse.result;
-        
+
         EnhancedLogger.info(`Successfully parsed UBRN data`, {
           ubrn: trimmedUbrn,
           hasResult: !!resultData,
-          resultKeys: resultData ? Object.keys(resultData) : []
+          resultKeys: resultData ? Object.keys(resultData) : [],
         });
       }
       // Check for error response
-      else if (apiResponse.error || apiResponse.status === "error" || apiResponse.success === false) {
+      else if (
+        apiResponse.error ||
+        apiResponse.status === "error" ||
+        apiResponse.success === false
+      ) {
         apiStatus = "error";
         resultData = apiResponse;
-        errorMessage = apiResponse.error || apiResponse.message || "UBRN তথ্য পাওয়া যায়নি";
-        
+        errorMessage =
+          apiResponse.error || apiResponse.message || "UBRN তথ্য পাওয়া যায়নি";
+
         EnhancedLogger.warn(`API returned error for UBRN: ${trimmedUbrn}`, {
           error: errorMessage,
-          fullResponse: apiResponse
+          fullResponse: apiResponse,
         });
       }
       // Direct result object
       else if (apiResponse.dob || apiResponse.name || apiResponse.ubrn) {
         apiStatus = "success";
         resultData = apiResponse;
-        
+
         EnhancedLogger.info(`Direct result object found`, {
           ubrn: trimmedUbrn,
-          fields: Object.keys(apiResponse)
+          fields: Object.keys(apiResponse),
         });
       }
       // Unknown structure
       else {
         apiStatus = "unknown";
         resultData = apiResponse;
-        
+
         EnhancedLogger.warn(`Unknown API response structure`, {
           ubrn: trimmedUbrn,
-          response: apiResponse
+          response: apiResponse,
         });
       }
     } else {
@@ -1806,7 +1815,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
       EnhancedLogger.error(`Invalid API response type`, {
         ubrn: trimmedUbrn,
         responseType: typeof apiResponse,
-        response: apiResponse
+        response: apiResponse,
       });
     }
 
@@ -1821,7 +1830,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
         userId: user._id,
         oldBalance,
         deduction: CONFIG.ubrnServicePrice,
-        newBalance: user.balance
+        newBalance: user.balance,
       });
 
       // Create transaction record
@@ -1835,14 +1844,14 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
           apiStatus,
           executionTime: apiResponse.execution_time || "N/A",
           resultFields: resultData ? Object.keys(resultData) : [],
-          timestamp: new Date().toISOString()
-        }
+          timestamp: new Date().toISOString(),
+        },
       });
 
       EnhancedLogger.info(`Transaction created`, {
         transactionId: transaction._id,
         userId: user._id,
-        amount: CONFIG.ubrnServicePrice
+        amount: CONFIG.ubrnServicePrice,
       });
 
       // Format and send result message
@@ -1853,17 +1862,17 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
       resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
       resultMessage += `📅 তারিখ: ${new Date().toLocaleDateString("bn-BD")}\n`;
       resultMessage += `⏰ সময়: ${new Date().toLocaleTimeString("bn-BD")}\n`;
-      
+
       if (apiResponse.execution_time) {
         resultMessage += `⚡ প্রসেসিং সময়: ${apiResponse.execution_time}\n`;
       }
-      
+
       resultMessage += `\n📋 *ব্যক্তিগত তথ্য:*\n`;
 
       // Format result data
       if (resultData) {
         // Bengali field mappings
-        const fieldMappings: {[key: string]: string} = {
+        const fieldMappings: { [key: string]: string } = {
           name: "নাম",
           dob: "জন্ম তারিখ",
           ubrn: "UBRN নম্বর",
@@ -1874,7 +1883,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
           address: "বর্তমান ঠিকানা",
           national_id: "জাতীয় পরিচয়পত্র",
           registration_number: "নিবন্ধন নম্বর",
-          registration_date: "নিবন্ধনের তারিখ"
+          registration_date: "নিবন্ধনের তারিখ",
         };
 
         // Display known fields
@@ -1886,16 +1895,18 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
         // Display any other fields not in mappings
         Object.entries(resultData).forEach(([key, value]) => {
-          if (!fieldMappings[key] && value && typeof value !== 'object') {
-            const displayKey = key.replace(/_/g, ' ').toUpperCase();
+          if (!fieldMappings[key] && value && typeof value !== "object") {
+            const displayKey = key.replace(/_/g, " ").toUpperCase();
             resultMessage += `• ${displayKey}: ${value}\n`;
           }
         });
 
         // Log what was displayed
         EnhancedLogger.debug(`Result displayed to user`, {
-          displayedFields: Object.keys(resultData).filter(key => resultData[key]),
-          totalFields: Object.keys(resultData).length
+          displayedFields: Object.keys(resultData).filter(
+            (key) => resultData[key],
+          ),
+          totalFields: Object.keys(resultData).length,
         });
       } else {
         resultMessage += "কোন তথ্য পাওয়া যায়নি\n";
@@ -1911,13 +1922,13 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
       // Notify admin
       await notifyAdmin(
         `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\n` +
-        `📱 ব্যবহারকারী: ${formattedPhone}\n` +
-        `🔢 UBRN: ${trimmedUbrn}\n` +
-        `💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n` +
-        `💳 পুরাতন ব্যালেন্স: ৳${oldBalance}\n` +
-        `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n` +
-        `📊 লেনদেন ID: ${transaction._id}\n` +
-        `⏱️ সময়: ${new Date().toLocaleString("bn-BD")}`
+          `📱 ব্যবহারকারী: ${formattedPhone}\n` +
+          `🔢 UBRN: ${trimmedUbrn}\n` +
+          `💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n` +
+          `💳 পুরাতন ব্যালেন্স: ৳${oldBalance}\n` +
+          `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n` +
+          `📊 লেনদেন ID: ${transaction._id}\n` +
+          `⏱️ সময়: ${new Date().toLocaleString("bn-BD")}`,
       );
 
       EnhancedLogger.logFlowCompletion(formattedPhone, "ubrn_verification", {
@@ -1928,9 +1939,8 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
         newBalance: user.balance,
         apiStatus,
         executionTime: apiResponse.execution_time,
-        resultFieldsCount: resultData ? Object.keys(resultData).length : 0
+        resultFieldsCount: resultData ? Object.keys(resultData).length : 0,
       });
-
     } else {
       // API failed or returned error
       EnhancedLogger.warn(`UBRN verification failed`, {
@@ -1938,16 +1948,16 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
         phone: formattedPhone,
         apiStatus,
         errorMessage,
-        apiResponse
+        apiResponse,
       });
 
       await sendTextMessage(
         formattedPhone,
         `❌ UBRN তথ্য পাওয়া যায়নি\n\n` +
-        `UBRN: ${trimmedUbrn}\n\n` +
-        `${errorMessage ? `কারণ: ${errorMessage}\n\n` : ''}` +
-        `💰 আপনার ব্যালেন্স কাটা হয়নি\n\n` +
-        `🏠 *মেনুতে ফিরতে 'Menu' লিখুন*`
+          `UBRN: ${trimmedUbrn}\n\n` +
+          `${errorMessage ? `কারণ: ${errorMessage}\n\n` : ""}` +
+          `💰 আপনার ব্যালেন্স কাটা হয়নি\n\n` +
+          `🏠 *মেনুতে ফিরতে 'Menu' লিখুন*`,
       );
     }
 
@@ -1958,35 +1968,40 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     EnhancedLogger.info(`UBRN process completed for ${formattedPhone}`, {
       ubrn: trimmedUbrn,
       finalStatus: apiStatus,
-      userNotified: true
+      userNotified: true,
     });
-
   } catch (error) {
-    EnhancedLogger.error(`Critical error in UBRN processing for ${formattedPhone}`, {
-      error: error,
-      ubrn: ubrn,
-      stack: error instanceof Error ? error.stack : 'No stack trace',
-      timestamp: new Date().toISOString()
-    });
+    EnhancedLogger.error(
+      `Critical error in UBRN processing for ${formattedPhone}`,
+      {
+        error: error,
+        ubrn: ubrn,
+        stack: error instanceof Error ? error.stack : "No stack trace",
+        timestamp: new Date().toISOString(),
+      },
+    );
 
     try {
       await sendTextMessage(
         formattedPhone,
         "❌ UBRN ভেরিফিকেশন করতে সমস্যা হয়েছে।\n\n" +
-        "দয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।\n\n" +
-        "🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন"
+          "দয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।\n\n" +
+          "🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
       );
     } catch (sendError) {
-      EnhancedLogger.error(`Failed to send error message to ${formattedPhone}`, {
-        error: sendError
-      });
+      EnhancedLogger.error(
+        `Failed to send error message to ${formattedPhone}`,
+        {
+          error: sendError,
+        },
+      );
     }
 
     try {
       await stateManager.clearUserState(formattedPhone);
     } catch (stateError) {
       EnhancedLogger.error(`Failed to clear state for ${formattedPhone}`, {
-        error: stateError
+        error: stateError,
       });
     }
 
@@ -1994,7 +2009,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
       await showMainMenu(formattedPhone, false);
     } catch (menuError) {
       EnhancedLogger.error(`Failed to show main menu for ${formattedPhone}`, {
-        error: menuError
+        error: menuError,
       });
     }
   }
@@ -4215,14 +4230,14 @@ async function handleAdminViewOrders(phone: string): Promise<void> {
       message += `   💰: ৳${order.totalPrice}\n`;
       message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n`;
       //add file or text info
-      order.serviceData.forEach((item: any,index:number) => {
+      order.serviceData.forEach((item: any, index: number) => {
         if (item.type === "file") {
           const publicUrl = `${process.env.NEXT_PUBLIC_URL}/order-file/${order._id}/${index}`;
           message += `      📁 ${publicUrl}: [ফাইল সংযুক্ত]\n`;
         } else {
           message += `      📝 ${item.fieldName}: ${item.value}\n`;
         }
-      })
+      });
 
       message += `\n`;
     });
@@ -4731,7 +4746,7 @@ export async function sendDeliveryFile(
   caption?: string,
 ): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
-  
+
   console.log("=== WhatsApp API Debug ===");
   console.log("1. Input Parameters:");
   console.log("- to:", to);
@@ -4750,7 +4765,8 @@ export async function sendDeliveryFile(
 
   // Validate environment variables
   if (!PHONE_NUMBER_ID || !ACCESS_TOKEN) {
-    const error = "Missing WhatsApp API credentials. Check WA_PHONE_NUMBER_ID and WA_ACCESS_TOKEN.";
+    const error =
+      "Missing WhatsApp API credentials. Check WA_PHONE_NUMBER_ID and WA_ACCESS_TOKEN.";
     console.error("3. Validation Error:", error);
     throw new Error(error);
   }
@@ -4770,7 +4786,7 @@ export async function sendDeliveryFile(
   }
 
   const ext = fileName.toLowerCase().split(".").pop() || "";
-  
+
   let type: "image" | "document" = "document";
   let media: any = {};
 
@@ -4811,20 +4827,17 @@ export async function sendDeliveryFile(
 
   try {
     console.log("6. Making API request...");
-    const res = await fetch(
-      url,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
       },
-    );
+      body: JSON.stringify(payload),
+    });
 
     console.log("7. Response Status:", res.status, res.statusText);
-    
+
     const data = await res.json();
     console.log("8. Response Data:", JSON.stringify(data, null, 2));
 
@@ -4835,7 +4848,7 @@ export async function sendDeliveryFile(
       console.error("- Error:", data.error);
       console.error("- fbtrace_id:", data.error?.fbtrace_id);
       console.error("- Payload sent:", JSON.stringify(payload, null, 2));
-      
+
       let errorMessage = `WhatsApp API error (${res.status}): `;
       if (data?.error?.message) {
         errorMessage += data.error.message;
@@ -4844,14 +4857,14 @@ export async function sendDeliveryFile(
       } else {
         errorMessage += "Unknown error";
       }
-      
+
       throw new Error(errorMessage);
     }
 
     console.log("10. SUCCESS - Message sent!");
     console.log("- Message ID:", data.messages?.[0]?.id);
     console.log("- Contact WA ID:", data.contacts?.[0]?.wa_id);
-    
+
     return data;
   } catch (error) {
     console.error("11. CATCH BLOCK - Error occurred:");
@@ -4899,46 +4912,49 @@ export async function sendOrderDeliveryTemplate(
   invoiceNumber: string,
   documentUrl: string,
   documentFileName: string,
-  language = "en_US"
+  language = "en_US",
 ) {
-  const res = await fetch(`https://graph.facebook.com/v22.0/${CONFIG.phoneNumberId}/messages`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${CONFIG.accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      to,
-      type: "template",
-      template: {
-        name: "purchase_receipt",
-        language: { code: language },
-        components: [
-          {
-            type: "body",
-            parameters: [
-              { type: "text", text: productName },
-              { type: "text", text: storeName },
-              { type: "text", text: invoiceNumber },
-            ],
-          },
-          {
-            type: "header",
-            parameters: [
-              {
-                type: "document",
-                document: {
-                  link: documentUrl,
-                  filename: documentFileName,
-                },
-              },
-            ],
-          },
-        ],
+  const res = await fetch(
+    `https://graph.facebook.com/v22.0/${CONFIG.phoneNumberId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${CONFIG.accessToken}`,
+        "Content-Type": "application/json",
       },
-    }),
-  });
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to,
+        type: "template",
+        template: {
+          name: "purchase_receipt",
+          language: { code: language },
+          components: [
+            {
+              type: "body",
+              parameters: [
+                { type: "text", text: productName },
+                { type: "text", text: storeName },
+                { type: "text", text: invoiceNumber },
+              ],
+            },
+            {
+              type: "header",
+              parameters: [
+                {
+                  type: "document",
+                  document: {
+                    link: documentUrl,
+                    filename: documentFileName,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    },
+  );
 
   const data = await res.json();
 
@@ -5057,7 +5073,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
             await sendOrderDeliveryTemplate(
               user.whatsapp,
               updatedOrder.serviceName || "Service",
-              'Birth Help',
+              "Birth Help",
               orderId,
               publicUrl,
               deliveryData.fileName || "delivery_file",
