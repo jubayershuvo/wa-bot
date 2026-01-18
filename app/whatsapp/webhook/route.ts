@@ -217,7 +217,7 @@ class RateLimiter {
   }
 }
 
-const rateLimiter = new RateLimiter(10, 60000); // 10 requests per minute
+const rateLimiter = new RateLimiter(10, 10000); // 10 requests per second
 
 // --- TypeScript Interfaces ---
 interface WhatsAppMessage {
