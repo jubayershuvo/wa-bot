@@ -4456,7 +4456,7 @@ async function completeFailedOrCancelledOrder(phone: string): Promise<void> {
     await cancelFlow(phone, true);
   }
 }
-async function sendDeliveryFile(
+export async function sendDeliveryFile(
   to: string,
   fileUrl: string,
   fileName: string,
