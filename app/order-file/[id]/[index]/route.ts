@@ -30,7 +30,7 @@ export async function GET(
         ? data.filePath
         : null;
     const filePath = filePathFromPwd
-      ? path.resolve(process.cwd(), filePathFromPwd)
+      ? path.join(process.cwd(), filePathFromPwd)
       : null;
     if (!filePath) {
       return NextResponse.json(

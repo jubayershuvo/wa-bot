@@ -3958,6 +3958,15 @@ async function handleAdminViewOrders(phone: string): Promise<void> {
       message += `   👤: ${user?.name || "N/A"} (${user?.whatsapp || "N/A"})\n`;
       message += `   💰: ৳${order.totalPrice}\n`;
       message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
+      //add file or text info
+      order.serviceData.forEach((item: any,index:number) => {
+        if (item.type === "file") {
+          const publicUrl = `${process.env.NEXT_PUBLIC_URL}/order-file/${order._id}/${index}`;
+          message += `      📁 ${publicUrl}: [ফাইল সংযুক্ত]\n`;
+        } else {
+          message += `      📝 ${item.fieldName}: ${item.value}\n`;
+        }
+      })
     });
 
     const totalOrders = await Order.countDocuments();
