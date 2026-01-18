@@ -7111,6 +7111,17 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       const changes = entry?.changes?.[0];
       const value = changes?.value;
 
+      const inboundPhoneNumberId =
+        body?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id;
+
+      const allowed = new Set([
+        process.env.WA_PHONE_NUMBER_ID, // number B (Next bot handles)
+      ]);
+
+      if (inboundPhoneNumberId && !allowed.has(inboundPhoneNumberId)) {
+        return NextResponse.json({ status: "EVENT_RECEIVED" }); // ✅ ignore
+      }
+
       if (value?.messages && value.messages.length > 0) {
         const message = value.messages[0];
         const from = message.from;
