@@ -4892,7 +4892,62 @@ async function isUrlAccessible(fileUrl: string): Promise<boolean> {
     return false;
   }
 }
+export async function sendOrderDeliveryTemplate(
+  to: string,
+  productName: string,
+  storeName: string,
+  invoiceNumber: string,
+  documentUrl: string,
+  documentFileName: string,
+  language = "en_US"
+) {
+  const res = await fetch(`https://graph.facebook.com/v22.0/${CONFIG.phoneNumberId}/messages`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${CONFIG.accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "template",
+      template: {
+        name: "purchase_receipt",
+        language: { code: language },
+        components: [
+          {
+            type: "body",
+            parameters: [
+              { type: "text", text: productName },
+              { type: "text", text: storeName },
+              { type: "text", text: invoiceNumber },
+            ],
+          },
+          {
+            type: "header",
+            parameters: [
+              {
+                type: "document",
+                document: {
+                  link: documentUrl,
+                  filename: documentFileName,
+                },
+              },
+            ],
+          },
+        ],
+      },
+    }),
+  });
 
+  const data = await res.json();
+
+  if (!res.ok) {
+    throw new Error(`WhatsApp Delivery Error: ${JSON.stringify(data)}`);
+  }
+
+  return data;
+}
 // Updated completeOrderDelivery function to use sendDeliveryFile
 async function completeOrderDelivery(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
@@ -4999,12 +5054,13 @@ async function completeOrderDelivery(phone: string): Promise<void> {
             const fileCaption = `📦 ${updatedOrder.serviceName || "Service"} - Delivery File\n🆔 Order: ${orderId.slice(-8)}`;
 
             // Send the file using WhatsApp's media API
-            await sendDeliveryFile(
+            await sendOrderDeliveryTemplate(
               user.whatsapp,
+              updatedOrder.serviceName || "Service",
+              'Birth Help',
+              orderId,
               publicUrl,
-              deliveryData.fileName,
-              deliveryData.fileType,
-              fileCaption,
+              deliveryData.fileName || "delivery_file",
             );
 
             EnhancedLogger.info(
