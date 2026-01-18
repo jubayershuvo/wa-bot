@@ -1659,20 +1659,11 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
       const response = await axios.get(CONFIG.ubrnApiUrl, {
         params: { ubrn: trimmedUbrn },
-        headers: {
-          "User-Agent": "Birthhelp-Bot/1.0",
-          "Accept": "application/json",
-          "Content-Type": "application/json"
-        },
-        timeout: 30000, // 30 seconds timeout
-        validateStatus: function (status) {
-          return status < 500; // Reject only on server errors
-        }
       });
 
       const apiEndTime = Date.now();
       const apiDuration = apiEndTime - apiStartTime;
-      
+      console.log(response)
       EnhancedLogger.info(`UBRN API response received`, {
         ubrn: trimmedUbrn,
         status: response.status,
