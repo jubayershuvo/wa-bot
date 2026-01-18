@@ -4474,8 +4474,8 @@ async function sendDeliveryFile(
   console.log("- fileType:", fileType);
   console.log("- caption:", caption);
 
-  const PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;
-  const ACCESS_TOKEN = process.env.WA_ACCESS_TOKEN;
+  const PHONE_NUMBER_ID = CONFIG.phoneNumberId;
+  const ACCESS_TOKEN = CONFIG.accessToken;
 
   console.log("2. Environment Variables:");
   console.log("- PHONE_NUMBER_ID:", PHONE_NUMBER_ID ? "***SET***" : "MISSING!");
