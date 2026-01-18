@@ -4,10 +4,17 @@ export interface ServiceField {
   id: string;
   name: string;
   label: string;
-  type: "text" | "number" | "select" | "file";
-  description?: string;
-  options?: string[];
+  type: 'text' | 'number' | 'select' | 'file';
   required: boolean;
+  options?: string[];
+  description?: string;
+  placeholder?: string;
+  validation?: {
+    min?: number;
+    max?: number;
+    pattern?: string;
+    errorMessage?: string;
+  };
   createdAt: Date;
   updatedAt: Date;
 }
@@ -26,7 +33,7 @@ export interface IService extends Document {
   updatedAt: Date;
 }
 
-const ServiceFieldSchema = new Schema(
+const ServiceFieldSchema = new Schema<ServiceField>(
   {
     id: {
       type: String,
@@ -48,6 +55,18 @@ const ServiceFieldSchema = new Schema(
       enum: ["text", "number", "select", "file"],
       default: "text",
     },
+    description: {
+      type: String,
+      default: "",
+    },
+    placeholder: {
+      type: String,
+      default: "",
+    },
+    validation: {
+      type: Object,
+      default: {},
+    },
     options: {
       type: [String],
       default: undefined,
@@ -60,7 +79,7 @@ const ServiceFieldSchema = new Schema(
   { _id: false }
 );
 
-const ServiceSchema = new Schema(
+const ServiceSchema = new Schema<IService>(
   {
     name: {
       type: String,
@@ -87,6 +106,7 @@ const ServiceSchema = new Schema(
       default: true,
       index: true,
     },
+    
     instructions: {
       type: String,
       trim: true,
