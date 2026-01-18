@@ -1914,25 +1914,16 @@ async function askForServiceField(
     message += `${field.description}\n\n`;
   }
 
-  if (field.options && field.options.length > 0) {
-    message += `অপশনসমূহ:\n`;
-    field.options.forEach((option: string, index: number) => {
-      message += `${index + 1}. ${option}\n`;
-    });
-    message += `\nঅপশন নম্বর লিখুন (1-${field.options.length}):\n`;
-  } else if (field.type === "number") {
-    message += `সংখ্যা লিখুন:\n`;
-    if (field.validation?.min || field.validation?.max) {
-      message += `মিনিমাম: ${field.validation.min || 0}, ম্যাক্সিমাম: ${field.validation.max || 100000}\n`;
-    }
-  } else if (field.type === "file") {
-    message += `ফাইল আপলোড করুন (ছবি বা ডকুমেন্ট):\n`;
-    message += `সাপোর্টেড: ইমেজ (JPG, PNG), PDF, ডকুমেন্ট\n`;
-  } else {
-    message += `টেক্সট লিখুন:\n`;
+  if (field.type === "file") {
+    message += `📁 ফাইল আপলোড করুন:\n`;
+    message += `• ইমেজ (JPG, PNG)\n`;
+    message += `• PDF বা ডকুমেন্ট\n\n`;
+    message += `দয়া করে ফাইল পাঠান...`;
+  } else if (field.type === "text") {
+    message += `টেক্সট লিখুন:`;
   }
 
-  message += `\n🚫 বাতিল করতে 'cancel' লিখুন`;
+  message += `\n\n🚫 বাতিল করতে 'cancel' লিখুন`;
 
   await sendTextWithCancelButton(formattedPhone, message);
 }
@@ -1952,32 +1943,29 @@ async function askForServiceConfirmation(
 
   if (Object.keys(collectedData).length > 0) {
     message += `📋 প্রদত্ত তথ্য:\n`;
-    service.requiredFields?.forEach((field: ServiceField) => {
-      const value = collectedData[field.name] || "শূন্য";
-      message += `• ${field.label}: ${value}\n`;
-    });
+    for (const [fieldName, fieldData] of Object.entries(collectedData)) {
+      const field = service.requiredFields?.find((f) => f.name === fieldName);
+      if (field) {
+        if (field.type === "file") {
+          message += `• ${field.label}: 📁 ফাইল আপলোড করা হয়েছে\n`;
+        } else {
+          message += `• ${field.label}: ${fieldData.data || "শূন্য"}\n`;
+        }
+      }
+    }
     message += `\n`;
   }
 
-  if (service.instructions) {
-    message += `📝 নির্দেশনা: ${service.instructions}\n\n`;
-  }
-
   message += `✅ অর্ডার কনফার্ম করতে 'confirm' লিখুন\n`;
-
-  // Only show edit option if there are fields
-  if (service.requiredFields && service.requiredFields.length > 0) {
-    message += `✏️ তথ্য পরিবর্তন করতে 'edit' লিখুন\n`;
-  }
-
+  message += `✏️ তথ্য পরিবর্তন করতে 'edit' লিখুন\n`;
   message += `🚫 বাতিল করতে 'cancel' লিখুন`;
 
-  // Update state to show we're awaiting confirmation
+  // Update state to awaiting confirmation
   await stateManager.updateStateData(formattedPhone, {
     serviceOrder: {
       ...serviceOrderData,
     },
-    currentState: "awaiting_service_confirmation", // Add this state
+    currentState: "awaiting_service_confirmation",
   });
 
   await sendTextWithCancelButton(formattedPhone, message);
@@ -2003,7 +1991,7 @@ async function handleUserFileUpload(
     if (message.type === "image" || message.type === "document") {
       const mediaId =
         message.type === "image" ? message.image?.id : message.document?.id;
-      const fileName =
+      const originalFileName =
         message.type === "image"
           ? `user_${formattedPhone}_${Date.now()}.jpg`
           : message.document?.filename ||
@@ -2026,59 +2014,37 @@ async function handleUserFileUpload(
         );
       }
 
-      EnhancedLogger.info(`User media downloaded, uploading to server`, {
-        fileName,
-        fileSize: buffer.length,
-        mimeType,
-      });
-
-      // Create user-specific upload directory
-      const userUploadsDir = path.join(
-        process.cwd(),
-        "uploads",
-        "users",
-        formattedPhone,
-      );
-
-      if (!fs.existsSync(userUploadsDir)) {
-        EnhancedLogger.info(
-          `Creating user upload directory: ${userUploadsDir}`,
-        );
-        fs.mkdirSync(userUploadsDir, { recursive: true });
+      // Create uploads directory structure
+      const uploadsDir = path.join(process.cwd(), "uploads", "orders");
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
       }
 
       // Generate unique filename
       const fileExt =
-        path.extname(fileName) ||
-        (mimeType.includes("image") ? ".jpg" : ".bin");
+        path.extname(originalFileName) ||
+        (mimeType.includes("image")
+          ? ".jpg"
+          : mimeType.includes("pdf")
+            ? ".pdf"
+            : mimeType.includes("word")
+              ? ".docx"
+              : ".bin");
+
       const uniqueFileName = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}${fileExt}`;
-      const filePath = path.join(userUploadsDir, uniqueFileName);
+      const filePath = path.join(uploadsDir, uniqueFileName);
 
-      EnhancedLogger.info(`Saving user file to: ${filePath}`);
-
-      // Save file to disk
+      // Save file
       fs.writeFileSync(filePath, buffer);
 
-      // Verify file was saved
-      if (!fs.existsSync(filePath)) {
-        throw new Error(`Failed to save file to ${filePath}`);
-      }
+      // Create public URL path
+      const publicPath = `/uploads/orders/${uniqueFileName}`;
 
-      const stats = fs.statSync(filePath);
-      const fileSize = formatFileSize(stats.size);
-
-      EnhancedLogger.info(`User file saved successfully`, {
-        filePath,
-        fileSize: stats.size,
-        savedSize: buffer.length,
-      });
-
-      // Return file information
       return {
-        fileUrl: filePath, // You might want to store relative path or URL
-        fileName: uniqueFileName,
+        fileUrl: publicPath, // This will be stored in the database
+        fileName: originalFileName,
         fileType: mimeType,
-        fileSize: fileSize,
+        fileSize: formatFileSize(buffer.length),
       };
     } else {
       throw new Error(
@@ -2149,9 +2115,9 @@ async function handleServiceFieldInput(
     }
 
     const field = service.requiredFields[fieldIndex];
-    let fieldValue: string = "";
+    let fieldValue: any = null;
 
-    // Check if file is uploaded for file type fields
+    // Handle file upload for file type fields
     if (field.type === "file" && (message?.image || message?.document)) {
       try {
         await sendTextMessage(
@@ -2163,7 +2129,14 @@ async function handleServiceFieldInput(
         const fileData = await handleUserFileUpload(formattedPhone, message);
 
         if (fileData) {
-          fieldValue = fileData.fileUrl; // Store file path/URL
+          // Store file information
+          fieldValue = {
+            fileName: fileData.fileName,
+            filePath: fileData.fileUrl, // Server path
+            fileType: fileData.fileType,
+            fileSize: fileData.fileSize,
+            uploadedAt: new Date().toISOString(),
+          };
 
           await sendTextMessage(
             formattedPhone,
@@ -2184,79 +2157,34 @@ async function handleServiceFieldInput(
         );
         return;
       }
-    } else {
-      // Handle text input for non-file fields
+    } else if (field.type === "text") {
+      // Handle text input
       fieldValue = input.trim();
 
-      // Handle option selection for select type fields
-      if (
-        field.type === "select" &&
-        field.options &&
-        field.options.length > 0
-      ) {
-        const optionIndex = parseInt(fieldValue) - 1;
-        if (optionIndex >= 0 && optionIndex < field.options.length) {
-          fieldValue = field.options[optionIndex];
-        } else {
-          // Check if input matches one of the options directly
-          const matchedOption = field.options.find(
-            (opt: string) => opt.toLowerCase() === fieldValue.toLowerCase(),
-          );
-          if (matchedOption) {
-            fieldValue = matchedOption;
-          } else {
-            await sendTextMessage(
-              formattedPhone,
-              `❌ দয়া করে একটি বৈধ অপশন সিলেক্ট করুন:\n\n${field.options.map((opt: string, idx: number) => `${idx + 1}. ${opt}`).join("\n")}\n\nঅথবা সরাসরি অপশন লিখুন।`,
-            );
-            return;
-          }
-        }
-      }
-
-      // Validate number fields
-      if (field.type === "number") {
-        const numValue = parseFloat(fieldValue);
-        if (isNaN(numValue)) {
-          await sendTextMessage(
-            formattedPhone,
-            "❌ দয়া করে একটি বৈধ সংখ্যা লিখুন।",
-          );
-          return;
-        }
-
-        if (field.validation?.min && numValue < field.validation.min) {
-          await sendTextMessage(
-            formattedPhone,
-            `❌ সংখ্যাটি কমপক্ষে ${field.validation.min} হতে হবে।`,
-          );
-          return;
-        }
-
-        if (field.validation?.max && numValue > field.validation.max) {
-          await sendTextMessage(
-            formattedPhone,
-            `❌ সংখ্যাটি সর্বোচ্চ ${field.validation.max} হতে পারে।`,
-          );
-          return;
-        }
-
-        fieldValue = numValue.toString();
-      }
-
-      // Validate required field
       if (field.required && !fieldValue) {
         await sendTextMessage(
           formattedPhone,
-          "❌ এই ফিল্ডটি প্রয়োজনীয়। দয়া করে মান দিন।",
+          `❌ '${field.label}' প্রয়োজনীয়। দয়া করে মান দিন।`,
         );
         return;
       }
+    } else {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ '${field.label}' ফিল্ডের জন্য সঠিক ইনপুট দিন।`,
+      );
+      return;
     }
 
     // Store collected data
     const collectedData = serviceOrderData.collectedData || {};
-    collectedData[field.name] = fieldValue;
+
+    // Store field data in the format needed for Order model
+    collectedData[field.name] = {
+      label: field.label,
+      type: field.type,
+      data: fieldValue, // This will be either text string or file object
+    };
 
     // Update state
     fieldIndex++;
@@ -2419,30 +2347,20 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       }
     }
 
-    // Process file metadata - convert file paths to URLs
-    const processedServiceData: Record<string, any> = {};
+    // Process collected data for storage
+    const processedServiceData: any[] = [];
     if (serviceOrderData.collectedData) {
-      for (const [key, value] of Object.entries(
+      for (const [fieldName, fieldData] of Object.entries(
         serviceOrderData.collectedData,
       )) {
-        const field = service.requiredFields?.find((f) => f.name === key);
-        if (field?.type === "file" && value && typeof value === "string") {
-          // Convert file path to accessible URL
-          if (value.startsWith("/")) {
-            // Extract filename from path
-            const filename = path.basename(value);
-            // Create URL for the file
-            processedServiceData[key] = {
-              fileUrl: `/api/files/users/${formattedPhone}/${filename}`,
-              originalName: filename,
-              uploadedAt: new Date().toISOString(),
-              fieldLabel: field.label,
-            };
-          } else {
-            processedServiceData[key] = value;
-          }
-        } else {
-          processedServiceData[key] = value;
+        const field = service.requiredFields?.find((f) => f.name === fieldName);
+        if (field) {
+          processedServiceData.push({
+            field: fieldName,
+            label: field.label,
+            type: field.type,
+            data: fieldData.data, // This contains either text or file information
+          });
         }
       }
     }
@@ -2466,7 +2384,7 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       createdAt: new Date(),
     });
 
-    // CREATE ORDER FOR REGULAR SERVICE
+    // CREATE ORDER
     const order = await Order.create({
       orderId: `ORD-${Date.now()}`,
       userId: user._id,
@@ -2475,37 +2393,30 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       quantity: 1,
       unitPrice: serviceOrderData.price,
       totalPrice: serviceOrderData.price,
-      serviceData: processedServiceData, // Use processed data with file URLs
+      serviceData: processedServiceData, // Store all field data here
       status: "pending",
       transactionId: transaction._id,
       placedAt: new Date(),
       createdAt: new Date(),
     });
 
-    // Update service statistic
-
     await sendTextMessage(
       formattedPhone,
       `✅ *অর্ডার সফল*\n\n📦 সার্ভিস: ${service.name}\n🆔 অর্ডার আইডি: ${order._id}\n💰 খরচ: ৳${serviceOrderData.price}\n🆕 ব্যালেন্স: ৳${user.balance}\n📅 সময়: ${new Date().toLocaleString()}\n\n🎉 আপনার অর্ডারটি সফলভাবে প্লেস করা হয়েছে!\n\nআমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
     );
 
-    await notifyAdmin(
-      `🛒 নতুন অর্ডার\n\nব্যবহারকারী: ${formattedPhone}\nনাম: ${user.name}\nঅর্ডার আইডি: ${order._id}\nসার্ভিস: ${service.name}\nমূল্য: ৳${serviceOrderData.price}\nইউজার ব্যালেন্স: ৳${user.balance}\n\n📋 *প্রদত্ত তথ্য:*\n${Object.entries(
-        processedServiceData,
-      )
-        .map(([key, value]) => {
-          const field = service.requiredFields?.find((f) => f.name === key);
-          const label = field?.label || key;
-          let displayValue = value;
+    // Notify admin with field details
+    let adminMessage = `🛒 নতুন অর্ডার\n\nব্যবহারকারী: ${formattedPhone}\nনাম: ${user.name}\nঅর্ডার আইডি: ${order._id}\nসার্ভিস: ${service.name}\nমূল্য: ৳${serviceOrderData.price}\nইউজার ব্যালেন্স: ৳${user.balance}\n\n📋 *প্রদত্ত তথ্য:*\n`;
 
-          if (typeof value === "object" && value.fileUrl) {
-            displayValue = `📁 ফাইল (${value.originalName})`;
-          }
+    processedServiceData.forEach((fieldData: any) => {
+      if (fieldData.type === "file") {
+        adminMessage += `• ${fieldData.label}: 📁 ফাইল আপলোড করা হয়েছে\n`;
+      } else {
+        adminMessage += `• ${fieldData.label}: ${fieldData.data}\n`;
+      }
+    });
 
-          return `• ${label}: ${displayValue}`;
-        })
-        .join("\n")}`,
-    );
+    await notifyAdmin(adminMessage);
 
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
@@ -2516,7 +2427,7 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       serviceName: serviceOrderData.serviceName,
       price: serviceOrderData.price,
       newBalance: user.balance,
-      collectedData: processedServiceData,
+      fieldCount: processedServiceData.length,
     });
   } catch (err) {
     EnhancedLogger.error(
@@ -2889,7 +2800,7 @@ async function handleAdminAddServiceStep(
 
         await sendTextWithCancelButton(
           phone,
-          "📝 *সার্ভিসের বিবরণ লিখুন*\n\nসার্ভিসটি সম্পর্কে সংক্ষিপ্ত বিবরণ দিন:\n\nউদাহরণ: 'পেশাদার গ্রাফিক ডিজাইন সার্ভিস'",
+          "📝 *সার্ভিসের বিবরণ লিখুন*\n\nসার্ভিসটি সম্পর্কে সংক্ষিপ্ত বিবরণ দিন:",
         );
         break;
 
@@ -2911,7 +2822,7 @@ async function handleAdminAddServiceStep(
 
         await sendTextWithCancelButton(
           phone,
-          "💰 *সার্ভিসের মূল্য লিখুন*\n\nসার্ভিসের মূল্য টাকায় লিখুন:\n\nউদাহরণ: 100\n\n📌 শুধু সংখ্যা লিখুন (দশমিক চিহ্ন ছাড়া)",
+          "💰 *সার্ভিসের মূল্য লিখুন*\n\nসার্ভিসের মূল্য টাকায় লিখুন:\n\nউদাহরণ: 100",
         );
         break;
 
@@ -2937,7 +2848,7 @@ async function handleAdminAddServiceStep(
 
         await sendTextWithCancelButton(
           phone,
-          "📋 *সার্ভিস নির্দেশনা লিখুন*\n\nগ্রাহকদের জন্য নির্দেশনা লিখুন:\n\nউদাহরণ: 'আপনার ডিজাইন তথ্য পাঠান'\n\nস্কিপ করতে 'skip' লিখুন",
+          "📋 *সার্ভিস নির্দেশনা লিখুন*\n\nগ্রাহকদের জন্য নির্দেশনা লিখুন:\n\nস্কিপ করতে 'skip' লিখুন",
         );
         break;
 
@@ -2969,232 +2880,160 @@ async function handleAdminAddServiceStep(
             adminAddService: {
               step: 6,
               serviceData: state?.data?.adminAddService?.serviceData,
-              fieldStep: 1,
+              fieldStep: 1, // Start field creation at step 1
             },
           });
 
           await sendTextWithCancelButton(
             phone,
-            "📝 *প্রথম ফিল্ডের নাম লিখুন*\n\nফিল্ডের নাম লিখুন (ইংরেজিতে, স্পেস ছাড়া):\n\nউদাহরণ: 'full_name'\n\n📌 নামটি ছোট, পরিষ্কার এবং বুঝতে সহজ হোক",
+            "📝 *প্রথম ফিল্ডের নাম লিখুন*\n\nফিল্ডের অভ্যন্তরীণ নাম লিখুন (ইংরেজিতে, স্পেস ছাড়া):\n\nউদাহরণ: 'full_name', 'document_file'",
           );
         } else {
           await finalizeServiceCreation(phone);
         }
         break;
 
-      // In the case 6: Field Name Step section, fix the field creation logic:
-      case 6: // Field Name Step
-        const fieldStep = state?.data?.adminAddService?.fieldStep || 1;
+      case 6: // Field Name
+        if (!input.trim()) {
+          await sendTextMessage(phone, "❌ দয়া করে একটি ফিল্ড নাম লিখুন!");
+          return;
+        }
 
-        if (fieldStep === 1) {
-          // Field Name
-          const fieldName = input.toLowerCase().replace(/[^a-z0-9_]/g, "_");
-          if (!fieldName || fieldName.length < 2) {
-            await sendTextMessage(
-              phone,
-              "❌ দয়া করে একটি বৈধ ফিল্ড নাম লিখুন! (স্পেস ছাড়া, শুধুমাত্র a-z, 0-9, _)",
-            );
-            return;
-          }
+        const fieldName = input.trim().toLowerCase().replace(/\s+/g, "_");
 
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            ...state?.data?.adminAddService,
+            currentField: {
+              name: fieldName,
+            },
+            fieldStep: 2,
+          },
+        });
+
+        await sendTextWithCancelButton(
+          phone,
+          `📝 *ফিল্ডের লেবেল লিখুন*\n\nফিল্ডের লেবেল লিখুন (ব্যবহারকারী দেখবে):\n\nউদাহরণ: 'আপনার পূর্ণ নাম', 'ডকুমেন্ট আপলোড করুন'`,
+        );
+        break;
+
+      case 7: // Field Label
+        if (!input.trim()) {
+          await sendTextMessage(phone, "❌ দয়া করে একটি লেবেল লিখুন!");
+          return;
+        }
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            ...state?.data?.adminAddService,
+            currentField: {
+              ...state?.data?.adminAddService?.currentField,
+              label: input.trim(),
+            },
+            fieldStep: 3,
+          },
+        });
+
+        await sendQuickReplyMenu(
+          phone,
+          "📋 ফিল্ডের ধরন\n\nফিল্ডের ধরন সিলেক্ট করুন:",
+          [
+            { id: "field_type_text", title: "📝 টেক্সট" },
+            { id: "field_type_file", title: "📁 ফাইল" },
+          ],
+        );
+        break;
+
+      case 8: // Field Type
+        let fieldType: "text" | "file" = "text";
+        if (input === "field_type_file") {
+          fieldType = "file";
+        }
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            ...state?.data?.adminAddService,
+            currentField: {
+              ...state?.data?.adminAddService?.currentField,
+              type: fieldType,
+            },
+            fieldStep: 4,
+          },
+        });
+
+        await sendQuickReplyMenu(
+          phone,
+          "📋 প্রয়োজনীয়তা\n\nফিল্ডটি কি প্রয়োজনীয়?",
+          [
+            { id: "field_required_yes", title: "✅ প্রয়োজনীয়" },
+            { id: "field_required_no", title: "➡️ ঐচ্ছিক" },
+          ],
+        );
+        break;
+
+      case 9: // Field Required
+        const required = input === "field_required_yes";
+        const currentField = state?.data?.adminAddService?.currentField;
+
+        if (!currentField) {
+          throw new Error("Current field not found");
+        }
+
+        const completedField: ServiceField = {
+          id: `field_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          name: currentField.name || "",
+          label: currentField.label || "",
+          type: currentField.type || "text",
+          required: required,
+          description: "",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const serviceData = state?.data?.adminAddService?.serviceData;
+        const updatedFields = [
+          ...(serviceData?.requiredFields || []),
+          completedField,
+        ];
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            step: 10,
+            serviceData: {
+              ...serviceData,
+              requiredFields: updatedFields,
+            },
+            fieldStep: undefined,
+            currentField: undefined,
+          },
+        });
+
+        await sendQuickReplyMenu(
+          phone,
+          `✅ ফিল্ড যোগ করা হয়েছে\n\nফিল্ড: ${completedField.label}\nটাইপ: ${completedField.type}\nপ্রয়োজনীয়: ${completedField.required ? "হ্যাঁ" : "না"}\n\nআরেকটি ফিল্ড যোগ করবেন?`,
+          [
+            { id: "add_more_fields", title: "➕ আরেকটি যোগ করুন" },
+            { id: "finish_fields", title: "✅ শেষ করুন" },
+          ],
+        );
+        break;
+
+      case 10: // Add More Fields or Finish
+        if (input === "add_more_fields") {
           await stateManager.updateStateData(formattedPhone, {
             adminAddService: {
               ...state?.data?.adminAddService,
-              currentField: {
-                name: fieldName,
-                label: "",
-                type: "text" as const,
-                required: true,
-              },
-              fieldStep: 2,
+              step: 6, // Go back to field name step
+              fieldStep: 1,
             },
           });
 
           await sendTextWithCancelButton(
             phone,
-            "📝 *ফিল্ডের লেবেল লিখুন*\n\nফিল্ডের লেবেল লিখুন (ব্যবহারকারী দেখবে):\n\nউদাহরণ: 'আপনার পূর্ণ নাম'\n\n📌 লেবেলটি পরিষ্কার ও বর্ণনামূলক হোক",
+            "📝 *পরবর্তী ফিল্ডের নাম লিখুন*\n\nফিল্ডের অভ্যন্তরীণ নাম লিখুন (ইংরেজিতে, স্পেস ছাড়া):",
           );
-        } else if (fieldStep === 2) {
-          // Field Label
-          if (!input.trim()) {
-            await sendTextMessage(phone, "❌ দয়া করে একটি লেবেল লিখুন!");
-            return;
-          }
-
-          await stateManager.updateStateData(formattedPhone, {
-            adminAddService: {
-              ...state?.data?.adminAddService,
-              currentField: {
-                ...state?.data?.adminAddService?.currentField,
-                label: input.trim(),
-              },
-              fieldStep: 3,
-            },
-          });
-
-          await sendQuickReplyMenu(
-            phone,
-            "📋 ফিল্ডের ধরন\n\nফিল্ডের ধরন সিলেক্ট করুন:",
-            [
-              { id: "field_text", title: "📝 টেক্সট" },
-              { id: "field_number", title: "🔢 নাম্বার" },
-              { id: "field_select", title: "📋 সিলেক্ট অপশন" },
-              { id: "field_file", title: "📁 ফাইল" },
-            ],
-          );
-        } else if (fieldStep === 3) {
-          // Field Type
-          const fieldType =
-            input === "field_text"
-              ? "text"
-              : input === "field_number"
-                ? "number"
-                : input === "field_select"
-                  ? "select"
-                  : "file";
-
-          await stateManager.updateStateData(formattedPhone, {
-            adminAddService: {
-              ...state?.data?.adminAddService,
-              currentField: {
-                ...state?.data?.adminAddService?.currentField,
-                type: fieldType,
-              },
-              fieldStep: fieldType === "select" ? 4 : 5,
-            },
-          });
-
-          if (fieldType === "select") {
-            await sendTextWithCancelButton(
-              phone,
-              "📋 *অপশনসমূহ লিখুন*\n\nঅপশনগুলো কমা (,) দিয়ে আলাদা করে লিখুন:\n\nউদাহরণ: 'ছোট, মধ্যম, বড়'\n\n📌 কমপক্ষে ২টি অপশন দিন",
-            );
-          } else if (fieldType === "number") {
-            await sendTextWithCancelButton(
-              phone,
-              "🔢 *সংখ্যা সীমা নির্ধারণ*\n\nমিনিমাম এবং ম্যাক্সিমাম সংখ্যা নির্ধারণ করুন:\n\nফরম্যাট: min,max\nউদাহরণ: 0,100\n\nস্কিপ করতে 'skip' লিখুন",
-            );
-          } else {
-            await sendQuickReplyMenu(
-              phone,
-              "📋 প্রয়োজনীয়তা\n\nফিল্ডটি কি প্রয়োজনীয়?",
-              [
-                { id: "required_yes", title: "✅ প্রয়োজনীয়" },
-                { id: "required_no", title: "➡️ ঐচ্ছিক" },
-              ],
-            );
-          }
-        } else if (fieldStep === 4) {
-          // Select Options
-          if (input.toLowerCase() === "skip") {
-            await stateManager.updateStateData(formattedPhone, {
-              adminAddService: {
-                ...state?.data?.adminAddService,
-                currentField: {
-                  ...state?.data?.adminAddService?.currentField,
-                  options: [],
-                },
-                fieldStep: 5,
-              },
-            });
-
-            await sendQuickReplyMenu(
-              phone,
-              "📋 প্রয়োজনীয়তা\n\nফিল্ডটি কি প্রয়োজনীয়?",
-              [
-                { id: "required_yes", title: "✅ প্রয়োজনীয়" },
-                { id: "required_no", title: "➡️ ঐচ্ছিক" },
-              ],
-            );
-          } else {
-            const options = input
-              .split(",")
-              .map((opt) => opt.trim())
-              .filter((opt) => opt.length > 0);
-
-            if (options.length < 2) {
-              await sendTextMessage(phone, "❌ কমপক্ষে ২টি অপশন দিন!");
-              return;
-            }
-
-            await stateManager.updateStateData(formattedPhone, {
-              adminAddService: {
-                ...state?.data?.adminAddService,
-                currentField: {
-                  ...state?.data?.adminAddService?.currentField,
-                  options: options,
-                },
-                fieldStep: 5,
-              },
-            });
-
-            await sendQuickReplyMenu(
-              phone,
-              "📋 প্রয়োজনীয়তা\n\nফিল্ডটি কি প্রয়োজনীয়?",
-              [
-                { id: "required_yes", title: "✅ প্রয়োজনীয়" },
-                { id: "required_no", title: "➡️ ঐচ্ছিক" },
-              ],
-            );
-          }
-        } else if (fieldStep === 5) {
-          // Required or not
-          const required = input === "required_yes";
-          const currentField = state?.data?.adminAddService?.currentField;
-
-          if (!currentField) {
-            throw new Error("Current field not found");
-          }
-
-          // Create validation object if number type
-          let validation;
-          if (currentField.type === "number" && input.includes(",")) {
-            const [minStr, maxStr] = input.split(",");
-            const min = parseInt(minStr.trim());
-            const max = parseInt(maxStr.trim());
-            if (!isNaN(min) && !isNaN(max)) {
-              validation = { min, max };
-            }
-          }
-
-          const completedField: ServiceField = {
-            id: `field_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-            name: currentField.name || "",
-            label: currentField.label || "",
-            type: currentField.type || "text",
-            required: required,
-            options: currentField.options,
-            validation: validation,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          };
-
-          const serviceData = state?.data?.adminAddService?.serviceData;
-          const updatedFields = [
-            ...(serviceData?.requiredFields || []),
-            completedField,
-          ];
-
-          await stateManager.updateStateData(formattedPhone, {
-            adminAddService: {
-              step: 7,
-              serviceData: {
-                ...serviceData,
-                requiredFields: updatedFields,
-              },
-              fieldStep: 1,
-              currentField: undefined,
-            },
-          });
-
-          await sendQuickReplyMenu(
-            phone,
-            `📋 ফিল্ড যোগ করা হয়েছে\n\nফিল্ড: ${completedField.label}\nটাইপ: ${completedField.type}\nপ্রয়োজনীয়: ${completedField.required ? "হ্যাঁ" : "না"}\n\nআরেকটি ফিল্ড যোগ করবেন?`,
-            [
-              { id: "add_more_fields", title: "➕ আরেকটি যোগ করুন" },
-              { id: "finish_fields", title: "✅ শেষ করুন" },
-            ],
-          );
+        } else {
+          await finalizeServiceCreation(phone);
         }
         break;
 

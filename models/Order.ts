@@ -1,11 +1,11 @@
 import mongoose, { Schema, Document, Model, Types } from "mongoose";
 
 // Order Status Types
-export type OrderStatus = 
-  | "pending" 
-  | "processing" 
-  | "completed" 
-  | "failed" 
+export type OrderStatus =
+  | "pending"
+  | "processing"
+  | "completed"
+  | "failed"
   | "cancelled";
 
 // Delivery Data Interface
@@ -36,17 +36,24 @@ export interface IOrder extends Document {
   quantity: number;
   unitPrice: number;
   totalPrice: number;
-  serviceData: Record<string, any>; // Data collected from service fields
+  serviceData: [
+    {
+      field: string; // Field name (e.g., "full_name")
+      label: string; // User-facing label
+      type: string; // "text" or "file"
+      data: Schema.Types.Mixed; // Can be string (for text) or object (for file)
+    },
+  ]; // Data collected from service fields
   status: OrderStatus;
   deliveryData?: DeliveryData;
   cancellationData?: CancellationData;
   notes?: string;
   transactionId?: Types.ObjectId;
-  
+
   // Admin fields
   assignedTo?: string; // Admin assigned to process order
   priority: "low" | "medium" | "high";
-  
+
   // Timestamps
   placedAt: Date;
   processedAt?: Date;
@@ -56,22 +63,28 @@ export interface IOrder extends Document {
 }
 
 // Order Schema
-const DeliveryDataSchema = new Schema<DeliveryData>({
-  deliveredAt: Date,
-  deliveryMethod: String,
-  text: String,
-  fileUrl: String,
-  fileName: String,
-  fileType: String,
-  deliveryType: String,
-  deliveredBy: String,
-}, { _id: false });
+const DeliveryDataSchema = new Schema<DeliveryData>(
+  {
+    deliveredAt: Date,
+    deliveryMethod: String,
+    text: String,
+    fileUrl: String,
+    fileName: String,
+    fileType: String,
+    deliveryType: String,
+    deliveredBy: String,
+  },
+  { _id: false },
+);
 
-const CancellationDataSchema = new Schema<CancellationData>({
-  cancelledAt: Date,
-  reason: String,
-  cancelledBy: String,
-}, { _id: false });
+const CancellationDataSchema = new Schema<CancellationData>(
+  {
+    cancelledAt: Date,
+    reason: String,
+    cancelledBy: String,
+  },
+  { _id: false },
+);
 
 const OrderSchema = new Schema<IOrder>(
   {
@@ -80,7 +93,8 @@ const OrderSchema = new Schema<IOrder>(
       required: [true, "Order ID is required"],
       unique: true,
       index: true,
-      default: () => `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
+      default: () =>
+        `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
     },
     userId: {
       type: Schema.Types.ObjectId,
@@ -115,11 +129,14 @@ const OrderSchema = new Schema<IOrder>(
       required: [true, "Total price is required"],
       min: [1, "Total price must be at least 1"],
     },
-    serviceData: {
-      type: Schema.Types.Mixed,
-      required: true,
-      default: {},
-    },
+    serviceData: [
+      {
+        field: String, // Field name (e.g., "full_name")
+        label: String, // User-facing label
+        type: String, // "text" or "file"
+        data: Schema.Types.Mixed, // Can be string (for text) or object (for file)
+      },
+    ],
     status: {
       type: String,
       required: true,
@@ -138,7 +155,7 @@ const OrderSchema = new Schema<IOrder>(
       ref: "Transaction",
       index: true,
     },
-    
+
     // Admin fields
     assignedTo: {
       type: String,
@@ -149,7 +166,7 @@ const OrderSchema = new Schema<IOrder>(
       enum: ["low", "medium", "high"],
       default: "medium",
     },
-    
+
     // Timestamps
     placedAt: {
       type: Date,
@@ -162,7 +179,7 @@ const OrderSchema = new Schema<IOrder>(
     timestamps: true, // Adds createdAt and updatedAt automatically
     toJSON: { virtuals: true },
     toObject: { virtuals: true },
-  }
+  },
 );
 
 // Indexes for better query performance
@@ -215,10 +232,10 @@ OrderSchema.pre("save", function (next) {
   if (!this.totalPrice) {
     this.totalPrice = this.unitPrice * this.quantity;
   }
-  
+
   // Update timestamps based on status
   const now = new Date();
-  
+
   if (this.isModified("status")) {
     switch (this.status) {
       case "processing":
@@ -242,12 +259,12 @@ OrderSchema.pre("save", function (next) {
         break;
     }
   }
-  
+
   // Set delivery timestamp if delivery data is added
   if (this.deliveryData && !this.deliveryData.deliveredAt) {
     this.deliveryData.deliveredAt = now;
   }
-  
+
   this.save();
 });
 
@@ -256,7 +273,9 @@ OrderSchema.statics.findByUserId = function (userId: string | Types.ObjectId) {
   return this.find({ userId }).sort({ createdAt: -1 });
 };
 
-OrderSchema.statics.findByServiceId = function (serviceId: string | Types.ObjectId) {
+OrderSchema.statics.findByServiceId = function (
+  serviceId: string | Types.ObjectId,
+) {
   return this.find({ serviceId }).sort({ createdAt: -1 });
 };
 
@@ -268,23 +287,25 @@ OrderSchema.statics.findCompletedOrders = function () {
   return this.find({ status: "completed" });
 };
 
-OrderSchema.statics.findByStatus = function (status: OrderStatus | OrderStatus[]) {
+OrderSchema.statics.findByStatus = function (
+  status: OrderStatus | OrderStatus[],
+) {
   const statuses = Array.isArray(status) ? status : [status];
   return this.find({ status: { $in: statuses } });
 };
 
 OrderSchema.statics.getRevenueStats = async function (
   startDate?: Date,
-  endDate?: Date
+  endDate?: Date,
 ) {
   const match: any = { status: "completed" };
-  
+
   if (startDate || endDate) {
     match.placedAt = {};
     if (startDate) match.placedAt.$gte = startDate;
     if (endDate) match.placedAt.$lte = endDate;
   }
-  
+
   return this.aggregate([
     { $match: match },
     {
@@ -308,7 +329,9 @@ OrderSchema.methods.markAsProcessing = async function (assignedTo?: string) {
   return this.save();
 };
 
-OrderSchema.methods.markAsCompleted = async function (deliveryData?: DeliveryData) {
+OrderSchema.methods.markAsCompleted = async function (
+  deliveryData?: DeliveryData,
+) {
   this.status = "completed";
   this.completedAt = new Date();
   if (deliveryData) {
@@ -317,7 +340,10 @@ OrderSchema.methods.markAsCompleted = async function (deliveryData?: DeliveryDat
   return this.save();
 };
 
-OrderSchema.methods.markAsFailed = async function (reason?: string, cancelledBy?: string) {
+OrderSchema.methods.markAsFailed = async function (
+  reason?: string,
+  cancelledBy?: string,
+) {
   this.status = "failed";
   this.cancellationData = {
     cancelledAt: new Date(),
@@ -327,7 +353,10 @@ OrderSchema.methods.markAsFailed = async function (reason?: string, cancelledBy?
   return this.save();
 };
 
-OrderSchema.methods.markAsCancelled = async function (reason?: string, cancelledBy?: string) {
+OrderSchema.methods.markAsCancelled = async function (
+  reason?: string,
+  cancelledBy?: string,
+) {
   this.status = "cancelled";
   this.cancellationData = {
     cancelledAt: new Date(),
@@ -337,7 +366,9 @@ OrderSchema.methods.markAsCancelled = async function (reason?: string, cancelled
   return this.save();
 };
 
-OrderSchema.methods.updateDelivery = async function (deliveryData: DeliveryData) {
+OrderSchema.methods.updateDelivery = async function (
+  deliveryData: DeliveryData,
+) {
   this.deliveryData = {
     ...this.deliveryData,
     ...deliveryData,
@@ -352,6 +383,7 @@ OrderSchema.methods.addNote = async function (note: string) {
 };
 
 // Create and export the model
-const Order: Model<IOrder> = mongoose.models.Order || mongoose.model<IOrder>("Order", OrderSchema);
+const Order: Model<IOrder> =
+  mongoose.models.Order || mongoose.model<IOrder>("Order", OrderSchema);
 
 export default Order;
