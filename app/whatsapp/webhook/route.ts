@@ -4682,27 +4682,27 @@ async function completeOrderDelivery(phone: string): Promise<void> {
         });
 
         if (isAccessible) {
-          try {
-            // Create caption for the file
-            const fileCaption = `📦 ${updatedOrder.serviceName || "Service"} - Delivery File\n🆔 Order: ${orderId.slice(-8)}`;
+          // try {
+          //   // Create caption for the file
+          //   const fileCaption = `📦 ${updatedOrder.serviceName || "Service"} - Delivery File\n🆔 Order: ${orderId.slice(-8)}`;
 
-            // Send the file using WhatsApp's media API
-            await sendDeliveryFile(
-              user.whatsapp,
-              publicUrl,
-              deliveryData.fileName,
-              deliveryData.fileType,
-              fileCaption,
-            );
+          //   // Send the file using WhatsApp's media API
+          //   await sendDeliveryFile(
+          //     user.whatsapp,
+          //     publicUrl,
+          //     deliveryData.fileName,
+          //     deliveryData.fileType,
+          //     fileCaption,
+          //   );
 
-            EnhancedLogger.info(
-              `File sent successfully to user ${user.whatsapp}`,
-            );
-          } catch (fileError: any) {
-            EnhancedLogger.error(`Failed to send file via WhatsApp API:`, {
-              error: fileError?.message || fileError,
-              fileUrl: deliveryData.fileUrl,
-            });
+          //   EnhancedLogger.info(
+          //     `File sent successfully to user ${user.whatsapp}`,
+          //   );
+          // } catch (fileError: any) {
+            // EnhancedLogger.error(`Failed to send file via WhatsApp API:`, {
+            //   error: fileError?.message || fileError,
+            //   fileUrl: deliveryData.fileUrl,
+            // });
 
             // Fallback: Send download link
             const downloadMessage =
@@ -4712,7 +4712,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
               `ফাইলটি ডাউনলোড করতে উপরের লিঙ্কে ক্লিক করুন।`;
 
             await sendTextMessage(user.whatsapp, downloadMessage);
-          }
+          // }
         } else {
           // URL not accessible, send direct link
           const inaccessibleMessage =
