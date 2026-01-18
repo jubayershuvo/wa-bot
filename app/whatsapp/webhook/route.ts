@@ -4464,23 +4464,42 @@ async function sendDeliveryFile(
   caption?: string,
 ): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
+  
+  console.log("=== WhatsApp API Debug ===");
+  console.log("1. Input Parameters:");
+  console.log("- to:", to);
+  console.log("- formattedTo:", formattedTo);
+  console.log("- fileUrl:", fileUrl);
+  console.log("- fileName:", fileName);
+  console.log("- fileType:", fileType);
+  console.log("- caption:", caption);
 
   const PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID;
   const ACCESS_TOKEN = process.env.WA_ACCESS_TOKEN;
 
+  console.log("2. Environment Variables:");
+  console.log("- PHONE_NUMBER_ID:", PHONE_NUMBER_ID ? "***SET***" : "MISSING!");
+  console.log("- ACCESS_TOKEN:", ACCESS_TOKEN ? "***SET***" : "MISSING!");
+
   // Validate environment variables
   if (!PHONE_NUMBER_ID || !ACCESS_TOKEN) {
-    throw new Error("Missing WhatsApp API credentials. Check WA_PHONE_NUMBER_ID and WA_ACCESS_TOKEN.");
+    const error = "Missing WhatsApp API credentials. Check WA_PHONE_NUMBER_ID and WA_ACCESS_TOKEN.";
+    console.error("3. Validation Error:", error);
+    throw new Error(error);
   }
 
   // Validate phone number
   if (!formattedTo) {
-    throw new Error("Invalid phone number format");
+    const error = "Invalid phone number format";
+    console.error("3. Validation Error:", error);
+    throw new Error(error);
   }
 
   // Validate file URL
   if (!fileUrl || !fileUrl.startsWith("http")) {
-    throw new Error("Invalid file URL. Must be a valid HTTP/HTTPS URL.");
+    const error = "Invalid file URL. Must be a valid HTTP/HTTPS URL.";
+    console.error("3. Validation Error:", error);
+    throw new Error(error);
   }
 
   const ext = fileName.toLowerCase().split(".").pop() || "";
@@ -4510,15 +4529,23 @@ async function sendDeliveryFile(
 
   const payload = {
     messaging_product: "whatsapp",
-    recipient_type: "individual", // Added recipient_type
+    recipient_type: "individual",
     to: formattedTo,
     type: type,
     [type]: media,
   };
 
+  console.log("4. Generated Payload:");
+  console.log("- Type:", type);
+  console.log("- Payload:", JSON.stringify(payload, null, 2));
+
+  const url = `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`;
+  console.log("5. API URL:", url);
+
   try {
+    console.log("6. Making API request...");
     const res = await fetch(
-      `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
+      url,
       {
         method: "POST",
         headers: {
@@ -4529,26 +4556,44 @@ async function sendDeliveryFile(
       },
     );
 
+    console.log("7. Response Status:", res.status, res.statusText);
+    
     const data = await res.json();
+    console.log("8. Response Data:", JSON.stringify(data, null, 2));
 
     if (!res.ok) {
-      console.error("WhatsApp API Error:", {
-        status: res.status,
-        statusText: res.statusText,
-        error: data.error,
-        payload: payload
-      });
+      console.error("9. WhatsApp API Error Details:");
+      console.error("- Status:", res.status);
+      console.error("- Status Text:", res.statusText);
+      console.error("- Error:", data.error);
+      console.error("- fbtrace_id:", data.error?.fbtrace_id);
+      console.error("- Payload sent:", JSON.stringify(payload, null, 2));
       
-      throw new Error(
-        `WhatsApp API error (${res.status}): ${data?.error?.message || data?.error?.error_user_msg || "Unknown error"}`,
-      );
+      let errorMessage = `WhatsApp API error (${res.status}): `;
+      if (data?.error?.message) {
+        errorMessage += data.error.message;
+      } else if (data?.error?.error_user_msg) {
+        errorMessage += data.error.error_user_msg;
+      } else {
+        errorMessage += "Unknown error";
+      }
+      
+      throw new Error(errorMessage);
     }
 
+    console.log("10. SUCCESS - Message sent!");
+    console.log("- Message ID:", data.messages?.[0]?.id);
+    console.log("- Contact WA ID:", data.contacts?.[0]?.wa_id);
+    
     return data;
   } catch (error) {
+    console.error("11. CATCH BLOCK - Error occurred:");
     if (error instanceof Error) {
+      console.error("- Error message:", error.message);
+      console.error("- Stack trace:", error.stack);
       throw error;
     }
+    console.error("- Unknown error:", error);
     throw new Error(`Network or unknown error: ${error}`);
   }
 }
@@ -4682,27 +4727,27 @@ async function completeOrderDelivery(phone: string): Promise<void> {
         });
 
         if (isAccessible) {
-          // try {
-          //   // Create caption for the file
-          //   const fileCaption = `📦 ${updatedOrder.serviceName || "Service"} - Delivery File\n🆔 Order: ${orderId.slice(-8)}`;
+          try {
+            // Create caption for the file
+            const fileCaption = `📦 ${updatedOrder.serviceName || "Service"} - Delivery File\n🆔 Order: ${orderId.slice(-8)}`;
 
-          //   // Send the file using WhatsApp's media API
-          //   await sendDeliveryFile(
-          //     user.whatsapp,
-          //     publicUrl,
-          //     deliveryData.fileName,
-          //     deliveryData.fileType,
-          //     fileCaption,
-          //   );
+            // Send the file using WhatsApp's media API
+            await sendDeliveryFile(
+              user.whatsapp,
+              publicUrl,
+              deliveryData.fileName,
+              deliveryData.fileType,
+              fileCaption,
+            );
 
-          //   EnhancedLogger.info(
-          //     `File sent successfully to user ${user.whatsapp}`,
-          //   );
-          // } catch (fileError: any) {
-            // EnhancedLogger.error(`Failed to send file via WhatsApp API:`, {
-            //   error: fileError?.message || fileError,
-            //   fileUrl: deliveryData.fileUrl,
-            // });
+            EnhancedLogger.info(
+              `File sent successfully to user ${user.whatsapp}`,
+            );
+          } catch (fileError: any) {
+            EnhancedLogger.error(`Failed to send file via WhatsApp API:`, {
+              error: fileError?.message || fileError,
+              fileUrl: deliveryData.fileUrl,
+            });
 
             // Fallback: Send download link
             const downloadMessage =
@@ -4712,7 +4757,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
               `ফাইলটি ডাউনলোড করতে উপরের লিঙ্কে ক্লিক করুন।`;
 
             await sendTextMessage(user.whatsapp, downloadMessage);
-          // }
+          }
         } else {
           // URL not accessible, send direct link
           const inaccessibleMessage =
