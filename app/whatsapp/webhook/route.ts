@@ -4843,7 +4843,7 @@ async function handleAdminFileUpload(
       });
 
       // Create public URL for the file
-      const publicUrl = `/api/files/orders/${orderId}/${uniqueFileName}`;
+      const publicUrl = filePath;
 
       // Update state with file info
       await stateManager.updateStateData(formattedPhone, {
