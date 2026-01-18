@@ -1630,109 +1630,219 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
     // Call UBRN API
     let ubrnDataResult;
+    let apiResponse: any;
+    
     try {
       EnhancedLogger.info(`Calling UBRN API for: ${ubrn}`);
       const response = await axios.get(CONFIG.ubrnApiUrl, {
         params: { ubrn: ubrn.trim() },
         headers: {
           "User-Agent": "Birthhelp-Bot/1.0",
+          "Accept": "application/json"
         },
+        timeout: 15000 // 15 seconds timeout
       });
-      ubrnDataResult = response.data;
+      
+      apiResponse = response.data;
       EnhancedLogger.info(`UBRN API response received`, {
-        hasData: !!ubrnDataResult,
-        responseType: typeof ubrnDataResult,
+        status: response.status,
+        dataStructure: typeof apiResponse,
+        keys: apiResponse ? Object.keys(apiResponse) : 'no data'
       });
+      
     } catch (apiError: unknown) {
       EnhancedLogger.error(`UBRN API error for ${ubrn}:`, apiError);
 
       let errorMessage = "UBRN API তে সমস্যা হয়েছে।";
+      let errorDetails = "";
+      
       if (axios.isAxiosError(apiError)) {
-        if (apiError.code === "ECONNABORTED") {
+        if (apiError.code === "ECONNABORTED" || apiError.code === "ETIMEDOUT") {
           errorMessage = "UBRN API টাইমআউট হয়েছে। দয়া পরে চেষ্টা করুন।";
         } else if (apiError.response?.status === 404) {
           errorMessage = "UBRN নম্বরটি পাওয়া যায়নি। দয়া করে সঠিক নম্বর দিন।";
+        } else if (apiError.response?.status === 400) {
+          errorMessage = "UBRN নম্বরটি সঠিক নয়। দয়া করে সঠিক ফরম্যাটে দিন।";
+        } else if (apiError.response?.data) {
+          errorDetails = apiError.response.data.message || JSON.stringify(apiError.response.data);
         }
       }
 
       await sendTextMessage(
         formattedPhone,
-        `❌ ${errorMessage}\n\nইরর: ${
-          apiError instanceof Error ? apiError.message : "Unknown error"
-        }\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+        `❌ ${errorMessage}\n${errorDetails ? `বিস্তারিত: ${errorDetails}\n` : ''}\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
       );
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
       return;
     }
 
-    // Deduct balance
-    user.balance -= CONFIG.ubrnServicePrice;
-    await user.save();
-
-    // Create transaction record
-    const transaction = await Spent.create({
-      user: user._id,
-      amount: CONFIG.ubrnServicePrice,
-      service: "UBRN Search",
-    });
-
-    // Format and send result
-    let resultMessage = `✅ *UBRN ভেরিফিকেশন সম্পন্ন*\n\n`;
-    resultMessage += `🔢 UBRN: ${ubrn}\n`;
-    resultMessage += `💰 খরচ: ৳${CONFIG.ubrnServicePrice}\n`;
-    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n`;
-    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
-
-    if (ubrnDataResult && typeof ubrnDataResult === "object") {
-      resultMessage += `📊 *রেজাল্ট:*\n`;
-
-      // Check if response has an error or success property
-      if (ubrnDataResult.error) {
-        resultMessage += `❌ ত্রুটি: ${ubrnDataResult.error}\n`;
-      } else if (ubrnDataResult.success === false) {
-        resultMessage += `❌ UBRN নম্বরটি পাওয়া যায়নি।\n`;
-      } else {
-        // Display all properties from response
-        Object.entries(ubrnDataResult).forEach(([key, value]) => {
-          if (value !== null && value !== undefined) {
-            if (typeof value === "object") {
-              resultMessage += `${key}:\n`;
-              Object.entries(value as object).forEach(([subKey, subValue]) => {
-                if (subValue !== null && subValue !== undefined) {
-                  resultMessage += `  ${subKey}: ${subValue}\n`;
-                }
-              });
-            } else {
-              resultMessage += `${key}: ${value}\n`;
-            }
-          }
-        });
-      }
-    } else if (ubrnDataResult) {
-      resultMessage += `📊 রেজাল্ট: ${ubrnDataResult}\n`;
-    } else {
-      resultMessage += `📊 রেজাল্ট: কোন তথ্য পাওয়া যায়নি\n`;
+    // Check API response structure
+    if (!apiResponse) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ UBRN API থেকে কোনো রেসপন্স পাওয়া যায়নি। দয়া পরে চেষ্টা করুন।",
+      );
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
     }
 
-    resultMessage += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+    // Process API response based on expected structure
+    let apiStatus = "unknown";
+    let resultData: any = null;
+    
+    if (typeof apiResponse === "object") {
+      // Check for error in response
+      if (apiResponse.error || apiResponse.success === false) {
+        apiStatus = "error";
+        resultData = apiResponse;
+      } 
+      // Check for your specific API structure
+      else if (apiResponse.status === "success" && apiResponse.result) {
+        apiStatus = "success";
+        resultData = apiResponse.result;
+        ubrnDataResult = apiResponse; // Store full response
+      }
+      // Check for alternative structure
+      else if (apiResponse.data) {
+        apiStatus = apiResponse.status || "success";
+        resultData = apiResponse.data;
+        ubrnDataResult = apiResponse;
+      }
+      // Otherwise use the whole response as data
+      else {
+        apiStatus = "success";
+        resultData = apiResponse;
+        ubrnDataResult = apiResponse;
+      }
+    } else {
+      // If response is not an object (e.g., string), store as is
+      apiStatus = "success";
+      resultData = apiResponse;
+      ubrnDataResult = apiResponse;
+    }
 
-    await sendTextMessage(formattedPhone, resultMessage);
+    EnhancedLogger.info(`Processed UBRN data`, {
+      apiStatus,
+      hasResultData: !!resultData,
+      resultDataType: typeof resultData
+    });
 
-    // Notify admin
-    await notifyAdmin(
-      `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nUBRN: ${ubrn}\nমূল্য: ৳${CONFIG.ubrnServicePrice}`,
-    );
+    // Deduct balance only if API was successful
+    if (apiStatus === "success" && resultData) {
+      user.balance -= CONFIG.ubrnServicePrice;
+      await user.save();
+
+      // Create transaction record
+      const transaction = await Spent.create({
+        user: user._id,
+        amount: CONFIG.ubrnServicePrice,
+        service: "UBRN Search",
+        reference: ubrn.trim(),
+        metadata: {
+          apiStatus,
+          executionTime: ubrnDataResult?.execution_time,
+          timestamp: new Date().toISOString()
+        }
+      });
+
+      // Format and send result
+      let resultMessage = `✅ *UBRN ভেরিফিকেশন সম্পন্ন*\n\n`;
+      resultMessage += `🔢 UBRN: ${ubrn}\n`;
+      resultMessage += `💰 খরচ: ৳${CONFIG.ubrnServicePrice}\n`;
+      resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n`;
+      resultMessage += `📅 সময়: ${new Date().toLocaleString("bn-BD")}\n`;
+      
+      if (ubrnDataResult?.execution_time) {
+        resultMessage += `⏱️ এক্সিকিউশন সময়: ${ubrnDataResult.execution_time}\n`;
+      }
+      
+      resultMessage += `\n📊 *রেজাল্ট:*\n`;
+
+      // Display result data in organized way
+      if (resultData && typeof resultData === "object") {
+        // Format common UBRN result fields
+        const displayFields = [
+          { key: "name", label: "নাম" },
+          { key: "dob", label: "জন্ম তারিখ" },
+          { key: "father_name", label: "পিতার নাম" },
+          { key: "mother_name", label: "মাতার নাম" },
+          { key: "gender", label: "লিঙ্গ" },
+          { key: "birth_place", label: "জন্মস্থান" },
+          { key: "address", label: "ঠিকানা" },
+          { key: "national_id", label: "জাতীয় আইডি" },
+          { key: "registration_date", label: "নিবন্ধন তারিখ" },
+          { key: "registration_number", label: "নিবন্ধন নম্বর" }
+        ];
+
+        let hasValidData = false;
+        
+        for (const field of displayFields) {
+          if (resultData[field.key]) {
+            resultMessage += `• ${field.label}: ${resultData[field.key]}\n`;
+            hasValidData = true;
+          }
+        }
+
+        // If no predefined fields found, display all available fields
+        if (!hasValidData) {
+          Object.entries(resultData).forEach(([key, value]) => {
+            if (value !== null && value !== undefined && value !== "") {
+              if (typeof value === "object") {
+                resultMessage += `\n${key}:\n`;
+                Object.entries(value as object).forEach(([subKey, subValue]) => {
+                  if (subValue !== null && subValue !== undefined) {
+                    resultMessage += `  • ${subKey}: ${subValue}\n`;
+                  }
+                });
+              } else {
+                // Format key name for display
+                const displayKey = key.replace(/_/g, " ").toUpperCase();
+                resultMessage += `• ${displayKey}: ${value}\n`;
+              }
+            }
+          });
+        }
+      } else if (resultData) {
+        resultMessage += `${resultData}\n`;
+      } else {
+        resultMessage += `কোন তথ্য পাওয়া যায়নি\n`;
+      }
+
+      resultMessage += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+      await sendTextMessage(formattedPhone, resultMessage);
+
+      // Notify admin
+      await notifyAdmin(
+        `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nUBRN: ${ubrn}\nমূল্য: ৳${CONFIG.ubrnServicePrice}\nনতুন ব্যালেন্স: ৳${user.balance}\nট্রান্সাকশন ID: ${transaction._id}`,
+      );
+
+      EnhancedLogger.logFlowCompletion(formattedPhone, "ubrn_verification", {
+        ubrn: ubrn,
+        price: CONFIG.ubrnServicePrice,
+        transactionId: transaction._id,
+        newBalance: user.balance,
+        apiStatus: apiStatus,
+        hasData: !!resultData
+      });
+    } else {
+      // API returned error or no data
+      await sendTextMessage(
+        formattedPhone,
+        `❌ UBRN তথ্য পাওয়া যায়নি।\n\nUBRN: ${ubrn}\n\nকারণ: ${resultData?.error || resultData?.message || "অজানা ত্রুটি"}\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+      );
+      
+      EnhancedLogger.warn(`UBRN not found or API error`, {
+        ubrn,
+        response: apiResponse
+      });
+    }
 
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
 
-    EnhancedLogger.logFlowCompletion(formattedPhone, "ubrn_verification", {
-      ubrn: ubrn,
-      price: CONFIG.ubrnServicePrice,
-      transactionId: transaction._id,
-      newBalance: user.balance,
-    });
   } catch (err) {
     EnhancedLogger.error(`Failed to process UBRN for ${formattedPhone}:`, err);
     await sendTextMessage(
