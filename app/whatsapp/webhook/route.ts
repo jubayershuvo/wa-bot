@@ -4630,6 +4630,11 @@ async function completeOrderDelivery(phone: string): Promise<void> {
 
       await sendTextMessage(user.whatsapp, notification);
       const newData = await Order.findById(orderId);
+      // log the newData
+      EnhancedLogger.info(`Fetched updated order data for delivery`, {
+        orderId,
+        newData,
+      });
       // Step 2: Send file if available
       if (
         newData?.deliveryData?.fileUrl
