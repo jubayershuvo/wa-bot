@@ -3957,7 +3957,7 @@ async function handleAdminViewOrders(phone: string): Promise<void> {
       message += `   🆔: ${order._id}\n`;
       message += `   👤: ${user?.name || "N/A"} (${user?.whatsapp || "N/A"})\n`;
       message += `   💰: ৳${order.totalPrice}\n`;
-      message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
+      message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n`;
       //add file or text info
       order.serviceData.forEach((item: any,index:number) => {
         if (item.type === "file") {
@@ -3967,6 +3967,8 @@ async function handleAdminViewOrders(phone: string): Promise<void> {
           message += `      📝 ${item.fieldName}: ${item.value}\n`;
         }
       })
+
+      message += `\n`;
     });
 
     const totalOrders = await Order.countDocuments();
