@@ -834,7 +834,6 @@ async function checkDakhilaApproval(
       urlLength: url.length,
       urlPreview: url.substring(0, 100),
     });
-
     // Validate URL using helper function
     const validation = validateDakhilaUrl(url);
     if (!validation.isValid) {
@@ -849,7 +848,7 @@ async function checkDakhilaApproval(
     if (!processedUrl.startsWith("http")) {
       processedUrl = "https://" + processedUrl;
     }
-
+console.log(processedUrl)
     // Encode the URL
     const encodedUrl = encodeURIComponent(processedUrl);
     const apiUrl = `${CONFIG.dakhilaApiUrl}?url=${encodedUrl}`;
