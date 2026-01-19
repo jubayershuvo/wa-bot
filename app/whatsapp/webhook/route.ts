@@ -848,7 +848,7 @@ async function checkDakhilaApproval(
     if (!processedUrl.startsWith("http")) {
       processedUrl = "https://" + processedUrl;
     }
-console.log(processedUrl)
+    console.log(processedUrl);
     // Encode the URL
     const encodedUrl = encodeURIComponent(processedUrl);
     const apiUrl = `${CONFIG.dakhilaApiUrl}?url=${encodedUrl}`;
@@ -8088,7 +8088,7 @@ async function handleUserMessage(
     // REGULAR MESSAGE HANDLING (FOR ALL USERS)
     // ========================================
     if (message.type === "text") {
-      const userText = message.text?.body.trim().toLowerCase() || "";
+      const userText = message.text?.body.trim() || "";
       EnhancedLogger.info(
         `[${requestId}] Text message received: "${userText}"`,
         {
@@ -8098,11 +8098,11 @@ async function handleUserMessage(
 
       // Cancel handler for all flows
       if (
-        userText === "cancel" ||
-        userText === "বাতিল" ||
-        userText === "c" ||
-        userText === "cancel all" ||
-        userText === "stop"
+        userText.toLowerCase() === "cancel" ||
+        userText.toLowerCase() === "বাতিল" ||
+        userText.toLowerCase() === "c" ||
+        userText.toLowerCase() === "cancel all" ||
+        userText.toLowerCase() === "stop"
       ) {
         EnhancedLogger.info(`[${requestId}] Cancelling flow for user`);
         await cancelFlow(formattedPhone, isAdmin);
@@ -9192,12 +9192,7 @@ async function handleUserMessage(
 // --- Main Webhook Handler ---
 export async function POST(req: NextRequest): Promise<NextResponse> {
   const requestId =
-    Date.now().toString(36) + Math.random().toString(36).substr(2);
-  EnhancedLogger.info(`[${requestId}] Webhook POST request received`, {
-    url: req.url,
-    method: "POST",
-    timestamp: new Date().toISOString(),
-  });
+    Date.now().toString(36) + Math.random().toString(36).substring(2);
 
   try {
     sessionMonitor.start();
