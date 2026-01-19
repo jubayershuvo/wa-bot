@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import User, { IUser } from "@/models/User";
 import Service, { IService, ServiceField } from "@/models/Service";
-import Order from "@/models/Order";
+import Order, { ServiceDataField } from "@/models/Order";
 import Transaction from "@/models/Transaction";
 import stateManager from "@/lib/whatsappState";
 import { sessionMonitor } from "@/lib/sessionMonitor";
@@ -217,7 +217,7 @@ class RateLimiter {
   }
 }
 
-const rateLimiter = new RateLimiter(10, 60000); // 10 requests per minute
+const rateLimiter = new RateLimiter(10, 10000); // 10 requests per second
 
 // --- TypeScript Interfaces ---
 interface WhatsAppMessage {
@@ -1594,34 +1594,52 @@ async function handleUbrnVerificationStart(phone: string): Promise<void> {
 
 async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
-  EnhancedLogger.info(`Processing UBRN for ${formattedPhone}`, { ubrn });
+  const trimmedUbrn = ubrn.trim();
+
+  EnhancedLogger.info(`Starting UBRN processing for ${formattedPhone}`, {
+    ubrn: trimmedUbrn,
+    timestamp: new Date().toISOString(),
+  });
 
   try {
+    // Update state
     await stateManager.updateStateData(formattedPhone, {
       ubrn: {
-        ubrn: ubrn.trim(),
+        ubrn: trimmedUbrn,
+        processingStart: new Date().toISOString(),
       },
     });
 
+    // Send initial message
     await sendTextMessage(
       formattedPhone,
-      `⏳ UBRN তথ্য যাচাই করা হচ্ছে...\n\nUBRN: ${ubrn}\n\nদয়া করে অপেক্ষা করুন...`,
+      `⏳ UBRN তথ্য যাচাই করা হচ্ছে...\n\nUBRN: ${trimmedUbrn}\n\nদয়া করে অপেক্ষা করুন...`,
     );
 
+    EnhancedLogger.debug(`Connecting to database for user: ${formattedPhone}`);
     await connectDB();
     const user = await User.findOne({ whatsapp: formattedPhone });
 
     if (!user) {
+      EnhancedLogger.warn(`User not found: ${formattedPhone}`);
       await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
       return;
     }
 
+    EnhancedLogger.debug(`User found: ${user._id}, Balance: ${user.balance}`);
+
+    // Check balance
     if (user.balance < CONFIG.ubrnServicePrice) {
+      EnhancedLogger.warn(`Insufficient balance for ${formattedPhone}`, {
+        balance: user.balance,
+        required: CONFIG.ubrnServicePrice,
+      });
+
       await sendTextMessage(
         formattedPhone,
-        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}`,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💰 ব্যালেন্স রিচার্জ করতে অ্যাডমিনের সাথে যোগাযোগ করুন।`,
       );
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
@@ -1629,118 +1647,371 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     }
 
     // Call UBRN API
-    let ubrnDataResult;
+    let apiResponse;
+    const apiStartTime = Date.now();
+
     try {
-      EnhancedLogger.info(`Calling UBRN API for: ${ubrn}`);
-      const response = await axios.get(CONFIG.ubrnApiUrl, {
-        params: { ubrn: ubrn.trim() },
-        headers: {
-          "User-Agent": "Birthhelp-Bot/1.0",
-        },
+      EnhancedLogger.info(`Calling UBRN API`, {
+        ubrn: trimmedUbrn,
+        url: CONFIG.ubrnApiUrl,
+        startTime: new Date().toISOString(),
       });
-      ubrnDataResult = response.data;
+
+      const response = await axios.get(CONFIG.ubrnApiUrl, {
+        params: { ubrn: trimmedUbrn },
+      });
+
+      const apiEndTime = Date.now();
+      const apiDuration = apiEndTime - apiStartTime;
+      console.log(response);
       EnhancedLogger.info(`UBRN API response received`, {
-        hasData: !!ubrnDataResult,
-        responseType: typeof ubrnDataResult,
+        ubrn: trimmedUbrn,
+        status: response.status,
+        statusText: response.statusText,
+        duration: `${apiDuration}ms`,
+        headers: response.headers,
+        dataKeys: response.data ? Object.keys(response.data) : "no data",
+      });
+
+      apiResponse = response.data;
+
+      // Log the actual response structure
+      EnhancedLogger.debug(`UBRN API raw response`, {
+        data: apiResponse,
+        dataType: typeof apiResponse,
       });
     } catch (apiError: unknown) {
-      EnhancedLogger.error(`UBRN API error for ${ubrn}:`, apiError);
+      const apiEndTime = Date.now();
+      const apiDuration = apiEndTime - apiStartTime;
+
+      EnhancedLogger.error(`UBRN API call failed for ${trimmedUbrn}`, {
+        error: apiError,
+        duration: `${apiDuration}ms`,
+        phone: formattedPhone,
+        stack: apiError instanceof Error ? apiError.stack : "No stack trace",
+      });
 
       let errorMessage = "UBRN API তে সমস্যা হয়েছে।";
+      let errorDetails = "";
+
       if (axios.isAxiosError(apiError)) {
-        if (apiError.code === "ECONNABORTED") {
-          errorMessage = "UBRN API টাইমআউট হয়েছে। দয়া পরে চেষ্টা করুন।";
+        EnhancedLogger.error(`Axios error details`, {
+          code: apiError.code,
+          message: apiError.message,
+          response: apiError.response?.data,
+          status: apiError.response?.status,
+          config: {
+            url: apiError.config?.url,
+            method: apiError.config?.method,
+            params: apiError.config?.params,
+          },
+        });
+
+        if (apiError.code === "ECONNABORTED" || apiError.code === "ETIMEDOUT") {
+          errorMessage =
+            "UBRN API টাইমআউট হয়েছে। দয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।";
         } else if (apiError.response?.status === 404) {
-          errorMessage = "UBRN নম্বরটি পাওয়া যায়নি। দয়া করে সঠিক নম্বর দিন।";
+          errorMessage =
+            "❌ UBRN নম্বরটি পাওয়া যায়নি।\n\nদয়া করে নিশ্চিত করুন যে UBRN নম্বরটি সঠিক।";
+        } else if (apiError.response?.status === 400) {
+          errorMessage =
+            "❌ UBRN নম্বরটি সঠিক ফরম্যাটে নয়।\n\nদয়া করে ১৭ বা ১৮ ডিজিটের UBRN নম্বর দিন।";
+        } else if (apiError.response?.status === 429) {
+          errorMessage =
+            "❌ অনেকগুলো রিকোয়েস্ট করা হয়েছে।\n\nদয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।";
+        } else if (apiError.response?.data) {
+          const errorData = apiError.response.data;
+          errorDetails =
+            typeof errorData === "object"
+              ? JSON.stringify(errorData, null, 2)
+              : String(errorData);
         }
+      } else if (apiError instanceof Error) {
+        errorDetails = apiError.message;
       }
 
       await sendTextMessage(
         formattedPhone,
-        `❌ ${errorMessage}\n\nইরর: ${
-          apiError instanceof Error ? apiError.message : "Unknown error"
-        }\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+        `${errorMessage}\n\n${errorDetails ? `বিস্তারিত: ${errorDetails}\n\n` : ""}আপনার ব্যালেন্স কাটা হয়নি।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+      );
+
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    // Validate API response
+    if (!apiResponse) {
+      EnhancedLogger.error(`Empty API response for UBRN: ${trimmedUbrn}`);
+      await sendTextMessage(
+        formattedPhone,
+        "❌ UBRN API থেকে কোনো রেসপন্স পাওয়া যায়নি।\n\nদয়া করে আডমিনের সাথে যোগাযোগ করুন।",
       );
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
       return;
     }
 
-    // Deduct balance
-    user.balance -= CONFIG.ubrnServicePrice;
-    await user.save();
-
-    // Create transaction record
-    const transaction = await Spent.create({
-      user: user._id,
-      amount: CONFIG.ubrnServicePrice,
-      service: "UBRN Search",
+    // Parse API response
+    EnhancedLogger.debug(`Parsing API response`, {
+      responseType: typeof apiResponse,
+      responseKeys: Object.keys(apiResponse),
     });
 
-    // Format and send result
-    let resultMessage = `✅ *UBRN ভেরিফিকেশন সম্পন্ন*\n\n`;
-    resultMessage += `🔢 UBRN: ${ubrn}\n`;
-    resultMessage += `💰 খরচ: ৳${CONFIG.ubrnServicePrice}\n`;
-    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n`;
-    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
+    let resultData = null;
+    let apiStatus = "unknown";
+    let errorMessage = "";
 
-    if (ubrnDataResult && typeof ubrnDataResult === "object") {
-      resultMessage += `📊 *রেজাল্ট:*\n`;
+    if (typeof apiResponse === "object") {
+      // Check for your specific API structure
+      if (apiResponse.status === "success" && apiResponse.result) {
+        apiStatus = "success";
+        resultData = apiResponse.result;
 
-      // Check if response has an error or success property
-      if (ubrnDataResult.error) {
-        resultMessage += `❌ ত্রুটি: ${ubrnDataResult.error}\n`;
-      } else if (ubrnDataResult.success === false) {
-        resultMessage += `❌ UBRN নম্বরটি পাওয়া যায়নি।\n`;
-      } else {
-        // Display all properties from response
-        Object.entries(ubrnDataResult).forEach(([key, value]) => {
-          if (value !== null && value !== undefined) {
-            if (typeof value === "object") {
-              resultMessage += `${key}:\n`;
-              Object.entries(value as object).forEach(([subKey, subValue]) => {
-                if (subValue !== null && subValue !== undefined) {
-                  resultMessage += `  ${subKey}: ${subValue}\n`;
-                }
-              });
-            } else {
-              resultMessage += `${key}: ${value}\n`;
-            }
-          }
+        EnhancedLogger.info(`Successfully parsed UBRN data`, {
+          ubrn: trimmedUbrn,
+          hasResult: !!resultData,
+          resultKeys: resultData ? Object.keys(resultData) : [],
         });
       }
-    } else if (ubrnDataResult) {
-      resultMessage += `📊 রেজাল্ট: ${ubrnDataResult}\n`;
+      // Check for error response
+      else if (
+        apiResponse.error ||
+        apiResponse.status === "error" ||
+        apiResponse.success === false
+      ) {
+        apiStatus = "error";
+        resultData = apiResponse;
+        errorMessage =
+          apiResponse.error || apiResponse.message || "UBRN তথ্য পাওয়া যায়নি";
+
+        EnhancedLogger.warn(`API returned error for UBRN: ${trimmedUbrn}`, {
+          error: errorMessage,
+          fullResponse: apiResponse,
+        });
+      }
+      // Direct result object
+      else if (apiResponse.dob || apiResponse.name || apiResponse.ubrn) {
+        apiStatus = "success";
+        resultData = apiResponse;
+
+        EnhancedLogger.info(`Direct result object found`, {
+          ubrn: trimmedUbrn,
+          fields: Object.keys(apiResponse),
+        });
+      }
+      // Unknown structure
+      else {
+        apiStatus = "unknown";
+        resultData = apiResponse;
+
+        EnhancedLogger.warn(`Unknown API response structure`, {
+          ubrn: trimmedUbrn,
+          response: apiResponse,
+        });
+      }
     } else {
-      resultMessage += `📊 রেজাল্ট: কোন তথ্য পাওয়া যায়নি\n`;
+      apiStatus = "invalid";
+      EnhancedLogger.error(`Invalid API response type`, {
+        ubrn: trimmedUbrn,
+        responseType: typeof apiResponse,
+        response: apiResponse,
+      });
     }
 
-    resultMessage += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+    // Process based on API status
+    if (apiStatus === "success" && resultData) {
+      // Deduct balance
+      const oldBalance = user.balance;
+      user.balance -= CONFIG.ubrnServicePrice;
+      await user.save();
 
-    await sendTextMessage(formattedPhone, resultMessage);
+      EnhancedLogger.info(`Balance deducted`, {
+        userId: user._id,
+        oldBalance,
+        deduction: CONFIG.ubrnServicePrice,
+        newBalance: user.balance,
+      });
 
-    // Notify admin
-    await notifyAdmin(
-      `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nUBRN: ${ubrn}\nমূল্য: ৳${CONFIG.ubrnServicePrice}`,
-    );
+      // Create transaction record
+      const transaction = await Spent.create({
+        user: user._id,
+        amount: CONFIG.ubrnServicePrice,
+        service: "UBRN Search",
+        reference: trimmedUbrn,
+        status: "completed",
+        metadata: {
+          apiStatus,
+          executionTime: apiResponse.execution_time || "N/A",
+          resultFields: resultData ? Object.keys(resultData) : [],
+          timestamp: new Date().toISOString(),
+        },
+      });
 
+      EnhancedLogger.info(`Transaction created`, {
+        transactionId: transaction._id,
+        userId: user._id,
+        amount: CONFIG.ubrnServicePrice,
+      });
+
+      // Format and send result message
+      let resultMessage = `✅ *UBRN ভেরিফিকেশন সম্পন্ন*\n\n`;
+      resultMessage += `🔢 UBRN: ${trimmedUbrn}\n`;
+      resultMessage += `💰 খরচ: ৳${CONFIG.ubrnServicePrice}\n`;
+      resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
+      resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
+      resultMessage += `📅 তারিখ: ${new Date().toLocaleDateString("bn-BD")}\n`;
+      resultMessage += `⏰ সময়: ${new Date().toLocaleTimeString("bn-BD")}\n`;
+
+      if (apiResponse.execution_time) {
+        resultMessage += `⚡ প্রসেসিং সময়: ${apiResponse.execution_time}\n`;
+      }
+
+      resultMessage += `\n📋 *ব্যক্তিগত তথ্য:*\n`;
+
+      // Format result data
+      if (resultData) {
+        // Bengali field mappings
+        const fieldMappings: { [key: string]: string } = {
+          name: "নাম",
+          dob: "জন্ম তারিখ",
+          ubrn: "UBRN নম্বর",
+          father_name: "পিতার নাম",
+          mother_name: "মাতার নাম",
+          gender: "লিঙ্গ",
+          birth_place: "জন্মস্থান",
+          address: "বর্তমান ঠিকানা",
+          national_id: "জাতীয় পরিচয়পত্র",
+          registration_number: "নিবন্ধন নম্বর",
+          registration_date: "নিবন্ধনের তারিখ",
+        };
+
+        // Display known fields
+        Object.entries(fieldMappings).forEach(([key, bengaliLabel]) => {
+          if (resultData[key]) {
+            resultMessage += `• ${bengaliLabel}: ${resultData[key]}\n`;
+          }
+        });
+
+        // Display any other fields not in mappings
+        Object.entries(resultData).forEach(([key, value]) => {
+          if (!fieldMappings[key] && value && typeof value !== "object") {
+            const displayKey = key.replace(/_/g, " ").toUpperCase();
+            resultMessage += `• ${displayKey}: ${value}\n`;
+          }
+        });
+
+        // Log what was displayed
+        EnhancedLogger.debug(`Result displayed to user`, {
+          displayedFields: Object.keys(resultData).filter(
+            (key) => resultData[key],
+          ),
+          totalFields: Object.keys(resultData).length,
+        });
+      } else {
+        resultMessage += "কোন তথ্য পাওয়া যায়নি\n";
+      }
+
+      resultMessage += `\n💡 *দ্রষ্টব্য:*\n`;
+      resultMessage += `• এই তথ্য শুধুমাত্র রেফারেন্সের জন্য\n`;
+      resultMessage += `• যেকোনো ভুল তথ্যের জন্য আমরা দায়ী নই\n`;
+      resultMessage += `\n🏠 *মেনুতে ফিরতে 'Menu' লিখুন*`;
+
+      await sendTextMessage(formattedPhone, resultMessage);
+
+      // Notify admin
+      await notifyAdmin(
+        `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\n` +
+          `📱 ব্যবহারকারী: ${formattedPhone}\n` +
+          `🔢 UBRN: ${trimmedUbrn}\n` +
+          `💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n` +
+          `💳 পুরাতন ব্যালেন্স: ৳${oldBalance}\n` +
+          `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n` +
+          `📊 লেনদেন ID: ${transaction._id}\n` +
+          `⏱️ সময়: ${new Date().toLocaleString("bn-BD")}`,
+      );
+
+      EnhancedLogger.logFlowCompletion(formattedPhone, "ubrn_verification", {
+        ubrn: trimmedUbrn,
+        price: CONFIG.ubrnServicePrice,
+        transactionId: transaction._id,
+        oldBalance,
+        newBalance: user.balance,
+        apiStatus,
+        executionTime: apiResponse.execution_time,
+        resultFieldsCount: resultData ? Object.keys(resultData).length : 0,
+      });
+    } else {
+      // API failed or returned error
+      EnhancedLogger.warn(`UBRN verification failed`, {
+        ubrn: trimmedUbrn,
+        phone: formattedPhone,
+        apiStatus,
+        errorMessage,
+        apiResponse,
+      });
+
+      await sendTextMessage(
+        formattedPhone,
+        `❌ UBRN তথ্য পাওয়া যায়নি\n\n` +
+          `UBRN: ${trimmedUbrn}\n\n` +
+          `${errorMessage ? `কারণ: ${errorMessage}\n\n` : ""}` +
+          `💰 আপনার ব্যালেন্স কাটা হয়নি\n\n` +
+          `🏠 *মেনুতে ফিরতে 'Menu' লিখুন*`,
+      );
+    }
+
+    // Clear state and show menu
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
 
-    EnhancedLogger.logFlowCompletion(formattedPhone, "ubrn_verification", {
-      ubrn: ubrn,
-      price: CONFIG.ubrnServicePrice,
-      transactionId: transaction._id,
-      newBalance: user.balance,
+    EnhancedLogger.info(`UBRN process completed for ${formattedPhone}`, {
+      ubrn: trimmedUbrn,
+      finalStatus: apiStatus,
+      userNotified: true,
     });
-  } catch (err) {
-    EnhancedLogger.error(`Failed to process UBRN for ${formattedPhone}:`, err);
-    await sendTextMessage(
-      formattedPhone,
-      "❌ UBRN ভেরিফিকেশন করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+  } catch (error) {
+    EnhancedLogger.error(
+      `Critical error in UBRN processing for ${formattedPhone}`,
+      {
+        error: error,
+        ubrn: ubrn,
+        stack: error instanceof Error ? error.stack : "No stack trace",
+        timestamp: new Date().toISOString(),
+      },
     );
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, false);
+
+    try {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ UBRN ভেরিফিকেশন করতে সমস্যা হয়েছে।\n\n" +
+          "দয়া করে কিছুক্ষণ পরে আবার চেষ্টা করুন।\n\n" +
+          "🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+      );
+    } catch (sendError) {
+      EnhancedLogger.error(
+        `Failed to send error message to ${formattedPhone}`,
+        {
+          error: sendError,
+        },
+      );
+    }
+
+    try {
+      await stateManager.clearUserState(formattedPhone);
+    } catch (stateError) {
+      EnhancedLogger.error(`Failed to clear state for ${formattedPhone}`, {
+        error: stateError,
+      });
+    }
+
+    try {
+      await showMainMenu(formattedPhone, false);
+    } catch (menuError) {
+      EnhancedLogger.error(`Failed to show main menu for ${formattedPhone}`, {
+        error: menuError,
+      });
+    }
   }
 }
 
@@ -1832,6 +2103,16 @@ async function handleRegularServiceSelection(
       return;
     }
 
+    // Create initial collectedData object
+    const collectedData: Record<string, any> = {};
+
+    // Initialize with empty values for all required fields
+    if (service.requiredFields && service.requiredFields.length > 0) {
+      service.requiredFields.forEach((field: ServiceField) => {
+        collectedData[field.name] = "";
+      });
+    }
+
     await stateManager.setUserState(formattedPhone, {
       currentState: "awaiting_service_data",
       flowType: "service_order",
@@ -1841,7 +2122,7 @@ async function handleRegularServiceSelection(
           price: service.price,
           serviceName: service.name,
           fieldIndex: 0,
-          collectedData: {},
+          collectedData: collectedData,
           attempts: 0,
         },
         lastActivity: Date.now(),
@@ -1856,6 +2137,7 @@ async function handleRegularServiceSelection(
       {
         serviceId: actualServiceId,
         serviceName: service.name,
+        fieldCount: service.requiredFields?.length || 0,
       },
     );
 
@@ -1903,17 +2185,16 @@ async function askForServiceField(
     message += `${field.description}\n\n`;
   }
 
-  if (field.options && field.options.length > 0) {
-    message += `অপশনসমূহ:\n`;
-    field.options.forEach((option, index) => {
-      message += `${index + 1}. ${option}\n`;
-    });
-    message += `\nঅপশন নম্বর লিখুন বা সরাসরি মান লিখুন:\n`;
-  } else {
-    message += `মান লিখুন:\n`;
+  if (field.type === "file") {
+    message += `📁 ফাইল আপলোড করুন:\n`;
+    message += `• ইমেজ (JPG, PNG)\n`;
+    message += `• PDF বা ডকুমেন্ট\n\n`;
+    message += `দয়া করে ফাইল পাঠান...`;
+  } else if (field.type === "text") {
+    message += `টেক্সট লিখুন:`;
   }
 
-  message += `\n🚫 বাতিল করতে 'cancel' লিখুন`;
+  message += `\n\n🚫 বাতিল করতে 'cancel' লিখুন`;
 
   await sendTextWithCancelButton(formattedPhone, message);
 }
@@ -1933,10 +2214,37 @@ async function askForServiceConfirmation(
 
   if (Object.keys(collectedData).length > 0) {
     message += `📋 প্রদত্ত তথ্য:\n`;
-    Object.entries(collectedData).forEach(([key, value]) => {
-      const field = service.requiredFields?.find((f) => f.name === key);
-      message += `• ${field?.label || key}: ${value}\n`;
+
+    // First, collect all field data
+    const fieldsData: { label: string; value: string }[] = [];
+
+    if (service.requiredFields) {
+      service.requiredFields.forEach((field: ServiceField) => {
+        const fieldData = collectedData[field.name];
+        let displayValue = "শূন্য";
+
+        if (fieldData) {
+          if (field.type === "file") {
+            displayValue = "📁 ফাইল আপলোড করা হয়েছে";
+          } else if (typeof fieldData === "object" && fieldData.data) {
+            displayValue = fieldData.data;
+          } else if (typeof fieldData === "string") {
+            displayValue = fieldData;
+          }
+        }
+
+        fieldsData.push({
+          label: field.label,
+          value: displayValue,
+        });
+      });
+    }
+
+    // Now display all fields
+    fieldsData.forEach((field) => {
+      message += `• ${field.label}: ${field.value}\n`;
     });
+
     message += `\n`;
   }
 
@@ -1944,26 +2252,123 @@ async function askForServiceConfirmation(
     message += `📝 নির্দেশনা: ${service.instructions}\n\n`;
   }
 
-  message += `✅ অর্ডার কনফার্ম করতে 'confirm' লিখুন\n`;
-  message += `✏️ তথ্য পরিবর্তন করতে 'edit' লিখুন\n`;
-  message += `🚫 বাতিল করতে 'cancel' লিখুন`;
-
+  // Update state to awaiting confirmation
   await stateManager.updateStateData(formattedPhone, {
     serviceOrder: {
       ...serviceOrderData,
     },
+    currentState: "awaiting_service_confirmation",
   });
 
-  await sendTextWithCancelButton(formattedPhone, message);
+  // Send confirmation with buttons
+  await sendQuickReplyMenu(formattedPhone, message, [
+    { id: "order_confirm", title: "✅ কনফার্ম করুন" },
+    { id: "order_edit", title: "✏️ এডিট করুন" },
+    { id: "order_cancel", title: "🚫 বাতিল করুন" },
+  ]);
+}
+async function handleUserFileUpload(
+  phone: string,
+  message: WhatsAppMessage,
+): Promise<{
+  fileUrl: string;
+  fileName: string;
+  fileType: string;
+  fileSize: string;
+} | null> {
+  const formattedPhone = formatPhoneNumber(phone);
+
+  EnhancedLogger.info(`Handling user file upload for ${formattedPhone}`, {
+    messageType: message.type,
+    hasImage: !!message.image,
+    hasDocument: !!message.document,
+  });
+
+  try {
+    if (message.type === "image" || message.type === "document") {
+      const mediaId =
+        message.type === "image" ? message.image?.id : message.document?.id;
+      const originalFileName =
+        message.type === "image"
+          ? `user_${formattedPhone}_${Date.now()}.jpg`
+          : message.document?.filename ||
+            `user_${formattedPhone}_${Date.now()}.pdf`;
+
+      if (!mediaId) {
+        EnhancedLogger.error(`No media ID found for file upload`);
+        throw new Error("No media ID");
+      }
+
+      EnhancedLogger.info(`Downloading user media: ${mediaId}`);
+
+      // Download media from WhatsApp
+      const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
+
+      // Check file size
+      if (buffer.length > CONFIG.maxFileSize) {
+        throw new Error(
+          `File size too large: ${buffer.length} bytes, max: ${CONFIG.maxFileSize}`,
+        );
+      }
+
+      // Create uploads directory structure
+      const uploadsDir = path.join(process.cwd(), "uploads", "orders");
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+
+      // Generate unique filename
+      const fileExt =
+        path.extname(originalFileName) ||
+        (mimeType.includes("image")
+          ? ".jpg"
+          : mimeType.includes("pdf")
+            ? ".pdf"
+            : mimeType.includes("word")
+              ? ".docx"
+              : ".bin");
+
+      const uniqueFileName = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}${fileExt}`;
+      const filePath = path.join(uploadsDir, uniqueFileName);
+
+      // Save file
+      fs.writeFileSync(filePath, buffer);
+
+      // Create public URL path
+      const publicPath = `/uploads/orders/${uniqueFileName}`;
+
+      return {
+        fileUrl: publicPath, // This will be stored in the database
+        fileName: originalFileName,
+        fileType: mimeType,
+        fileSize: formatFileSize(buffer.length),
+      };
+    } else {
+      throw new Error(
+        `Unsupported message type for file upload: ${message.type}`,
+      );
+    }
+  } catch (error: any) {
+    EnhancedLogger.error(`Failed to handle user file upload:`, {
+      error: error?.message || error,
+      stack: error?.stack,
+      phone: formattedPhone,
+    });
+    throw error;
+  }
 }
 
+// Helper function to format file size
 async function handleServiceFieldInput(
   phone: string,
   input: string,
+  message?: WhatsAppMessage,
 ): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
+
   EnhancedLogger.info(`Processing service field input for ${formattedPhone}`, {
     input,
+    hasFile: !!message?.image || !!message?.document,
   });
 
   try {
@@ -2002,34 +2407,76 @@ async function handleServiceFieldInput(
     }
 
     const field = service.requiredFields[fieldIndex];
-    let fieldValue = input.trim();
+    let fieldValue: any = null;
 
-    // Handle option selection
-    if (field.options && field.options.length > 0) {
-      const optionIndex = parseInt(fieldValue) - 1;
-      if (optionIndex >= 0 && optionIndex < field.options.length) {
-        fieldValue = field.options[optionIndex];
-      } else if (!field.options.includes(fieldValue)) {
+    // Handle file upload for file type fields
+    if (field.type === "file" && (message?.image || message?.document)) {
+      try {
         await sendTextMessage(
           formattedPhone,
-          `❌ দয়া করে একটি বৈধ অপশন সিলেক্ট করুন:\n\n${field.options.map((opt: string, idx: number) => `${idx + 1}. ${opt}`).join("\n")}`,
+          "⏳ ফাইল আপলোড হচ্ছে... দয়া করে অপেক্ষা করুন।",
+        );
+
+        // Handle file upload
+        const fileData = await handleUserFileUpload(formattedPhone, message);
+
+        if (fileData) {
+          // Store file information
+          fieldValue = {
+            fileName: fileData.fileName,
+            filePath: fileData.fileUrl, // Server path
+            fileType: fileData.fileType,
+            fileSize: fileData.fileSize,
+            uploadedAt: new Date().toISOString(),
+          };
+
+          await sendTextMessage(
+            formattedPhone,
+            `✅ ফাইল আপলোড সফল!\n\n📁 ফাইল: ${fileData.fileName}\n📊 সাইজ: ${fileData.fileSize}\n\nএখন পরবর্তী ধাপে যাচ্ছি...`,
+          );
+        } else {
+          await sendTextMessage(
+            formattedPhone,
+            "❌ ফাইল আপলোড ব্যর্থ। দয়া পরে চেষ্টা করুন।",
+          );
+          return;
+        }
+      } catch (uploadError) {
+        EnhancedLogger.error(`File upload failed:`, uploadError);
+        await sendTextMessage(
+          formattedPhone,
+          "❌ ফাইল আপলোডে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
         );
         return;
       }
-    }
+    } else if (field.type === "text") {
+      // Handle text input
+      fieldValue = input.trim();
 
-    // Validate required field
-    if (field.required && !fieldValue) {
+      if (field.required && !fieldValue) {
+        await sendTextMessage(
+          formattedPhone,
+          `❌ '${field.label}' প্রয়োজনীয়। দয়া করে মান দিন।`,
+        );
+        return;
+      }
+    } else {
       await sendTextMessage(
         formattedPhone,
-        "❌ এই ফিল্ডটি প্রয়োজনীয়। দয়া করে মান দিন।",
+        `❌ '${field.label}' ফিল্ডের জন্য সঠিক ইনপুট দিন।`,
       );
       return;
     }
 
     // Store collected data
     const collectedData = serviceOrderData.collectedData || {};
-    collectedData[field.name] = fieldValue;
+
+    // Store field data in the format needed for Order model
+    collectedData[field.name] = {
+      label: field.label,
+      type: field.type,
+      data: fieldValue, // This will be either text string or file object
+    };
 
     // Update state
     fieldIndex++;
@@ -2043,7 +2490,8 @@ async function handleServiceFieldInput(
 
     EnhancedLogger.debug(`Field collected for ${formattedPhone}`, {
       fieldName: field.name,
-      fieldValue,
+      fieldType: field.type,
+      fieldValue: field.type === "file" ? "[FILE]" : fieldValue,
       fieldIndex,
       totalFields: service.requiredFields.length,
     });
@@ -2086,23 +2534,52 @@ async function handleEditServiceData(phone: string): Promise<void> {
     await connectDB();
     const service = await Service.findById(serviceId);
 
-    if (!service || !service.requiredFields) {
+    if (
+      !service ||
+      !service.requiredFields ||
+      service.requiredFields.length === 0
+    ) {
       await sendTextMessage(
         formattedPhone,
-        "❌ সার্ভিস বা ফিল্ড পাওয়া যায়নি!",
+        "❌ এই সার্ভিসের কোন ফিল্ড নেই এডিট করার!",
       );
-      await cancelFlow(formattedPhone, false);
+      await askForServiceConfirmation(phone, service as IService);
       return;
     }
 
-    // Show fields to edit
+    // Create field selection menu
     const fieldRows = service.requiredFields.map(
-      (field: ServiceField, index: number) => ({
-        id: `edit_field_${index}`,
-        title: field.label,
-        description: `বর্তমান: ${serviceOrderData.collectedData?.[field.name] || "শূন্য"}`,
-      }),
+      (field: ServiceField, index: number) => {
+        const fieldData = serviceOrderData.collectedData?.[field.name];
+        let currentValue = "শূন্য";
+
+        if (fieldData) {
+          if (field.type === "file") {
+            currentValue = "📁 ফাইল আপলোড করা হয়েছে";
+          } else if (typeof fieldData === "object" && fieldData.data) {
+            currentValue =
+              fieldData.data.substring(0, 20) +
+              (fieldData.data.length > 20 ? "..." : "");
+          } else if (typeof fieldData === "string") {
+            currentValue =
+              fieldData.substring(0, 20) + (fieldData.length > 20 ? "..." : "");
+          }
+        }
+
+        return {
+          id: `edit_field_${index}`,
+          title: field.label,
+          description: `বর্তমান: ${currentValue}`,
+        };
+      },
     );
+
+    // Add option to edit all fields
+    fieldRows.push({
+      id: "edit_all_fields",
+      title: "📝 সব ফিল্ড এডিট করুন",
+      description: "সমস্ত ফিল্ড আবার ইনপুট নিন",
+    });
 
     await sendListMenu(
       formattedPhone,
@@ -2167,10 +2644,45 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       return;
     }
 
+    // Validate all required fields are filled
+    if (service.requiredFields && service.requiredFields.length > 0) {
+      for (const field of service.requiredFields) {
+        if (field.required && !serviceOrderData.collectedData?.[field.name]) {
+          await sendTextMessage(
+            formattedPhone,
+            `❌ প্রয়োজনীয় ফিল্ড '${field.label}' পূরণ করা হয়নি।\n\nদয়া করে 'edit' বাটন ক্লিক করুন এবং তথ্য দিন।`,
+          );
+          return;
+        }
+      }
+    }
+
+    // Process collected data for storage
+    // Process collected data for storage
+    const processedServiceData: ServiceDataField[] = [];
+    if (serviceOrderData.collectedData) {
+      for (const [fieldName, fieldData] of Object.entries(
+        serviceOrderData.collectedData,
+      )) {
+        const field = service.requiredFields?.find((f) => f.name === fieldName);
+        if (field && (field.type === "text" || field.type === "file")) {
+          const dataField: ServiceDataField = {
+            field: fieldName,
+            label: field.label,
+            type: field.type,
+            data: fieldData.data || "",
+            createdAt: new Date(),
+          };
+          processedServiceData.push(dataField);
+        }
+      }
+    }
+
     // Deduct balance
     user.balance -= Number(serviceOrderData.price);
     await user.save();
 
+    // Create transaction
     const transaction = await Transaction.create({
       trxId: `ORDER-${Date.now()}`,
       amount: serviceOrderData.price,
@@ -2181,56 +2693,95 @@ async function confirmServiceOrder(phone: string): Promise<void> {
       metadata: {
         serviceId: serviceOrderData.serviceId,
         serviceName: serviceOrderData.serviceName,
-        collectedData: serviceOrderData.collectedData || {},
+        fieldCount: processedServiceData.length,
       },
       createdAt: new Date(),
     });
 
-    // CREATE ORDER FOR REGULAR SERVICE
+    // Create order
     const order = await Order.create({
-      orderId: `ORD-${Date.now()}`,
+      orderId: `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       userId: user._id,
       serviceId: service._id,
       serviceName: service.name,
       quantity: 1,
       unitPrice: serviceOrderData.price,
       totalPrice: serviceOrderData.price,
-      serviceData: serviceOrderData.collectedData || {},
+      serviceData: processedServiceData,
       status: "pending",
       transactionId: transaction._id,
       placedAt: new Date(),
       createdAt: new Date(),
     });
 
-    await sendTextMessage(
-      formattedPhone,
-      `✅ *অর্ডার সফল*\n\n📦 সার্ভিস: ${service.name}\n🆔 অর্ডার আইডি: ${order._id}\n💰 খরচ: ৳${serviceOrderData.price}\n🆕 ব্যালেন্স: ৳${user.balance}\n📅 সময়: ${new Date().toLocaleString()}\n\n🎉 আপনার অর্ডারটি সফলভাবে প্লেস করা হয়েছে!\n\nআমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-    );
+    // Send success message
+    const successMessage =
+      `✅ *অর্ডার সফল*\n\n` +
+      `📦 সার্ভিস: ${service.name}\n` +
+      `🆔 অর্ডার আইডি: ${order.orderId}\n` +
+      `💰 খরচ: ৳${serviceOrderData.price}\n` +
+      `🆕 ব্যালেন্স: ৳${user.balance}\n` +
+      `📅 সময়: ${new Date().toLocaleString()}\n\n` +
+      `🎉 আপনার অর্ডারটি সফলভাবে প্লেস করা হয়েছে!\n\n` +
+      `আমাদের সাপোর্ট টিম শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n` +
+      `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
-    await notifyAdmin(
-      `🛒 নতুন অর্ডার\n\nব্যবহারকারী: ${formattedPhone}\nনাম: ${user.name}\nঅর্ডার আইডি: ${order._id}\nসার্ভিস: ${service.name}\nমূল্য: ৳${serviceOrderData.price}\nইউজার ব্যালেন্স: ৳${user.balance}`,
-    );
+    await sendTextMessage(formattedPhone, successMessage);
+
+    // Notify admin
+    let adminMessage = `🛒 নতুন অর্ডার\n\n`;
+    adminMessage += `ব্যবহারকারী: ${formattedPhone}\n`;
+    adminMessage += `নাম: ${user.name}\n`;
+    adminMessage += `অর্ডার আইডি: ${order.orderId}\n`;
+    adminMessage += `সার্ভিস: ${service.name}\n`;
+    adminMessage += `মূল্য: ৳${serviceOrderData.price}\n`;
+    adminMessage += `ইউজার ব্যালেন্স: ৳${user.balance}\n\n`;
+    adminMessage += `📋 *প্রদত্ত তথ্য:*\n`;
+
+    processedServiceData.forEach((fieldData: ServiceDataField) => {
+      if (fieldData.type === "file") {
+        adminMessage += `• ${fieldData.label}: 📁 ফাইল\n`;
+      } else {
+        adminMessage += `• ${fieldData.label}: ${fieldData.data}\n`;
+      }
+    });
+
+    await notifyAdmin(adminMessage);
 
     await stateManager.clearUserState(formattedPhone);
     await showMainMenu(formattedPhone, false);
 
     EnhancedLogger.logFlowCompletion(formattedPhone, "service_order", {
       orderId: order._id,
+      orderNumber: order.orderId,
       serviceId: serviceOrderData.serviceId,
       serviceName: serviceOrderData.serviceName,
       price: serviceOrderData.price,
       newBalance: user.balance,
-      collectedData: serviceOrderData.collectedData,
+      fieldCount: processedServiceData.length,
     });
-  } catch (err) {
+  } catch (err: any) {
     EnhancedLogger.error(
       `Failed to confirm service order for ${formattedPhone}:`,
-      err,
+      {
+        error: err.message,
+        stack: err.stack,
+      },
     );
-    await sendTextMessage(
-      formattedPhone,
-      "❌ অর্ডার কনফার্ম করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
-    );
+
+    // More specific error message
+    let errorMessage =
+      "❌ অর্ডার কনফার্ম করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।";
+
+    if (err.message.includes("validation")) {
+      errorMessage = "❌ ডাটা ভ্যালিডেশন ত্রুটি হয়েছে। দয়া পরে চেষ্টা করুন।";
+    } else if (err.message.includes("duplicate")) {
+      errorMessage = "❌ ডুপ্লিকেট অর্ডার আইডি। দয়া পরে চেষ্টা করুন।";
+    } else if (err.message.includes("connection")) {
+      errorMessage = "❌ ডাটাবেজ কানেকশন সমস্যা। দয়া পরে চেষ্টা করুন।";
+    }
+
+    await sendTextMessage(formattedPhone, errorMessage);
     await showMainMenu(formattedPhone, false);
   }
 }
@@ -2545,7 +3096,7 @@ async function handleAdminAddServiceStart(phone: string): Promise<void> {
     flowType: "admin_add_service",
     data: {
       adminAddService: {
-        step: 1,
+        step: 1, // Start at step 1 (service name)
         serviceData: {
           requiredFields: [],
         },
@@ -2593,7 +3144,7 @@ async function handleAdminAddServiceStep(
 
         await sendTextWithCancelButton(
           phone,
-          "📝 *সার্ভিসের বিবরণ লিখুন*\n\nসার্ভিসটি সম্পর্কে সংক্ষিপ্ত বিবরণ দিন:\n\nউদাহরণ: 'পেশাদার গ্রাফিক ডিজাইন সার্ভিস'",
+          "📝 *সার্ভিসের বিবরণ লিখুন*\n\nসার্ভিসটি সম্পর্কে সংক্ষিপ্ত বিবরণ দিন:",
         );
         break;
 
@@ -2615,7 +3166,7 @@ async function handleAdminAddServiceStep(
 
         await sendTextWithCancelButton(
           phone,
-          "💰 *সার্ভিসের মূল্য লিখুন*\n\nসার্ভিসের মূল্য টাকায় লিখুন:\n\nউদাহরণ: 100\n\n📌 শুধু সংখ্যা লিখুন (দশমিক চিহ্ন ছাড়া)",
+          "💰 *সার্ভিসের মূল্য লিখুন*\n\nসার্ভিসের মূল্য টাকায় লিখুন:\n\nউদাহরণ: 100",
         );
         break;
 
@@ -2641,7 +3192,7 @@ async function handleAdminAddServiceStep(
 
         await sendTextWithCancelButton(
           phone,
-          "📋 *সার্ভিস নির্দেশনা লিখুন*\n\nগ্রাহকদের জন্য নির্দেশনা লিখুন:\n\nউদাহরণ: 'আপনার ডিজাইন তথ্য পাঠান'\n\nস্কিপ করতে 'skip' লিখুন",
+          "📋 *সার্ভিস নির্দেশনা লিখুন*\n\nগ্রাহকদের জন্য নির্দেশনা লিখুন:\n\nস্কিপ করতে 'skip' লিখুন",
         );
         break;
 
@@ -2671,210 +3222,156 @@ async function handleAdminAddServiceStep(
         if (input === "add_fields_yes") {
           await stateManager.updateStateData(formattedPhone, {
             adminAddService: {
-              step: 6,
+              step: 6, // Field name step
               serviceData: state?.data?.adminAddService?.serviceData,
-              fieldStep: 1,
             },
           });
 
           await sendTextWithCancelButton(
             phone,
-            "📝 *প্রথম ফিল্ডের নাম লিখুন*\n\nফিল্ডের নাম লিখুন (ইংরেজিতে, স্পেস ছাড়া):\n\nউদাহরণ: 'full_name'\n\n📌 নামটি ছোট, পরিষ্কার এবং বুঝতে সহজ হোক",
+            "📝 *প্রথম ফিল্ডের নাম লিখুন*\n\nফিল্ডের অভ্যন্তরীণ নাম লিখুন (ইংরেজিতে, স্পেস ছাড়া):\n\nউদাহরণ: 'full_name', 'document_file'",
           );
         } else {
           await finalizeServiceCreation(phone);
         }
         break;
 
-      case 6: // Field Name Step
-        const fieldStep = state?.data?.adminAddService?.fieldStep || 1;
-
-        if (fieldStep === 1) {
-          // Field Name
-          const fieldName = input.toLowerCase().replace(/[^a-z0-9_]/g, "_");
-          if (!fieldName || fieldName.length < 2) {
-            await sendTextMessage(
-              phone,
-              "❌ দয়া করে একটি বৈধ ফিল্ড নাম লিখুন!",
-            );
-            return;
-          }
-
-          await stateManager.updateStateData(formattedPhone, {
-            adminAddService: {
-              ...state?.data?.adminAddService,
-              currentField: {
-                name: fieldName,
-                label: "",
-                type: "text" as const,
-                required: true,
-              },
-              fieldStep: 2,
-            },
-          });
-
-          await sendTextWithCancelButton(
-            phone,
-            "📝 *ফিল্ডের লেবেল লিখুন*\n\nফিল্ডের লেবেল লিখুন (ব্যবহারকারী দেখবে):\n\nউদাহরণ: 'আপনার পূর্ণ নাম'\n\n📌 লেবেলটি পরিষ্কার ও বর্ণনামূলক হোক",
-          );
-        } else if (fieldStep === 2) {
-          // Field Label
-          if (!input.trim()) {
-            await sendTextMessage(phone, "❌ দয়া করে একটি লেবেল লিখুন!");
-            return;
-          }
-
-          await stateManager.updateStateData(formattedPhone, {
-            adminAddService: {
-              ...state?.data?.adminAddService,
-              currentField: {
-                ...state?.data?.adminAddService?.currentField,
-                label: input.trim(),
-              },
-              fieldStep: 3,
-            },
-          });
-
-          await sendQuickReplyMenu(
-            phone,
-            "📋 ফিল্ডের ধরন\n\nফিল্ডের ধরন সিলেক্ট করুন:",
-            [
-              { id: "field_text", title: "📝 টেক্সট" },
-              { id: "field_number", title: "🔢 নাম্বার" },
-              { id: "field_select", title: "📋 সিলেক্ট অপশন" },
-              { id: "field_file", title: "📁 ফাইল" },
-            ],
-          );
-        } else if (fieldStep === 3) {
-          // Field Type
-          const fieldType =
-            input === "field_text"
-              ? "text"
-              : input === "field_number"
-                ? "number"
-                : input === "field_select"
-                  ? "select"
-                  : "file";
-
-          await stateManager.updateStateData(formattedPhone, {
-            adminAddService: {
-              ...state?.data?.adminAddService,
-              currentField: {
-                ...state?.data?.adminAddService?.currentField,
-                type: fieldType,
-              },
-              fieldStep: fieldType === "select" ? 4 : 5,
-            },
-          });
-
-          if (fieldType === "select") {
-            await sendTextWithCancelButton(
-              phone,
-              "📋 *অপশনসমূহ লিখুন*\n\nঅপশনগুলো কমা (,) দিয়ে আলাদা করে লিখুন:\n\nউদাহরণ: 'ছোট, মধ্যম, বড়'\n\n📌 কমপক্ষে ২টি অপশন দিন",
-            );
-          } else {
-            await sendQuickReplyMenu(
-              phone,
-              "📋 প্রয়োজনীয়তা\n\nফিল্ডটি কি প্রয়োজনীয়?",
-              [
-                { id: "required_yes", title: "✅ প্রয়োজনীয়" },
-                { id: "required_no", title: "➡️ ঐচ্ছিক" },
-              ],
-            );
-          }
-        } else if (fieldStep === 4) {
-          // Select Options
-          const options = input
-            .split(",")
-            .map((opt) => opt.trim())
-            .filter((opt) => opt.length > 0);
-
-          if (options.length < 2) {
-            await sendTextMessage(phone, "❌ কমপক্ষে ২টি অপশন দিন!");
-            return;
-          }
-
-          await stateManager.updateStateData(formattedPhone, {
-            adminAddService: {
-              ...state?.data?.adminAddService,
-              currentField: {
-                ...state?.data?.adminAddService?.currentField,
-                options: options,
-              },
-              fieldStep: 5,
-            },
-          });
-
-          await sendQuickReplyMenu(
-            phone,
-            "📋 প্রয়োজনীয়তা\n\nফিল্ডটি কি প্রয়োজনীয়?",
-            [
-              { id: "required_yes", title: "✅ প্রয়োজনীয়" },
-              { id: "required_no", title: "➡️ ঐচ্ছিক" },
-            ],
-          );
-        } else if (fieldStep === 5) {
-          // Required or not
-          const required = input === "required_yes";
-          const currentField = state?.data?.adminAddService?.currentField;
-
-          if (!currentField) {
-            throw new Error("Current field not found");
-          }
-
-          const completedField: ServiceField = {
-            id: `field_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-            name: currentField.name || "",
-            label: currentField.label || "",
-            type: currentField.type || "text",
-            required: required,
-            options: currentField.options,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          };
-
-          const serviceData = state?.data?.adminAddService?.serviceData;
-          const updatedFields = [
-            ...(serviceData?.requiredFields || []),
-            completedField,
-          ];
-
-          await stateManager.updateStateData(formattedPhone, {
-            adminAddService: {
-              step: 7,
-              serviceData: {
-                ...serviceData,
-                requiredFields: updatedFields,
-              },
-              fieldStep: 1,
-              currentField: undefined,
-            },
-          });
-
-          await sendQuickReplyMenu(
-            phone,
-            "📋 ফিল্ড যোগ করা হয়েছে\n\nআরেকটি ফিল্ড যোগ করবেন?",
-            [
-              { id: "add_more_fields", title: "➕ আরেকটি যোগ করুন" },
-              { id: "finish_fields", title: "✅ শেষ করুন" },
-            ],
-          );
+      case 6: // Field Name
+        if (!input.trim()) {
+          await sendTextMessage(phone, "❌ দয়া করে একটি ফিল্ড নাম লিখুন!");
+          return;
         }
+
+        const fieldName = input.trim().toLowerCase().replace(/\s+/g, "_");
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            ...state?.data?.adminAddService,
+            currentField: {
+              name: fieldName,
+            },
+            step: 7, // Move to field label step
+          },
+        });
+
+        await sendTextWithCancelButton(
+          phone,
+          `📝 *ফিল্ডের লেবেল লিখুন*\n\nফিল্ডের লেবেল লিখুন (ব্যবহারকারী দেখবে):\n\nউদাহরণ: 'আপনার পূর্ণ নাম', 'ডকুমেন্ট আপলোড করুন'`,
+        );
         break;
 
-      case 7: // More fields or finish
-        if (input === "add_more_fields") {
+      case 7: // Field Label
+        if (!input.trim()) {
+          await sendTextMessage(phone, "❌ দয়া করে একটি লেবেল লিখুন!");
+          return;
+        }
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            ...state?.data?.adminAddService,
+            currentField: {
+              ...state?.data?.adminAddService?.currentField,
+              label: input.trim(),
+            },
+            step: 8, // Move to field type step
+          },
+        });
+
+        await sendQuickReplyMenu(
+          phone,
+          "📋 ফিল্ডের ধরন\n\nফিল্ডের ধরন সিলেক্ট করুন:",
+          [
+            { id: "field_type_text", title: "📝 টেক্সট" },
+            { id: "field_type_file", title: "📁 ফাইল" },
+          ],
+        );
+        break;
+
+      case 8: // Field Type
+        let fieldType: "text" | "file" = "text";
+        if (input === "field_type_file") {
+          fieldType = "file";
+        }
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            ...state?.data?.adminAddService,
+            currentField: {
+              ...state?.data?.adminAddService?.currentField,
+              type: fieldType,
+            },
+            step: 9, // Move to field required step
+          },
+        });
+
+        await sendQuickReplyMenu(
+          phone,
+          "📋 প্রয়োজনীয়তা\n\nফিল্ডটি কি প্রয়োজনীয়?",
+          [
+            { id: "field_required_yes", title: "✅ প্রয়োজনীয়" },
+            { id: "field_required_no", title: "➡️ ঐচ্ছিক" },
+          ],
+        );
+        break;
+
+      case 9: // Field Required
+        const required = input === "field_required_yes";
+        const currentField = state?.data?.adminAddService?.currentField;
+
+        if (!currentField) {
+          throw new Error("Current field not found");
+        }
+
+        const completedField: ServiceField = {
+          id: `field_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          name: currentField.name || "",
+          label: currentField.label || "",
+          type: currentField.type || "text",
+          required: required,
+          description: "",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+
+        const serviceData = state?.data?.adminAddService?.serviceData;
+        const updatedFields = [
+          ...(serviceData?.requiredFields || []),
+          completedField,
+        ];
+
+        await stateManager.updateStateData(formattedPhone, {
+          adminAddService: {
+            step: 10, // Move to add more fields decision
+            serviceData: {
+              ...serviceData,
+              requiredFields: updatedFields,
+            },
+            currentField: undefined, // Clear current field
+          },
+        });
+
+        await sendQuickReplyMenu(
+          phone,
+          `✅ ফিল্ড যোগ করা হয়েছে\n\nফিল্ড: ${completedField.label}\nটাইপ: ${completedField.type}\nপ্রয়োজনীয়: ${completedField.required ? "হ্যাঁ" : "না"}\n\nআরেকটি ফিল্ড যোগ করবেন?`,
+          [
+            { id: "add_more_fields_yes", title: "➕ আরেকটি যোগ করুন" },
+            { id: "add_more_fields_no", title: "✅ শেষ করুন" },
+          ],
+        );
+        break;
+
+      case 10: // Add More Fields Decision
+        if (input === "add_more_fields_yes") {
           await stateManager.updateStateData(formattedPhone, {
             adminAddService: {
               ...state?.data?.adminAddService,
-              step: 6,
-              fieldStep: 1,
+              step: 6, // Go back to field name step
             },
           });
 
           await sendTextWithCancelButton(
             phone,
-            "📝 *পরবর্তী ফিল্ডের নাম লিখুন*\n\nফিল্ডের নাম লিখুন (ইংরেজিতে):\n\nউদাহরণ: 'email'",
+            "📝 *পরবর্তী ফিল্ডের নাম লিখুন*\n\nফিল্ডের অভ্যন্তরীণ নাম লিখুন (ইংরেজিতে, স্পেস ছাড়া):",
           );
         } else {
           await finalizeServiceCreation(phone);
@@ -2932,22 +3429,37 @@ async function finalizeServiceCreation(phone: string): Promise<void> {
       instructions: serviceData.instructions || "",
       requiredFields: serviceData.requiredFields || [],
       isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
     });
 
-    const message =
+    let message =
       `✅ *সার্ভিস তৈরি সফল*\n\n` +
       `📦 সার্ভিস: ${serviceData.name}\n` +
       `💰 মূল্য: ৳${serviceData.price}\n` +
       `📝 বিবরণ: ${serviceData.description}\n` +
       `📋 ফিল্ড সংখ্যা: ${serviceData.requiredFields?.length || 0}\n` +
-      `🆔 সার্ভিস আইডি: ${newService._id}\n\n` +
+      `🆔 সার্ভিস আইডি: ${newService._id}\n\n`;
+
+    // List all fields
+    if (serviceData.requiredFields && serviceData.requiredFields.length > 0) {
+      message += `📋 *ফিল্ডসমূহ:*\n`;
+      serviceData.requiredFields.forEach(
+        (field: ServiceField, index: number) => {
+          message += `${index + 1}. ${field.label} (${field.type}) - ${field.required ? "প্রয়োজনীয়" : "ঐচ্ছিক"}\n`;
+        },
+      );
+      message += `\n`;
+    }
+
+    message +=
       `🎉 সার্ভিস সফলভাবে তৈরি করা হয়েছে!\n\n` +
       `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(phone, message);
 
     await notifyAdmin(
-      `📦 নতুন সার্ভিস তৈরি করা হয়েছে\n\nসার্ভিস: ${serviceData.name}\nমূল্য: ৳${serviceData.price}\nতৈরি করেছেন: ${formattedPhone}\nসার্ভিস আইডি: ${newService._id}`,
+      `📦 নতুন সার্ভিস তৈরি করা হয়েছে\n\nসার্ভিস: ${serviceData.name}\nমূল্য: ৳${serviceData.price}\nতৈরি করেছেন: ${formattedPhone}\nসার্ভিস আইডি: ${newService._id}\nফিল্ড সংখ্যা: ${serviceData.requiredFields?.length || 0}`,
     );
 
     await stateManager.clearUserState(formattedPhone);
@@ -3711,7 +4223,18 @@ async function handleAdminViewOrders(phone: string): Promise<void> {
       message += `   🆔: ${order._id}\n`;
       message += `   👤: ${user?.name || "N/A"} (${user?.whatsapp || "N/A"})\n`;
       message += `   💰: ৳${order.totalPrice}\n`;
-      message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n\n`;
+      message += `   📅: ${new Date(order.placedAt).toLocaleDateString()}\n`;
+      //add file or text info
+      order.serviceData.forEach((item: any, index: number) => {
+        if (item.type === "file") {
+          const publicUrl = `${process.env.NEXT_PUBLIC_URL}/order-file/${order._id}/${index}`;
+          message += `      📁 ${publicUrl}: [ফাইল সংযুক্ত]\n`;
+        } else {
+          message += `      📝 ${item.fieldName}: ${item.value}\n`;
+        }
+      });
+
+      message += `\n`;
     });
 
     const totalOrders = await Order.countDocuments();
@@ -4210,24 +4733,59 @@ async function completeFailedOrCancelledOrder(phone: string): Promise<void> {
     await cancelFlow(phone, true);
   }
 }
-async function sendDeliveryFile(
+export async function sendDeliveryFile(
   to: string,
   fileUrl: string,
   fileName: string,
   fileType: string,
-  caption?: string
+  caption?: string,
 ): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
 
-  const PHONE_NUMBER_ID = process.env.WA_PHONE_NUMBER_ID!;
-  const ACCESS_TOKEN = process.env.WA_ACCESS_TOKEN!;
+  console.log("=== WhatsApp API Debug ===");
+  console.log("1. Input Parameters:");
+  console.log("- to:", to);
+  console.log("- formattedTo:", formattedTo);
+  console.log("- fileUrl:", fileUrl);
+  console.log("- fileName:", fileName);
+  console.log("- fileType:", fileType);
+  console.log("- caption:", caption);
+
+  const PHONE_NUMBER_ID = CONFIG.phoneNumberId;
+  const ACCESS_TOKEN = CONFIG.accessToken;
+
+  console.log("2. Environment Variables:");
+  console.log("- PHONE_NUMBER_ID:", PHONE_NUMBER_ID ? "***SET***" : "MISSING!");
+  console.log("- ACCESS_TOKEN:", ACCESS_TOKEN ? "***SET***" : "MISSING!");
+
+  // Validate environment variables
+  if (!PHONE_NUMBER_ID || !ACCESS_TOKEN) {
+    const error =
+      "Missing WhatsApp API credentials. Check WA_PHONE_NUMBER_ID and WA_ACCESS_TOKEN.";
+    console.error("3. Validation Error:", error);
+    throw new Error(error);
+  }
+
+  // Validate phone number
+  if (!formattedTo) {
+    const error = "Invalid phone number format";
+    console.error("3. Validation Error:", error);
+    throw new Error(error);
+  }
+
+  // Validate file URL
+  if (!fileUrl || !fileUrl.startsWith("http")) {
+    const error = "Invalid file URL. Must be a valid HTTP/HTTPS URL.";
+    console.error("3. Validation Error:", error);
+    throw new Error(error);
+  }
 
   const ext = fileName.toLowerCase().split(".").pop() || "";
 
   let type: "image" | "document" = "document";
   let media: any = {};
 
-  // Image
+  // Check for images
   if (
     fileType.startsWith("image/") ||
     ["jpg", "jpeg", "png", "webp", "gif"].includes(ext)
@@ -4237,9 +4795,8 @@ async function sendDeliveryFile(
       link: fileUrl,
       caption: caption || undefined,
     };
-  }
-  // Document (pdf, doc, xls, etc)
-  else {
+  } else {
+    // For documents
     type = "document";
     media = {
       link: fileUrl,
@@ -4250,32 +4807,70 @@ async function sendDeliveryFile(
 
   const payload = {
     messaging_product: "whatsapp",
+    recipient_type: "individual",
     to: formattedTo,
-    type,
+    type: type,
     [type]: media,
   };
 
-  const res = await fetch(
-    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
-    {
+  console.log("4. Generated Payload:");
+  console.log("- Type:", type);
+  console.log("- Payload:", JSON.stringify(payload, null, 2));
+
+  const url = `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`;
+  console.log("5. API URL:", url);
+
+  try {
+    console.log("6. Making API request...");
+    const res = await fetch(url, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${ACCESS_TOKEN}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
+    });
+
+    console.log("7. Response Status:", res.status, res.statusText);
+
+    const data = await res.json();
+    console.log("8. Response Data:", JSON.stringify(data, null, 2));
+
+    if (!res.ok) {
+      console.error("9. WhatsApp API Error Details:");
+      console.error("- Status:", res.status);
+      console.error("- Status Text:", res.statusText);
+      console.error("- Error:", data.error);
+      console.error("- fbtrace_id:", data.error?.fbtrace_id);
+      console.error("- Payload sent:", JSON.stringify(payload, null, 2));
+
+      let errorMessage = `WhatsApp API error (${res.status}): `;
+      if (data?.error?.message) {
+        errorMessage += data.error.message;
+      } else if (data?.error?.error_user_msg) {
+        errorMessage += data.error.error_user_msg;
+      } else {
+        errorMessage += "Unknown error";
+      }
+
+      throw new Error(errorMessage);
     }
-  );
 
-  const data = await res.json();
+    console.log("10. SUCCESS - Message sent!");
+    console.log("- Message ID:", data.messages?.[0]?.id);
+    console.log("- Contact WA ID:", data.contacts?.[0]?.wa_id);
 
-  if (!res.ok) {
-    throw new Error(
-      `WhatsApp API error: ${data?.error?.message || "Unknown error"}`
-    );
+    return data;
+  } catch (error) {
+    console.error("11. CATCH BLOCK - Error occurred:");
+    if (error instanceof Error) {
+      console.error("- Error message:", error.message);
+      console.error("- Stack trace:", error.stack);
+      throw error;
+    }
+    console.error("- Unknown error:", error);
+    throw new Error(`Network or unknown error: ${error}`);
   }
-
-  return data;
 }
 
 // Helper function to get file size in readable format
@@ -4283,7 +4878,7 @@ async function getFileSize(fileUrl: string): Promise<string> {
   try {
     const response = await fetch(fileUrl, { method: "HEAD" });
     const contentLength = response.headers.get("content-length");
-    
+
     if (contentLength) {
       const bytes = parseInt(contentLength, 10);
       if (bytes < 1024) return `${bytes} bytes`;
@@ -4305,7 +4900,65 @@ async function isUrlAccessible(fileUrl: string): Promise<boolean> {
     return false;
   }
 }
+export async function sendOrderDeliveryTemplate(
+  to: string,
+  productName: string,
+  storeName: string,
+  invoiceNumber: string,
+  documentUrl: string,
+  documentFileName: string,
+  language = "en_US",
+) {
+  const res = await fetch(
+    `https://graph.facebook.com/v22.0/${CONFIG.phoneNumberId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${CONFIG.accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to,
+        type: "template",
+        template: {
+          name: "purchase_receipt",
+          language: { code: language },
+          components: [
+            {
+              type: "body",
+              parameters: [
+                { type: "text", text: productName },
+                { type: "text", text: storeName },
+                { type: "text", text: invoiceNumber },
+              ],
+            },
+            {
+              type: "header",
+              parameters: [
+                {
+                  type: "document",
+                  document: {
+                    link: documentUrl,
+                    filename: documentFileName,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    },
+  );
 
+  const data = await res.json();
+
+  if (!res.ok) {
+    throw new Error(`WhatsApp Delivery Error: ${JSON.stringify(data)}`);
+  }
+
+  return data;
+}
 // Updated completeOrderDelivery function to use sendDeliveryFile
 async function completeOrderDelivery(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
@@ -4333,7 +4986,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
 
     // Always set status to "completed" for successful deliveries
     const newStatus = "completed";
-    
+
     EnhancedLogger.info(`Updating order status to: ${newStatus}`, {
       orderId,
       deliveryType,
@@ -4356,11 +5009,11 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     };
 
     updatedOrder.updatedAt = new Date();
-    
+
     EnhancedLogger.info(`Saving order with delivery data`, {
       deliveryData: updatedOrder.deliveryData,
     });
-    
+
     await updatedOrder.save();
 
     EnhancedLogger.info(`Order saved successfully`, {
@@ -4383,58 +5036,80 @@ async function completeOrderDelivery(phone: string): Promise<void> {
       }
 
       await sendTextMessage(user.whatsapp, notification);
-
+      const newData = await Order.findById(orderId);
+      // log the newData
+      EnhancedLogger.info(`Fetched updated order data for delivery`, {
+        orderId,
+        newData,
+      });
       // Step 2: Send file if available
-      if (deliveryData?.fileUrl && deliveryData?.fileName && deliveryData?.fileType) {
+      if (newData?.deliveryData?.fileUrl) {
         // Check if URL is accessible before trying to send
         const publicUrl = `${process.env.NEXT_PUBLIC_URL}/file/${orderId}`;
+        //log the publicUrl
+        EnhancedLogger.info(`Preparing to send delivery file`, {
+          orderId,
+          fileUrl: newData.deliveryData.fileUrl,
+          publicUrl,
+        });
         const isAccessible = await isUrlAccessible(publicUrl);
-        
+        //log the accessibility status
+        EnhancedLogger.info(`File URL accessibility check`, {
+          orderId,
+          isAccessible,
+        });
+
         if (isAccessible) {
           try {
             // Create caption for the file
             const fileCaption = `📦 ${updatedOrder.serviceName || "Service"} - Delivery File\n🆔 Order: ${orderId.slice(-8)}`;
-            
+
             // Send the file using WhatsApp's media API
-            await sendDeliveryFile(
+            await sendOrderDeliveryTemplate(
               user.whatsapp,
+              updatedOrder.serviceName || "Service",
+              "Birth Help",
+              orderId,
               publicUrl,
-              deliveryData.fileName,
-              deliveryData.fileType,
-              fileCaption
+              deliveryData.fileName || "delivery_file",
             );
-            
-            EnhancedLogger.info(`File sent successfully to user ${user.whatsapp}`);
+
+            EnhancedLogger.info(
+              `File sent successfully to user ${user.whatsapp}`,
+            );
           } catch (fileError: any) {
             EnhancedLogger.error(`Failed to send file via WhatsApp API:`, {
               error: fileError?.message || fileError,
               fileUrl: deliveryData.fileUrl,
             });
-            
+
             // Fallback: Send download link
-            const downloadMessage = `📁 *ডেলিভারি ফাইল:*\n\n` +
+            const downloadMessage =
+              `📁 *ডেলিভারি ফাইল:*\n\n` +
               `ফাইল: ${deliveryData.fileName}\n` +
               `📎 ডাউনলোড লিঙ্ক: ${publicUrl}\n\n` +
               `ফাইলটি ডাউনলোড করতে উপরের লিঙ্কে ক্লিক করুন।`;
-            
+
             await sendTextMessage(user.whatsapp, downloadMessage);
           }
         } else {
           // URL not accessible, send direct link
-          const inaccessibleMessage = `📁 *ডেলিভারি ফাইল:*\n\n` +
+          const inaccessibleMessage =
+            `📁 *ডেলিভারি ফাইল:*\n\n` +
             `ফাইল: ${deliveryData.fileName}\n` +
             `📎 ডাউনলোড লিঙ্ক: ${publicUrl}\n\n` +
             `ফাইলটি ডাউনলোড করতে উপরের লিঙ্কে ক্লিক করুন।`;
-          
+
           await sendTextMessage(user.whatsapp, inaccessibleMessage);
         }
       }
 
       // Step 3: Send final message
-      const finalMessage = `🎉 আপনার অর্ডার সফলভাবে সম্পন্ন হয়েছে!\n` +
+      const finalMessage =
+        `🎉 আপনার অর্ডার সফলভাবে সম্পন্ন হয়েছে!\n` +
         `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন: ${CONFIG.supportNumber}\n\n` +
         `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-      
+
       await sendTextMessage(user.whatsapp, finalMessage);
     }
 
@@ -4449,7 +5124,7 @@ async function completeOrderDelivery(phone: string): Promise<void> {
     if (deliveryType === "text" || deliveryType === "both") {
       adminMessage += `📝 টেক্সট পাঠানো: ${deliveryData?.text ? "✅ হ্যাঁ" : "❌ না"}\n`;
     }
-    
+
     if (deliveryType === "file" || deliveryType === "both") {
       adminMessage += `📁 ফাইল পাঠানো: ${deliveryData?.fileName ? "✅ হ্যাঁ" : "❌ না"}\n`;
     }
@@ -4501,26 +5176,32 @@ async function handleAdminFileUpload(
     return;
   }
 
-  EnhancedLogger.info(`Starting file upload for order: ${orderId}`, {
+  EnhancedLogger.info(`Admin file upload for order: ${orderId}`, {
     messageType: message.type,
     deliveryType,
   });
 
   try {
     if (message.type === "image" || message.type === "document") {
+      await sendTextMessage(
+        phone,
+        "⏳ *ফাইল আপলোড হচ্ছে...*\n\nদয়া করে অপেক্ষা করুন।",
+      );
+
       const mediaId =
         message.type === "image" ? message.image?.id : message.document?.id;
       const fileName =
         message.type === "image"
-          ? `order_${orderId}_${Date.now()}.jpg`
-          : message.document?.filename || `order_${orderId}_${Date.now()}.pdf`;
+          ? `delivery_${orderId}_${Date.now()}.jpg`
+          : message.document?.filename ||
+            `delivery_${orderId}_${Date.now()}.pdf`;
 
       if (!mediaId) {
         await sendTextMessage(phone, "❌ ফাইল আইডি পাওয়া যায়নি!");
         return;
       }
 
-      EnhancedLogger.info(`Downloading media: ${mediaId}`);
+      EnhancedLogger.info(`Downloading admin media: ${mediaId}`);
 
       // Download media from WhatsApp
       const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
@@ -4534,19 +5215,55 @@ async function handleAdminFileUpload(
         return;
       }
 
-      EnhancedLogger.info(`Media downloaded, uploading to server`, {
+      EnhancedLogger.info(`Admin media downloaded, uploading to server`, {
         fileName,
         fileSize: buffer.length,
         mimeType,
       });
 
-      // Upload to your server
-      const fileUrl = await uploadFile(buffer, fileName, mimeType);
+      // Create order-specific upload directory
+      const orderUploadsDir = path.join(
+        process.cwd(),
+        "uploads",
+        "orders",
+        orderId,
+      );
 
-      EnhancedLogger.info(`File uploaded successfully`, {
-        fileUrl,
-        fileName,
+      if (!fs.existsSync(orderUploadsDir)) {
+        EnhancedLogger.info(
+          `Creating order upload directory: ${orderUploadsDir}`,
+        );
+        fs.mkdirSync(orderUploadsDir, { recursive: true });
+      }
+
+      // Generate unique filename
+      const fileExt =
+        path.extname(fileName) ||
+        (mimeType.includes("image") ? ".jpg" : ".bin");
+      const uniqueFileName = `${Date.now()}_delivery${fileExt}`;
+      const filePath = path.join(orderUploadsDir, uniqueFileName);
+
+      EnhancedLogger.info(`Saving admin file to: ${filePath}`);
+
+      // Save file to disk
+      fs.writeFileSync(filePath, buffer);
+
+      // Verify file was saved
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`Failed to save file to ${filePath}`);
+      }
+
+      const stats = fs.statSync(filePath);
+      const fileSize = formatFileSize(stats.size);
+
+      EnhancedLogger.info(`Admin file saved successfully`, {
+        filePath,
+        fileSize: stats.size,
+        savedSize: buffer.length,
       });
+
+      // Create public URL for the file
+      const publicUrl = filePath;
 
       // Update state with file info
       await stateManager.updateStateData(formattedPhone, {
@@ -4554,9 +5271,10 @@ async function handleAdminFileUpload(
           ...state.data?.adminProcessOrder,
           deliveryData: {
             ...state.data?.adminProcessOrder?.deliveryData,
-            fileUrl: fileUrl,
-            fileName: fileName,
+            fileUrl: publicUrl,
+            fileName: uniqueFileName,
             fileType: mimeType,
+            fileSize: fileSize,
           },
           step: 5, // Always go to step 5 after file upload for completed orders
         },
@@ -4564,7 +5282,7 @@ async function handleAdminFileUpload(
 
       await sendTextMessage(
         phone,
-        `✅ *ফাইল আপলোড সফল*\n\n📁 ফাইল: ${fileName}\n📊 সাইজ: ${(buffer.length / 1024).toFixed(2)}KB\n\nফাইল সফলভাবে আপলোড হয়েছে!`,
+        `✅ *ফাইল আপলোড সফল*\n\n📁 ফাইল: ${uniqueFileName}\n📊 সাইজ: ${fileSize}\n📄 টাইপ: ${mimeType}\n\nফাইল সফলভাবে আপলোড হয়েছে!`,
       );
 
       // Continue with order completion
@@ -4576,7 +5294,7 @@ async function handleAdminFileUpload(
       );
     }
   } catch (err: any) {
-    EnhancedLogger.error(`Failed to handle file upload:`, {
+    EnhancedLogger.error(`Failed to handle admin file upload:`, {
       error: err?.message || err,
       stack: err?.stack,
     });
@@ -5630,6 +6348,746 @@ async function handleAdminBanUserConfirm(
   }
 }
 
+async function triggerAutoFileDelivery(
+  adminPhone: string,
+  message: WhatsAppMessage,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(adminPhone);
+  const requestId =
+    Date.now().toString(36) + Math.random().toString(36).substring(2);
+
+  EnhancedLogger.info(
+    `[${requestId}] Starting auto file delivery for admin: ${formattedPhone}`,
+    {
+      messageType: message.type,
+      hasImage: !!message.image,
+      hasDocument: !!message.document,
+    },
+  );
+
+  try {
+    // Send initial message
+    await sendTextMessage(
+      adminPhone,
+      "🤖 *অটো ফাইল ডেলিভারি শুরু হয়েছে*\n\n📁 ফাইল ডাউনলোড করা হচ্ছে...",
+    );
+
+    if (message.type === "image" || message.type === "document") {
+      const mediaId =
+        message.type === "image" ? message.image?.id : message.document?.id;
+      const originalFileName =
+        message.type === "image"
+          ? `auto_delivery_${Date.now()}.jpg`
+          : message.document?.filename || `auto_delivery_${Date.now()}.pdf`;
+
+      if (!mediaId) {
+        EnhancedLogger.error(`[${requestId}] No media ID found`);
+        await sendTextMessage(adminPhone, "❌ ফাইল আইডি পাওয়া যায়নি!");
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      // Download file
+      let buffer: Buffer;
+      let mimeType: string;
+
+      try {
+        EnhancedLogger.info(
+          `[${requestId}] Downloading WhatsApp media: ${mediaId}`,
+        );
+        const downloadResult = await downloadWhatsAppMedia(mediaId);
+        buffer = downloadResult.buffer;
+        mimeType = downloadResult.mimeType;
+
+        EnhancedLogger.debug(`[${requestId}] Media downloaded successfully`, {
+          bufferSize: buffer.length,
+          mimeType,
+        });
+      } catch (downloadError: any) {
+        EnhancedLogger.error(`[${requestId}] Failed to download media:`, {
+          error: downloadError?.message || downloadError,
+          stack: downloadError?.stack,
+          mediaId,
+        });
+
+        await sendTextMessage(
+          adminPhone,
+          "❌ ফাইল ডাউনলোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+        );
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      // Check file size
+      if (buffer.length > CONFIG.maxFileSize) {
+        EnhancedLogger.warn(`[${requestId}] File size too large`, {
+          fileSize: buffer.length,
+          maxSize: CONFIG.maxFileSize,
+        });
+
+        await sendTextMessage(
+          adminPhone,
+          `❌ ফাইল সাইজ খুব বড়! সর্বোচ্চ সাইজ: ${CONFIG.maxFileSize / 1024 / 1024}MB`,
+        );
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      // Extract filename without extension
+      const fileNameWithoutExt = path.parse(originalFileName).name;
+      const cleanFileName = fileNameWithoutExt
+        .toLowerCase()
+        .replace(/[^a-z0-9\u0980-\u09FF]/g, " ") // Replace special chars with space
+        .trim();
+
+      // Create search terms: BOTH the full filename AND individual words
+      const searchTerms = new Set<string>();
+
+      // 1. Add the full filename as one search term (john_certificate)
+      searchTerms.add(cleanFileName);
+
+      // 2. Also add individual words from the filename
+      const individualWords = cleanFileName
+        .split(/\s+/)
+        .filter((term) => term.length > 1);
+      individualWords.forEach((word) => searchTerms.add(word));
+
+      // Convert to array
+      const keywords = Array.from(searchTerms);
+
+      // Filter out very short terms
+      const filteredKeywords = keywords.filter((term) => term.length >= 2);
+
+      if (filteredKeywords.length === 0) {
+        EnhancedLogger.warn(`[${requestId}] No valid search terms extracted`, {
+          originalFileName,
+          cleanFileName,
+        });
+
+        await sendTextMessage(
+          adminPhone,
+          "❌ ফাইলনেম থেকে কোনো সার্চ টার্ম তৈরি করা যায়নি। ফাইলনেমে টেক্সট যোগ করুন (যেমন: john_certificate.pdf)।",
+        );
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      EnhancedLogger.info(`[${requestId}] Extracted search keywords`, {
+        originalFileName,
+        fileNameWithoutExt,
+        cleanFileName,
+        keywords: filteredKeywords,
+        fileSize: buffer.length,
+        mimeType,
+      });
+
+      // Create directory structure for auto delivery
+      const autoDeliveryBaseDir = path.join(
+        process.cwd(),
+        "uploads",
+        "auto_delivery",
+      );
+      const today = new Date();
+      const year = today.getFullYear().toString();
+      const month = (today.getMonth() + 1).toString().padStart(2, "0");
+      const day = today.getDate().toString().padStart(2, "0");
+
+      // Create directory: uploads/auto_delivery/YYYY/MM/DD/
+      const deliveryDir = path.join(autoDeliveryBaseDir, year, month, day);
+
+      try {
+        if (!fs.existsSync(deliveryDir)) {
+          fs.mkdirSync(deliveryDir, { recursive: true });
+          EnhancedLogger.info(
+            `[${requestId}] Created delivery directory: ${deliveryDir}`,
+          );
+        }
+      } catch (dirError: any) {
+        EnhancedLogger.error(`[${requestId}] Failed to create directory:`, {
+          error: dirError?.message || dirError,
+          stack: dirError?.stack,
+          deliveryDir,
+        });
+
+        await sendTextMessage(
+          adminPhone,
+          "❌ ফাইল সেভ করার ডিরেক্টরি তৈরি করতে সমস্যা হয়েছে।",
+        );
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      // Generate unique filename with timestamp
+      const timestamp = Date.now();
+      const randomString = Math.random().toString(36).substring(2, 10);
+      const fileExtension =
+        path.extname(originalFileName) ||
+        (mimeType.includes("image")
+          ? ".jpg"
+          : mimeType.includes("pdf")
+            ? ".pdf"
+            : mimeType.includes("word")
+              ? ".docx"
+              : ".bin");
+
+      const uniqueFileName = `${timestamp}_${randomString}${fileExtension}`;
+      const filePath = path.join(deliveryDir, uniqueFileName);
+
+      // Save file to server
+      try {
+        fs.writeFileSync(filePath, buffer);
+
+        // Verify file was saved
+        if (!fs.existsSync(filePath)) {
+          throw new Error(`Failed to save file to ${filePath}`);
+        }
+
+        const stats = fs.statSync(filePath);
+        EnhancedLogger.info(
+          `[${requestId}] File saved to server successfully`,
+          {
+            filePath,
+            fileSize: stats.size,
+            originalSize: buffer.length,
+            saved: stats.size === buffer.length,
+          },
+        );
+      } catch (saveError: any) {
+        EnhancedLogger.error(`[${requestId}] Failed to save file:`, {
+          error: saveError?.message || saveError,
+          stack: saveError?.stack,
+          filePath,
+        });
+
+        await sendTextMessage(
+          adminPhone,
+          "❌ ফাইল সার্ভারে সেভ করতে সমস্যা হয়েছে।",
+        );
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      // Create relative path for database storage
+      const relativePath = path
+        .join("auto_delivery", year, month, day, uniqueFileName)
+        .replace(/\\/g, "/");
+
+      await sendTextMessage(
+        adminPhone,
+        `✅ *ফাইল প্রসেস সম্পন্ন*\n\n📁 অরিজিনাল ফাইল: ${originalFileName}\n📁 সার্চ টার্ম: "${cleanFileName}"\n📊 সাইজ: ${formatFileSize(buffer.length)}\n📁 সেভ করা হয়েছে: ${relativePath}\n🔍 সার্চ করা হবে: "${filteredKeywords.join('", "')}"\n\n⏳ অর্ডার ম্যাচ খুঁজছি...`,
+      );
+
+      // Connect to database and search for orders
+      let orders = [];
+      try {
+        await connectDB();
+
+        // Get all pending orders
+        orders = await Order.find({
+          status: "pending",
+        })
+          .populate("userId", "name whatsapp")
+          .populate("serviceId", "name")
+          .sort({ createdAt: -1 });
+
+        EnhancedLogger.info(
+          `[${requestId}] Found ${orders.length} pending orders`,
+        );
+      } catch (dbError: any) {
+        EnhancedLogger.error(`[${requestId}] Database connection error:`, {
+          error: dbError?.message || dbError,
+          stack: dbError?.stack,
+        });
+
+        await sendTextMessage(
+          adminPhone,
+          "❌ ডাটাবেজে কানেকশন সমস্যা। দয়া পরে চেষ্টা করুন।",
+        );
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      const matchedOrders = [];
+      const deliveredUsers = new Set(); // To avoid duplicate deliveries
+
+      // Search through orders
+      for (const order of orders) {
+        try {
+          const user = order.userId as any;
+          if (!user || !user.whatsapp) {
+            EnhancedLogger.debug(
+              `[${requestId}] Skipping order ${order._id} - no user or whatsapp`,
+            );
+            continue;
+          }
+
+          if (deliveredUsers.has(user._id.toString())) {
+            EnhancedLogger.debug(
+              `[${requestId}] Skipping duplicate user ${user._id}`,
+            );
+            continue;
+          }
+
+          let isMatch = false;
+          let matchedField = "";
+          let matchedValue = "";
+
+          // Search in service data fields
+          if (order.serviceData && Array.isArray(order.serviceData)) {
+            for (const field of order.serviceData) {
+              if (field.type === "text" && field.data) {
+                try {
+                  const fieldText = field.data.toString().toLowerCase();
+
+                  // Check each keyword (including full filename)
+                  for (const keyword of filteredKeywords) {
+                    if (fieldText.includes(keyword)) {
+                      isMatch = true;
+                      matchedField = field.label;
+                      matchedValue =
+                        typeof field.data === "string"
+                          ? field.data
+                          : JSON.stringify(field.data);
+
+                      EnhancedLogger.debug(`[${requestId}] Match found`, {
+                        orderId: order._id,
+                        keyword,
+                        fieldText,
+                        matchedField,
+                        matchedValue,
+                      });
+
+                      break;
+                    }
+                  }
+                  if (isMatch) break;
+                } catch (fieldError: any) {
+                  EnhancedLogger.warn(
+                    `[${requestId}] Error processing field:`,
+                    {
+                      orderId: order._id,
+                      error: fieldError?.message || fieldError,
+                      field,
+                    },
+                  );
+                }
+              }
+            }
+          }
+
+          // Also search in user's name
+          if (!isMatch && user.name) {
+            const userName = user.name.toLowerCase();
+            for (const keyword of filteredKeywords) {
+              if (userName.includes(keyword)) {
+                isMatch = true;
+                matchedField = "ইউজার নাম";
+                matchedValue = user.name;
+                break;
+              }
+            }
+          }
+
+          // Search in service name
+          if (!isMatch && order.serviceName) {
+            const serviceName = order.serviceName.toLowerCase();
+            for (const keyword of filteredKeywords) {
+              if (serviceName.includes(keyword)) {
+                isMatch = true;
+                matchedField = "সার্ভিস নাম";
+                matchedValue = order.serviceName;
+                break;
+              }
+            }
+          }
+
+          // Search in order ID
+          if (!isMatch && order.orderId) {
+            const orderId = order.orderId.toLowerCase();
+            for (const keyword of filteredKeywords) {
+              if (orderId.includes(keyword)) {
+                isMatch = true;
+                matchedField = "অর্ডার আইডি";
+                matchedValue = order.orderId;
+                break;
+              }
+            }
+          }
+
+          if (isMatch) {
+            matchedOrders.push({
+              orderId: order._id,
+              orderNumber: order.orderId,
+              userId: user._id,
+              userName: user.name,
+              userPhone: user.whatsapp,
+              serviceName: order.serviceName,
+              matchedField,
+              matchedValue,
+              orderStatus: order.status,
+              orderDate: order.createdAt,
+            });
+
+            deliveredUsers.add(user._id.toString());
+
+            EnhancedLogger.info(`[${requestId}] Order matched successfully`, {
+              orderId: order._id,
+              userName: user.name,
+              userPhone: user.whatsapp,
+              matchedField,
+              matchedValue,
+            });
+          }
+        } catch (orderError: any) {
+          EnhancedLogger.error(`[${requestId}] Error processing order:`, {
+            error: orderError?.message || orderError,
+            stack: orderError?.stack,
+            orderId: order?._id,
+          });
+        }
+      }
+
+      // Send progress update
+      await sendTextMessage(
+        adminPhone,
+        `🔍 *${matchedOrders.length}টি ম্যাচিং অর্ডার পাওয়া গেছে*\n\n📊 মোট চেক করা: ${orders.length}\n🎯 ম্যাচিং: ${matchedOrders.length}\n\n⏳ স্বয়ংক্রিয় ডেলিভারি শুরু হচ্ছে...`,
+      );
+
+      // If no matches found
+      if (matchedOrders.length === 0) {
+        EnhancedLogger.info(`[${requestId}] No matching orders found`, {
+          totalOrders: orders.length,
+          keywords: filteredKeywords,
+        });
+
+        const noMatchMessage =
+          `❌ *কোন ম্যাচিং অর্ডার পাওয়া যায়নি*\n\n` +
+          `📁 ফাইল: ${originalFileName}\n` +
+          `🔍 সার্চ টার্ম: "${cleanFileName}"\n` +
+          `📁 সার্ভার পাথ: ${relativePath}\n` +
+          `📊 চেক করা অর্ডার: ${orders.length}\n\n` +
+          `📌 *কিভাবে কাজ করে:*\n` +
+          `ফাইলনেম: "john_certificate.pdf"\n` +
+          `সার্চ হবে: "john_certificate", "john", "certificate"\n\n` +
+          `📝 *পরামর্শ:*\n` +
+          `1. ফাইলনেমে ইউজারের সম্পূর্ণ নাম ব্যবহার করুন\n` +
+          `2. আন্ডারস্কোর (_) ব্যবহার করুন (john_certificate)\n` +
+          `3. স্পেস ব্যবহার করবেন না\n` +
+          `4. বাংলা বা ইংরেজি টেক্সট ব্যবহার করুন\n\n` +
+          `উদাহরণ:\n` +
+          `• john_certificate.pdf → "john_certificate" সার্চ করবে\n` +
+          `• abdul_nid_card.pdf → "abdul_nid_card" সার্চ করবে\n` +
+          `• service_123_document.pdf → "service_123_document" সার্চ করবে\n\n` +
+          `🏠 মেনুতে ফিরতে 'Menu' লিখুন`;
+
+        await sendTextMessage(adminPhone, noMatchMessage);
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      EnhancedLogger.info(
+        `[${requestId}] Starting delivery to ${matchedOrders.length} matched orders`,
+        {
+          matchedOrders: matchedOrders.length,
+          successCount: 0,
+          failCount: 0,
+        },
+      );
+
+      // Deliver to all matched orders
+      let successCount = 0;
+      let failCount = 0;
+      const deliveredDetails = [];
+      const failedDetails = [];
+
+      for (const order of matchedOrders) {
+        try {
+          // Create delivery data according to your schema
+          const deliveryData = {
+            deliveredAt: new Date(),
+            deliveryMethod: "whatsapp",
+            deliveryType: "file",
+            text: `ফাইল ডেলিভারি (ম্যাচ করা: ${order.matchedField})`,
+            fileUrl: relativePath, // Server filepath: auto_delivery/2024/01/19/filename.ext
+            fileName: originalFileName,
+            fileType: mimeType,
+            deliveredBy: formattedPhone,
+            searchKeywords: filteredKeywords,
+            matchedField: order.matchedField,
+            matchedValue: order.matchedValue,
+            matchedFilename: cleanFileName,
+          };
+
+          // Update order status and add delivery data
+          try {
+            await Order.findByIdAndUpdate(order.orderId, {
+              status: "completed",
+              deliveryData: deliveryData,
+              updatedAt: new Date(),
+            });
+
+            EnhancedLogger.debug(`[${requestId}] Order updated successfully`, {
+              orderId: order.orderId,
+              status: "completed",
+            });
+          } catch (updateError: any) {
+            EnhancedLogger.error(`[${requestId}] Failed to update order:`, {
+              error: updateError?.message || updateError,
+              stack: updateError?.stack,
+              orderId: order.orderId,
+            });
+
+            throw new Error(`Order update failed: ${updateError?.message}`);
+          }
+
+          // Create public URL for file delivery
+          const baseUrl =
+            process.env.NEXT_PUBLIC_URL || "http://localhost:3000";
+          const publicUrl = `${baseUrl}/api/download-order-file/${order.orderId}`;
+
+          // Try to send via WhatsApp template
+          try {
+            await sendOrderDeliveryTemplate(
+              order.userPhone,
+              order.serviceName || "সার্ভিস",
+              "Birth Help",
+              order.orderNumber,
+              publicUrl,
+              originalFileName,
+            );
+
+            EnhancedLogger.info(
+              `[${requestId}] WhatsApp template sent successfully`,
+              {
+                userPhone: order.userPhone,
+                orderId: order.orderId,
+              },
+            );
+          } catch (templateError: any) {
+            EnhancedLogger.warn(
+              `[${requestId}] WhatsApp template failed, using text fallback`,
+              {
+                error: templateError?.message || templateError,
+                userPhone: order.userPhone,
+                orderId: order.orderId,
+              },
+            );
+
+            // Fallback: Send text message with download link
+            try {
+              await sendTextMessage(
+                order.userPhone,
+                `✅ *আপনার অর্ডার সম্পন্ন হয়েছে!*\n\n` +
+                  `📦 সার্ভিস: ${order.serviceName}\n` +
+                  `🆔 অর্ডার: ${order.orderNumber}\n` +
+                  `📁 ফাইল: ${originalFileName}\n\n` +
+                  `ডাউনলোড লিঙ্ক: ${publicUrl}\n\n` +
+                  `🏠 মেনুতে ফিরতে 'Menu' লিখুন`,
+              );
+
+              EnhancedLogger.info(
+                `[${requestId}] Text fallback sent successfully`,
+                {
+                  userPhone: order.userPhone,
+                },
+              );
+            } catch (textError: any) {
+              EnhancedLogger.error(
+                `[${requestId}] Text fallback also failed:`,
+                {
+                  error: textError?.message || textError,
+                  userPhone: order.userPhone,
+                },
+              );
+              throw new Error(`Both template and text delivery failed`);
+            }
+          }
+
+          // Send additional confirmation message
+          try {
+            await sendTextMessage(
+              order.userPhone,
+              `📁 *ফাইল ডেলিভারি নোটিশ*\n\n` +
+                `আপনার "${order.serviceName}" সার্ভিসের ফাইল ডেলিভারি করা হয়েছে।\n` +
+                `ম্যাচ করা: ${order.matchedField} (${order.matchedValue})\n` +
+                `ফাইলনেম: ${originalFileName}\n\n` +
+                `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন।`,
+            );
+          } catch (confirmationError: any) {
+            EnhancedLogger.warn(`[${requestId}] Confirmation message failed`, {
+              error: confirmationError?.message || confirmationError,
+              userPhone: order.userPhone,
+            });
+            // Continue even if confirmation fails
+          }
+
+          successCount++;
+          deliveredDetails.push({
+            userName: order.userName,
+            userPhone: order.userPhone,
+            orderNumber: order.orderNumber,
+            serviceName: order.serviceName,
+            matchedField: order.matchedField,
+            matchedValue: order.matchedValue,
+            filePath: relativePath,
+          });
+
+          EnhancedLogger.info(`[${requestId}] Successfully delivered to user`, {
+            userPhone: order.userPhone,
+            userName: order.userName,
+            successCount,
+            total: matchedOrders.length,
+          });
+
+          // Delay to avoid rate limiting
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        } catch (deliveryError: any) {
+          failCount++;
+          failedDetails.push({
+            userName: order.userName,
+            userPhone: order.userPhone,
+            orderId: order.orderId,
+            error: deliveryError?.message || "Unknown error",
+          });
+
+          EnhancedLogger.error(`[${requestId}] Failed to deliver to user:`, {
+            error: deliveryError?.message || deliveryError,
+            stack: deliveryError?.stack,
+            userPhone: order.userPhone,
+            orderId: order.orderId,
+            userName: order.userName,
+          });
+        }
+      }
+
+      EnhancedLogger.info(`[${requestId}] Delivery process completed`, {
+        total: matchedOrders.length,
+        success: successCount,
+        failed: failCount,
+        successRate: `${((successCount / matchedOrders.length) * 100).toFixed(2)}%`,
+      });
+
+      // Send final summary
+      let summaryMessage = `🎉 *অটো ফাইল ডেলিভারি সম্পন্ন!*\n\n`;
+
+      summaryMessage += `📁 *ফাইল:* ${originalFileName}\n`;
+      summaryMessage += `🔍 *সার্চ টার্ম:* "${cleanFileName}"\n`;
+      summaryMessage += `📁 *সার্ভার পাথ:* ${relativePath}\n\n`;
+
+      summaryMessage += `📊 *ডেলিভারি রিপোর্ট:*\n`;
+      summaryMessage += `• মোট চেক করা: ${orders.length}\n`;
+      summaryMessage += `• মোট ম্যাচিং: ${matchedOrders.length}\n`;
+      summaryMessage += `• ✅ সফল ডেলিভারি: ${successCount}\n`;
+      summaryMessage += `• ❌ ব্যর্থ ডেলিভারি: ${failCount}\n`;
+      summaryMessage += `• 📈 সফলতার হার: ${((successCount / matchedOrders.length) * 100).toFixed(2)}%\n\n`;
+
+      if (deliveredDetails.length > 0) {
+        summaryMessage += `✅ *ডেলিভারি করা ইউজার:*\n`;
+
+        deliveredDetails.slice(0, 3).forEach((user, index) => {
+          summaryMessage += `${index + 1}. ${user.userName}\n`;
+          summaryMessage += `   📱: ${user.userPhone}\n`;
+          summaryMessage += `   🛒: ${user.serviceName}\n`;
+          summaryMessage += `   🆔: ${user.orderNumber}\n`;
+          summaryMessage += `   🔍: ${user.matchedField} (${user.matchedValue})\n`;
+          summaryMessage += `   📁: ${user.filePath}\n\n`;
+        });
+
+        if (deliveredDetails.length > 3) {
+          summaryMessage += `... এবং আরও ${deliveredDetails.length - 3}জন\n\n`;
+        }
+      }
+
+      if (failedDetails.length > 0) {
+        summaryMessage += `❌ *ব্যর্থ ইউজার:* ${failedDetails.length}জন\n\n`;
+        // Log failed details but don't show to admin
+        EnhancedLogger.warn(`[${requestId}] Failed deliveries:`, {
+          failedDetails,
+        });
+      }
+
+      summaryMessage += `🤖 *স্বয়ংক্রিয় প্রক্রিয়া সম্পন্ন*\n\n`;
+      summaryMessage += `🏠 মেনুতে ফিরতে 'Menu' লিখুন`;
+
+      await sendTextMessage(adminPhone, summaryMessage);
+
+      // Send admin notification
+      try {
+        await notifyAdmin(
+          `🤖 অটো ফাইল ডেলিভারি সম্পন্ন\n\n` +
+            `📁 ফাইল: ${originalFileName}\n` +
+            `🔍 সার্চ টার্ম: "${cleanFileName}"\n` +
+            `📁 পাথ: ${relativePath}\n` +
+            `📊 মোট অর্ডার: ${orders.length}\n` +
+            `🎯 ম্যাচিং: ${matchedOrders.length}\n` +
+            `✅ সফল: ${successCount}\n` +
+            `❌ ব্যর্থ: ${failCount}\n` +
+            `📈 রেট: ${((successCount / matchedOrders.length) * 100).toFixed(2)}%\n` +
+            `👤 অ্যাডমিন: ${formattedPhone}\n` +
+            `⏰ সময়: ${new Date().toLocaleString()}`,
+        );
+      } catch (notifyError: any) {
+        EnhancedLogger.error(
+          `[${requestId}] Failed to send admin notification:`,
+          {
+            error: notifyError?.message || notifyError,
+          },
+        );
+      }
+
+      await showMainMenu(adminPhone, true);
+    } else {
+      EnhancedLogger.warn(
+        `[${requestId}] Unsupported message type for auto delivery`,
+        {
+          messageType: message.type,
+        },
+      );
+
+      await sendTextMessage(
+        adminPhone,
+        "❌ শুধুমাত্র ইমেজ বা ডকুমেন্ট ফাইল সমর্থিত।",
+      );
+      await showMainMenu(adminPhone, true);
+    }
+  } catch (error: any) {
+    EnhancedLogger.error(`[${requestId}] Auto file delivery failed:`, {
+      error: error?.message || error,
+      stack: error?.stack,
+      adminPhone: formattedPhone,
+      requestId,
+    });
+
+    try {
+      await sendTextMessage(
+        adminPhone,
+        "❌ অটো ডেলিভারিতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+      );
+    } catch (sendError: any) {
+      EnhancedLogger.error(`[${requestId}] Failed to send error message:`, {
+        error: sendError?.message || sendError,
+      });
+    }
+
+    try {
+      await showMainMenu(adminPhone, true);
+    } catch (menuError: any) {
+      EnhancedLogger.error(`[${requestId}] Failed to show main menu:`, {
+        error: menuError?.message || menuError,
+      });
+    }
+  }
+}
+
+// Helper function
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} bytes`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 // --- Main Message Handler ---
 async function handleUserMessage(
   phone: string,
@@ -5639,7 +7097,7 @@ async function handleUserMessage(
 ): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   const requestId =
-    Date.now().toString(36) + Math.random().toString(36).substr(2);
+    Date.now().toString(36) + Math.random().toString(36).substring(2);
 
   EnhancedLogger.logRequest(formattedPhone, message, requestId);
 
@@ -5697,6 +7155,104 @@ async function handleUserMessage(
       flowType,
     });
 
+    // ========================================
+    // AUTO FILE DELIVERY FOR ADMIN (MAIN MENU ONLY)
+    // ========================================
+    if (isAdmin && (message.type === "image" || message.type === "document")) {
+      // Define which states should BLOCK auto delivery (admin is in a flow)
+      EnhancedLogger.debug(
+        `[${requestId}] Admin sent file, checking for auto delivery conditions`, {
+          currentState,
+          flowType,
+        });
+      const activeFlowStates = [
+        // User flows
+        "awaiting_trx_id",
+        "awaiting_ubrn_number",
+        "awaiting_instant_input",
+        "awaiting_service_data",
+        "awaiting_service_data_edit",
+        "awaiting_service_confirmation",
+
+        // Admin flows
+        "admin_add_service_name",
+        "admin_add_service_description",
+        "admin_add_service_price",
+        "admin_add_service_instructions",
+        "admin_edit_service_select",
+        "admin_edit_service_option",
+        "admin_edit_service_input",
+        "admin_delete_service_select",
+        "admin_delete_service_confirm",
+        "admin_toggle_service_select",
+        "admin_process_order_select",
+        "admin_process_order_status",
+        "admin_process_order_delivery_type",
+        "admin_process_order_text_input",
+        "admin_process_order_reason_input",
+        "admin_process_order_file_upload",
+        "admin_broadcast_message",
+        "admin_broadcast_type",
+        "admin_add_balance_phone",
+        "admin_add_balance_amount",
+        "admin_add_balance_reason",
+        "admin_ban_user_phone",
+        "admin_ban_user_confirm",
+        "admin_search_user_input",
+
+        // Any upload state
+        "uploading",
+        "awaiting_upload",
+        "file_upload",
+
+        // Any processing state
+        "processing",
+        "awaiting_processing",
+      ];
+
+      // Auto delivery ONLY triggers when admin is at main menu (no active state)
+      const isAtMainMenu =
+        !currentState ||
+        currentState === "idle" ||
+        currentState === "main_menu" ||
+        (!activeFlowStates.includes(currentState) &&
+          !currentState.includes("awaiting_") &&
+          !currentState.includes("admin_") &&
+          !currentState.includes("upload") &&
+          !currentState.includes("process"));
+
+      if (isAtMainMenu) {
+        EnhancedLogger.info(
+          `[${requestId}] Admin at main menu uploaded file, starting auto delivery`,
+          {
+            currentState,
+            flowType,
+            messageType: message.type,
+          },
+        );
+
+        // Clear any existing state
+        await stateManager.clearUserState(formattedPhone);
+
+        // Start auto file delivery
+        await triggerAutoFileDelivery(formattedPhone, message);
+        return;
+      } else {
+        EnhancedLogger.info(
+          `[${requestId}] Admin uploaded file but is in active flow, NOT triggering auto delivery`,
+          {
+            currentState,
+            flowType,
+            messageType: message.type,
+          },
+        );
+        // Continue with regular flow handling below
+      }
+    }
+
+    // ========================================
+    // REGULAR MESSAGE HANDLING (FOR ALL USERS)
+    // ========================================
     if (message.type === "text") {
       const userText = message.text?.body.trim().toLowerCase() || "";
       EnhancedLogger.info(
@@ -5755,18 +7311,30 @@ async function handleUserMessage(
         return;
       }
 
+      if (currentState === "awaiting_service_data_edit") {
+        EnhancedLogger.info(
+          `[${requestId}] Processing edited service field input`,
+        );
+        await handleServiceFieldInput(formattedPhone, userText);
+        return;
+      }
+
       if (currentState === "awaiting_service_confirmation") {
-        if (userText === "confirm") {
-          EnhancedLogger.info(`[${requestId}] Confirming service order`);
-          await confirmServiceOrder(formattedPhone);
-        } else if (userText === "edit") {
-          EnhancedLogger.info(`[${requestId}] Editing service data`);
-          await handleEditServiceData(formattedPhone);
-        } else {
-          await sendTextMessage(
-            formattedPhone,
-            "❌ দয়া করে 'confirm' বা 'edit' লিখুন।\n\n🚫 বাতিল করতে 'cancel' লিখুন",
-          );
+        // Don't process text for confirmation - only use buttons
+        await sendTextMessage(
+          formattedPhone,
+          "ℹ️ দয়া করে উপরের বাটনগুলো ব্যবহার করুন।\n\n✅ কনফার্ম করতে '✅ কনফার্ম করুন' বাটন ক্লিক করুন\n✏️ এডিট করতে '✏️ এডিট করুন' বাটন ক্লিক করুন\n🚫 বাতিল করতে '🚫 বাতিল করুন' বাটন ক্লিক করুন",
+        );
+        // Resend the confirmation menu
+        const state = await stateManager.getUserState(formattedPhone);
+        const serviceOrderData = state?.data
+          ?.serviceOrder as ServiceOrderStateData;
+        if (serviceOrderData?.serviceId) {
+          await connectDB();
+          const service = await Service.findById(serviceOrderData.serviceId);
+          if (service) {
+            await askForServiceConfirmation(formattedPhone, service);
+          }
         }
         return;
       }
@@ -6143,6 +7711,7 @@ async function handleUserMessage(
               "awaiting_ubrn_number",
               "awaiting_instant_input",
               "awaiting_service_data",
+              "awaiting_service_data_edit",
             ].includes(currentState)
           ) {
             await stateManager.clearUserState(formattedPhone);
@@ -6399,6 +7968,65 @@ async function handleUserMessage(
                   },
                 );
                 await handleAdminProcessOrderUpdate(formattedPhone, selectedId);
+              } else if (selectedId === "cancel_flow") {
+                EnhancedLogger.info(`[${requestId}] User cancelled flow`);
+                await cancelFlow(formattedPhone, isAdmin);
+              }
+              // Handle field editing options
+              else if (
+                selectedId.startsWith("edit_field_") ||
+                selectedId === "edit_all_fields"
+              ) {
+                EnhancedLogger.info(`[${requestId}] User selected field edit`, {
+                  selectedId,
+                });
+
+                const state = await stateManager.getUserState(formattedPhone);
+                const serviceOrderData = state?.data
+                  ?.serviceOrder as ServiceOrderStateData;
+
+                if (selectedId === "edit_all_fields") {
+                  // Reset to first field
+                  await stateManager.updateStateData(formattedPhone, {
+                    serviceOrder: {
+                      ...serviceOrderData,
+                      fieldIndex: 0,
+                    },
+                    currentState: "awaiting_service_data",
+                  });
+                } else {
+                  // Edit specific field
+                  const fieldIndex = parseInt(
+                    selectedId.replace("edit_field_", ""),
+                  );
+                  await stateManager.updateStateData(formattedPhone, {
+                    serviceOrder: {
+                      ...serviceOrderData,
+                      fieldIndex: fieldIndex,
+                    },
+                    currentState: "awaiting_service_data",
+                  });
+                }
+
+                // Get service info
+                await connectDB();
+                const service = await Service.findById(
+                  serviceOrderData?.serviceId,
+                );
+                if (service) {
+                  if (selectedId === "edit_all_fields") {
+                    await askForServiceField(formattedPhone, service, 0);
+                  } else {
+                    const fieldIndex = parseInt(
+                      selectedId.replace("edit_field_", ""),
+                    );
+                    await askForServiceField(
+                      formattedPhone,
+                      service,
+                      fieldIndex,
+                    );
+                  }
+                }
               } else {
                 EnhancedLogger.warn(`[${requestId}] Unknown option selected`, {
                   selectedId,
@@ -6475,6 +8103,56 @@ async function handleUserMessage(
           } else if (selectedId === "cancel_flow") {
             EnhancedLogger.info(`[${requestId}] User cancelled flow`);
             await cancelFlow(formattedPhone, isAdmin);
+          }
+          // Handle field editing options
+          else if (
+            selectedId.startsWith("edit_field_") ||
+            selectedId === "edit_all_fields"
+          ) {
+            EnhancedLogger.info(`[${requestId}] User selected field edit`, {
+              selectedId,
+            });
+
+            const state = await stateManager.getUserState(formattedPhone);
+            const serviceOrderData = state?.data
+              ?.serviceOrder as ServiceOrderStateData;
+
+            if (selectedId === "edit_all_fields") {
+              // Reset to first field
+              await stateManager.updateStateData(formattedPhone, {
+                serviceOrder: {
+                  ...serviceOrderData,
+                  fieldIndex: 0,
+                },
+                currentState: "awaiting_service_data",
+              });
+            } else {
+              // Edit specific field
+              const fieldIndex = parseInt(
+                selectedId.replace("edit_field_", ""),
+              );
+              await stateManager.updateStateData(formattedPhone, {
+                serviceOrder: {
+                  ...serviceOrderData,
+                  fieldIndex: fieldIndex,
+                },
+                currentState: "awaiting_service_data",
+              });
+            }
+
+            // Get service info
+            await connectDB();
+            const service = await Service.findById(serviceOrderData?.serviceId);
+            if (service) {
+              if (selectedId === "edit_all_fields") {
+                await askForServiceField(formattedPhone, service, 0);
+              } else {
+                const fieldIndex = parseInt(
+                  selectedId.replace("edit_field_", ""),
+                );
+                await askForServiceField(formattedPhone, service, fieldIndex);
+              }
+            }
           } else {
             EnhancedLogger.warn(`[${requestId}] Unknown option selected`, {
               selectedId,
@@ -6493,9 +8171,15 @@ async function handleUserMessage(
           selectedId,
         });
 
-        if (selectedId === "cancel_flow") {
+        if (selectedId === "cancel_flow" || selectedId === "order_cancel") {
           EnhancedLogger.info(`[${requestId}] User cancelled flow via button`);
           await cancelFlow(formattedPhone, isAdmin);
+        } else if (selectedId === "order_confirm") {
+          EnhancedLogger.info(`[${requestId}] User confirmed order via button`);
+          await confirmServiceOrder(formattedPhone);
+        } else if (selectedId === "order_edit") {
+          EnhancedLogger.info(`[${requestId}] User wants to edit order`);
+          await handleEditServiceData(formattedPhone);
         } else if (selectedId.startsWith("status_")) {
           EnhancedLogger.info(`[${requestId}] Admin selected status`, {
             selectedId,
@@ -6507,10 +8191,10 @@ async function handleUserMessage(
           });
           // Call the update function with delivery type
           await handleAdminProcessOrderUpdate(formattedPhone, selectedId);
-        } else if (selectedId.startsWith("field_")) {
+        } else if (selectedId.startsWith("field_type_")) {
           // Handle field type selection
           await handleAdminAddServiceStep(formattedPhone, selectedId);
-        } else if (selectedId.startsWith("required_")) {
+        } else if (selectedId.startsWith("field_required_")) {
           // Handle required field selection
           await handleAdminAddServiceStep(formattedPhone, selectedId);
         } else if (selectedId.startsWith("add_fields_")) {
@@ -6550,7 +8234,7 @@ async function handleUserMessage(
         }
       }
     } else if (message.type === "image" || message.type === "document") {
-      // Handle file uploads for order delivery
+      // Handle file uploads for both user service fields and admin order delivery
       const state = await stateManager.getUserState(formattedPhone);
       const currentState = state?.currentState;
       const flowType = state?.flowType;
@@ -6561,7 +8245,39 @@ async function handleUserMessage(
         flowType,
       });
 
-      // Check if we're in file upload state for order delivery
+      // Check if we're in file upload state for user service fields
+      if (
+        flowType === "service_order" &&
+        (currentState === "awaiting_service_data" ||
+          currentState === "awaiting_service_data_edit")
+      ) {
+        const serviceOrderData = state?.data
+          ?.serviceOrder as ServiceOrderStateData;
+        const serviceId = serviceOrderData?.serviceId;
+
+        if (serviceId) {
+          await connectDB();
+          const service = await Service.findById(serviceId);
+
+          if (service && service.requiredFields) {
+            const fieldIndex = serviceOrderData?.fieldIndex || 0;
+            const field = service.requiredFields[fieldIndex];
+
+            if (field && field.type === "file") {
+              EnhancedLogger.info(
+                `[${requestId}] Handling file upload for service field`,
+                { fieldName: field.name, fieldLabel: field.label },
+              );
+
+              // Process file upload for service field
+              await handleServiceFieldInput(formattedPhone, "", message);
+              return;
+            }
+          }
+        }
+      }
+
+      // Check if we're in file upload state for admin order delivery
       if (
         flowType === "admin_process_order" &&
         (currentState === "admin_process_order_file_upload" ||
@@ -6573,16 +8289,24 @@ async function handleUserMessage(
         );
         await handleAdminFileUpload(formattedPhone, message);
       } else {
-        EnhancedLogger.warn(`[${requestId}] File received in wrong state`, {
-          currentState,
-          flowType,
-        });
-        await sendTextMessage(
-          formattedPhone,
-          "❌ এই ধরনের মেসেজ এখন গ্রহণযোগ্য নয়।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+        // If admin uploaded file but not in auto delivery state, it's part of regular flow
+        EnhancedLogger.info(
+          `[${requestId}] File received in regular flow state`,
+          {
+            currentState,
+            flowType,
+          },
         );
-        await showMainMenu(formattedPhone, isAdmin);
+        // Continue with regular flow handling
       }
+    } else if (message.type === "audio" || message.type === "video") {
+      EnhancedLogger.warn(`[${requestId}] Unsupported media type`, {
+        messageType: message.type,
+      });
+      await sendTextMessage(
+        formattedPhone,
+        "❌ অডিও/ভিডিও ফাইল সমর্থিত নয়। দয়া করে ইমেজ বা ডকুমেন্ট ফাইল পাঠান।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+      );
     } else {
       EnhancedLogger.warn(`[${requestId}] Unhandled message type`, {
         type: message.type,
@@ -6649,11 +8373,28 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       object: body.object,
       entryCount: body.entry?.length || 0,
     });
-
+    // Save webhook body as JSON to server
+    const webhookDir = path.join(process.cwd(), "webhook_logs");
+    const webhookFile = path.join(webhookDir, `${requestId}.json`);
+    if (!fs.existsSync(webhookDir)) {
+      fs.mkdirSync(webhookDir);
+    }
+    fs.writeFileSync(webhookFile, JSON.stringify(body, null, 2));
     if (body.object === "whatsapp_business_account") {
       const entry = body.entry?.[0];
       const changes = entry?.changes?.[0];
       const value = changes?.value;
+
+      const inboundPhoneNumberId =
+        body?.entry?.[0]?.changes?.[0]?.value?.metadata?.phone_number_id;
+
+      const allowed = new Set([
+        process.env.WA_PHONE_NUMBER_ID, // number B (Next bot handles)
+      ]);
+
+      if (inboundPhoneNumberId && !allowed.has(inboundPhoneNumberId)) {
+        return NextResponse.json({ status: "EVENT_RECEIVED" }); // ✅ ignore
+      }
 
       if (value?.messages && value.messages.length > 0) {
         const message = value.messages[0];
