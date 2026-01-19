@@ -164,7 +164,7 @@ const INSTANT_SERVICES = [
   },
   {
     id: "instant_dakhila_approval",
-    name: "✅ Dakhila Approval Check",
+    name: "✅ দাখিলা অনুমোদন যাচাই",
     description: "Dakhila URL দিয়ে যাচাই করুন",
     price: 10,
     isActive: true,
