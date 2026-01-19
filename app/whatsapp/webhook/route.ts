@@ -2899,7 +2899,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
       const apiEndTime = Date.now();
       const apiDuration = apiEndTime - apiStartTime;
-      console.log(response);
+     
       EnhancedLogger.info(`UBRN API response received`, {
         ubrn: trimmedUbrn,
         status: response.status,
