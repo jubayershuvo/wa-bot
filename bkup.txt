@@ -138,6 +138,9 @@ const CONFIG = {
   supportNumber: process.env.SUPPORT_NUMBER || "+8801XXXXXXXXX",
   supportTelegram: process.env.SUPPORT_TELEGRAM || "t.me/birthhelp",
   ubrnApiUrl: process.env.UBRN_API_URL || "https://17.fortest.top/api/search",
+  dakhilaApiUrl:
+    process.env.DAKHILA_API_URL ||
+    "https://api.fortest.top/dakhila/secure_fetch_ldtax.php",
   ubrnServicePrice: 10,
   fileUploadUrl: process.env.FILE_UPLOYAD_URL || "/api/upload",
   maxFileSize: 10 * 1024 * 1024,
@@ -158,6 +161,17 @@ const INSTANT_SERVICES = [
     requiresInput: true,
     inputPrompt: "UBRN নম্বরটি পাঠান:",
     inputExample: "19862692537094068",
+  },
+  {
+    id: "instant_dakhila_approval",
+    name: "✅ দাখিলা অনুমোদন যাচাই",
+    description: "Dakhila URL দিয়ে যাচাই করুন",
+    price: 10,
+    isActive: true,
+    requiresInput: true,
+    inputPrompt: "Dakhila URL টি পাঠান:",
+    inputExample:
+      "https://portal.ldtax.gov.bd/citizen/holding/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   },
 ];
 
@@ -490,7 +504,283 @@ async function callWhatsAppApi(
     }
   }
 }
+// Add this function after other service handler functions (around line 1350)
 
+async function handleDakhilaApprovalCheck(
+  phone: string,
+  dakhilaUrl: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+
+  EnhancedLogger.info(
+    `Processing Dakhila approval check for ${formattedPhone}`,
+    {
+      urlPreview: dakhilaUrl.substring(0, 100),
+    },
+  );
+
+  try {
+    // Validate URL first
+    const validation = validateDakhilaUrl(dakhilaUrl);
+    if (!validation.isValid) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অবৈধ Dakhila URL*\n\nকারণ: ${validation.error}\n\nদয়া করে সঠিক Dakhila URL দিন।\n\nউদাহরণ:\nhttps://portal.ldtax.gov.bd/citizen/holding/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...`,
+      );
+      return;
+    }
+
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_dakhila_approval",
+    );
+    if (!service) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ Dakhila service not available!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    // Send processing message
+    await sendTextMessage(
+      formattedPhone,
+      `⏳ *Dakhila Approval যাচাই করা হচ্ছে...*\n\nURL: ${dakhilaUrl.substring(0, 80)}${dakhilaUrl.length > 80 ? "..." : ""}\n\nদয়া করে অপেক্ষা করুন...`,
+    );
+
+    // Call Dakhila API
+    const result = await checkDakhilaApproval(dakhilaUrl);
+
+    // Deduct balance
+    const oldBalance = user.balance;
+    user.balance -= service.price;
+    await user.save();
+
+    // Create transaction record
+    const transaction = await Transaction.create({
+      trxId: `DAKHILA-${Date.now()}`,
+      amount: service.price,
+      method: "balance",
+      status: "SUCCESS",
+      number: formattedPhone,
+      user: user._id,
+      metadata: {
+        serviceId: "instant_dakhila_approval",
+        serviceName: service.name,
+        dakhilaUrl: dakhilaUrl,
+        resultStatus: result.status,
+        resultMessage: result.message,
+        processedAt: new Date().toISOString(),
+      },
+      createdAt: new Date(),
+    });
+
+    let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
+    resultMessage += `🔗 Dakhila URL: ${dakhilaUrl.substring(0, 60)}${dakhilaUrl.length > 60 ? "..." : ""}\n`;
+    resultMessage += `💰 মূল্য: ৳${service.price}\n`;
+    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
+    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
+    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
+
+    if (result.status === "success") {
+      resultMessage += `🎉 *Dakhila Approval Status:* ✅ **APPROVED**\n\n`;
+      resultMessage += `Dakhila URL টি যাচাই করা হয়েছে এবং এটি বৈধ অনুমোদন আছে।\n`;
+    } else if (result.status === "error") {
+      resultMessage += `❌ *Dakhila Approval Status:* **NOT APPROVED**\n\n`;
+      resultMessage += `Dakhila URL টি যাচাই করা হয়েছে এবং এটি কোন অনুমোদন পাওয়া যায়নি।\n`;
+    } else {
+      resultMessage += `❓ *Dakhila Approval Status:* **UNKNOWN**\n\n`;
+      resultMessage += `Dakhila URL টি যাচাই করা হয়েছে কিন্তু স্ট্যাটাস নির্ধারণ করা যায়নি।\n`;
+    }
+
+    if (result.message) {
+      resultMessage += `\n📝 *বিস্তারিত:* ${result.message}\n`;
+    }
+
+    resultMessage += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(formattedPhone, resultMessage);
+
+    // Notify admin
+    await notifyAdmin(
+      `✅ Dakhila Approval Check সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nসার্ভিস: ${service.name}\nমূল্য: ৳${service.price}\nURL: ${dakhilaUrl.substring(0, 100)}${dakhilaUrl.length > 100 ? "..." : ""}\nস্ট্যাটাস: ${result.status === "success" ? "✅ APPROVED" : result.status === "error" ? "❌ NOT APPROVED" : "❓ UNKNOWN"}\nব্যালেন্স: ${oldBalance} → ${user.balance}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "dakhila_approval", {
+      url: dakhilaUrl,
+      price: service.price,
+      result: result.status,
+      transactionId: transaction._id,
+      oldBalance,
+      newBalance: user.balance,
+    });
+  } catch (err: any) {
+    EnhancedLogger.error(`Failed to process Dakhila approval:`, {
+      error: err?.message || err,
+      stack: err?.stack,
+      phone: formattedPhone,
+    });
+
+    await sendTextMessage(
+      formattedPhone,
+      "❌ Dakhila approval যাচাই করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+  }
+}
+// Add this function after other API functions (around line 450)
+async function checkDakhilaApproval(
+  url: string,
+): Promise<{ status: string; message?: string; data?: any }> {
+  try {
+    EnhancedLogger.info(`Checking Dakhila approval for URL`, {
+      urlLength: url.length,
+      urlPreview: url.substring(0, 100),
+    });
+
+    // Validate URL using helper function
+    const validation = validateDakhilaUrl(url);
+    if (!validation.isValid) {
+      return {
+        status: "error",
+        message: validation.error || "Invalid URL",
+      };
+    }
+
+    // Ensure URL is properly formatted
+    let processedUrl = url.trim();
+    if (!processedUrl.startsWith("http")) {
+      processedUrl = "https://" + processedUrl;
+    }
+
+    // Encode the URL
+    const encodedUrl = encodeURIComponent(processedUrl);
+    const apiUrl = `${CONFIG.dakhilaApiUrl}?url=${encodedUrl}`;
+
+    EnhancedLogger.debug(`Calling Dakhila API`, {
+      apiUrl: apiUrl.substring(0, 200) + "...",
+    });
+
+    const startTime = Date.now();
+    const response = await fetch(apiUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": "BirthHelp-Bot/1.0",
+        Accept: "application/json",
+      }
+    });
+
+    const responseTime = Date.now() - startTime;
+
+    if (!response.ok) {
+      EnhancedLogger.error(`Dakhila API error: ${response.status}`, {
+        status: response.status,
+        statusText: response.statusText,
+        responseTime: `${responseTime}ms`,
+      });
+
+      let errorMessage = `API request failed with status ${response.status}`;
+      if (response.status === 404) {
+        errorMessage = "Dakhila API endpoint not found";
+      } else if (response.status === 400) {
+        errorMessage = "Invalid request to Dakhila API";
+      } else if (response.status === 429) {
+        errorMessage = "Too many requests to Dakhila API";
+      } else if (response.status >= 500) {
+        errorMessage = "Dakhila API server error";
+      }
+
+      return {
+        status: "error",
+        message: errorMessage,
+      };
+    }
+
+    const data = await response.json();
+
+    EnhancedLogger.debug(`Dakhila API response`, {
+      status: data?.status,
+      responseTime: `${responseTime}ms`,
+      hasData: !!data,
+      dataKeys: data ? Object.keys(data) : [],
+    });
+
+    if (data && data.status === "success") {
+      return {
+        status: "success",
+        message: data.message || "Dakhila has approval",
+        data: data.data || data,
+      };
+    } else if (data && data.status === "error") {
+      return {
+        status: "error",
+        message: data.message || "Dakhila hasn't approval",
+        data: data,
+      };
+    } else if (data && data.approved !== undefined) {
+      // Alternative response format
+      return {
+        status: data.approved ? "success" : "error",
+        message: data.message || (data.approved ? "Approved" : "Not approved"),
+        data: data,
+      };
+    } else {
+      EnhancedLogger.warn(`Unexpected Dakhila API response`, {
+        data,
+      });
+      return {
+        status: "unknown",
+        message: "Could not determine approval status from response",
+        data: data,
+      };
+    }
+  } catch (error: any) {
+    EnhancedLogger.error(`Error checking Dakhila approval:`, {
+      error: error?.message || error,
+      stack: error?.stack,
+      url: url.substring(0, 100),
+    });
+
+    let errorMessage = "Failed to check Dakhila approval";
+    if (error.message?.includes("timeout")) {
+      errorMessage = "Dakhila API timeout. Please try again later.";
+    } else if (error.message?.includes("network")) {
+      errorMessage = "Network error. Please check your connection.";
+    } else if (error.message?.includes("ENOTFOUND")) {
+      errorMessage = "Cannot connect to Dakhila API server.";
+    } else if (error.message) {
+      errorMessage = `Error: ${error.message}`;
+    }
+
+    return {
+      status: "error",
+      message: errorMessage,
+    };
+  }
+}
 async function sendTextMessage(to: string, text: string): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
   EnhancedLogger.info(`Sending text message to ${formattedTo}`, {
@@ -1098,10 +1388,42 @@ async function cancelFlow(
   EnhancedLogger.info(`Canceling flow for ${formattedPhone}`);
 
   try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const flowType = state?.flowType;
+
+    // Special handling for different flow types
+    if (flowType === "dakhila_approval") {
+      await sendTextMessage(
+        formattedPhone,
+        "🚫 Dakhila approval check বাতিল করা হয়েছে।",
+      );
+    } else if (flowType === "ubrn_verification") {
+      await sendTextMessage(
+        formattedPhone,
+        "🚫 UBRN verification বাতিল করা হয়েছে।",
+      );
+    } else if (flowType === "recharge") {
+      await sendTextMessage(formattedPhone, "🚫 রিচার্জ বাতিল করা হয়েছে।");
+    } else if (flowType === "service_order") {
+      await sendTextMessage(
+        formattedPhone,
+        "🚫 সার্ভিস অর্ডার বাতিল করা হয়েছে।",
+      );
+    } else if (flowType === "instant_service") {
+      await sendTextMessage(
+        formattedPhone,
+        "🚫 ইন্সট্যান্ট সার্ভিস বাতিল করা হয়েছে।",
+      );
+    } else {
+      await sendTextMessage(formattedPhone, "🚫 অপারেশন বাতিল করা হয়েছে।");
+    }
+
     await stateManager.clearUserState(formattedPhone);
-    await sendTextMessage(formattedPhone, "🚫 অপারেশন বাতিল করা হয়েছে।");
     await showMainMenu(formattedPhone, isAdmin);
-    EnhancedLogger.logFlowCompletion(formattedPhone, "cancel", { isAdmin });
+    EnhancedLogger.logFlowCompletion(formattedPhone, "cancel", {
+      isAdmin,
+      flowType,
+    });
   } catch (err) {
     EnhancedLogger.error(`Failed to cancel flow for ${formattedPhone}:`, err);
     await sendTextMessage(
@@ -1294,7 +1616,70 @@ async function showInstantServices(phone: string): Promise<void> {
     await showMainMenu(formattedPhone, false);
   }
 }
+// Add this function after handleUbrnVerificationStart function (around line 1000)
+async function handleDakhilaApprovalStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Starting Dakhila approval check for ${formattedPhone}`);
 
+  try {
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_dakhila_approval",
+    );
+    if (!service) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ Dakhila service not available!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "awaiting_dakhila_url",
+      flowType: "dakhila_approval",
+      data: {
+        dakhilaData: {
+          serviceId: "instant_dakhila_approval",
+          price: service.price,
+          serviceName: service.name,
+          attempts: 0,
+        },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
+    });
+
+    const message = `✅ *Dakhila Approval Check*\n\n💰 মূল্য: ৳${service.price}\n\n${service.inputPrompt}\n\nউদাহরণ: ${service.inputExample}\n\n📌 নোট:\n• Dakhila URLটি সঠিকভাবে লিখুন\n• যাচাই করতে ১-২ মিনিট সময় লাগতে পারে\n• শুধুমাত্র ldtax.gov.bd এর URL সমর্থিত\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
+
+    await sendTextWithCancelButton(formattedPhone, message);
+    EnhancedLogger.info(`Dakhila approval started for ${formattedPhone}`);
+  } catch (err) {
+    EnhancedLogger.error(`Failed to start Dakhila approval for ${phone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ Dakhila সার্ভিস শুরু করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
 async function handleInstantServiceSelection(
   phone: string,
   serviceId: string,
@@ -1338,6 +1723,11 @@ async function handleInstantServiceSelection(
       return;
     }
 
+    if (serviceId === "instant_dakhila_approval") {
+      await handleDakhilaApprovalStart(phone);
+      return;
+    }
+
     if (service.requiresInput) {
       await stateManager.setUserState(formattedPhone, {
         currentState: "awaiting_instant_input",
@@ -1374,7 +1764,60 @@ async function handleInstantServiceSelection(
     await showMainMenu(formattedPhone, false);
   }
 }
+// Add this helper function near other helper functions
+function validateDakhilaUrl(url: string): { isValid: boolean; error?: string } {
+  try {
+    const trimmedUrl = url.trim();
 
+    if (!trimmedUrl) {
+      return { isValid: false, error: "URL is empty" };
+    }
+
+    // Check if it's a valid URL
+    let processedUrl = trimmedUrl;
+    if (!processedUrl.startsWith("http")) {
+      processedUrl = "https://" + processedUrl;
+    }
+
+    const urlObj = new URL(processedUrl);
+
+    // Check if it's from ldtax.gov.bd
+    if (!urlObj.hostname.includes("ldtax.gov.bd")) {
+      return {
+        isValid: false,
+        error: "URL must be from ldtax.gov.bd domain",
+      };
+    }
+
+    // Check if it's a citizen/holding URL
+    if (!urlObj.pathname.includes("/citizen/holding/")) {
+      return {
+        isValid: false,
+        error: "Invalid Dakhila URL format. Must be a citizen holding URL.",
+      };
+    }
+
+    // Check for JWT token in URL path
+    const pathParts = urlObj.pathname.split("/");
+    const token = pathParts[pathParts.length - 1];
+
+    // JWT tokens have 3 parts separated by dots
+    const tokenParts = token.split(".");
+    if (tokenParts.length !== 3) {
+      return {
+        isValid: false,
+        error: "Invalid Dakhila token format. Token should have 3 parts.",
+      };
+    }
+
+    return { isValid: true };
+  } catch (error) {
+    return {
+      isValid: false,
+      error: "Invalid URL format. Make sure the URL starts with https://",
+    };
+  }
+}
 async function handleInstantServiceInput(
   phone: string,
   input: string,
@@ -1397,7 +1840,12 @@ async function handleInstantServiceInput(
       return;
     }
 
-    await processInstantService(phone, serviceOrderData.serviceId!, input);
+    // Check if it's Dakhila approval
+    if (serviceOrderData.serviceId === "instant_dakhila_approval") {
+      await handleDakhilaApprovalCheck(formattedPhone, input.trim());
+    } else {
+      await processInstantService(phone, serviceOrderData.serviceId!, input);
+    }
   } catch (err) {
     EnhancedLogger.error(
       `Failed to process instant service input for ${formattedPhone}:`,
@@ -1430,6 +1878,9 @@ async function processInstantService(
     serviceName: service.name,
     input,
   });
+  if (serviceId === "instant_dakhila_approval") {
+    return;
+  }
 
   try {
     await connectDB();
@@ -7161,10 +7612,12 @@ async function handleUserMessage(
     if (isAdmin && (message.type === "image" || message.type === "document")) {
       // Define which states should BLOCK auto delivery (admin is in a flow)
       EnhancedLogger.debug(
-        `[${requestId}] Admin sent file, checking for auto delivery conditions`, {
+        `[${requestId}] Admin sent file, checking for auto delivery conditions`,
+        {
           currentState,
           flowType,
-        });
+        },
+      );
       const activeFlowStates = [
         // User flows
         "awaiting_trx_id",
@@ -7298,7 +7751,11 @@ async function handleUserMessage(
         await handleUbrnInput(formattedPhone, userText);
         return;
       }
-
+      if (currentState === "awaiting_dakhila_url") {
+        EnhancedLogger.info(`[${requestId}] Processing Dakhila URL input`);
+        await handleDakhilaApprovalCheck(formattedPhone, userText);
+        return;
+      }
       if (currentState === "awaiting_instant_input") {
         EnhancedLogger.info(`[${requestId}] Processing instant service input`);
         await handleInstantServiceInput(formattedPhone, userText);
