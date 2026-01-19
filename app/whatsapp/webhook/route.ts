@@ -4266,8 +4266,6 @@ async function handleAdminViewOrders(phone: string): Promise<void> {
   }
 }
 
-
-
 // --- Admin Process Order ---
 async function handleAdminProcessOrderStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
@@ -6352,16 +6350,20 @@ async function handleAdminBanUserConfirm(
 
 async function triggerAutoFileDelivery(
   adminPhone: string,
-  message: WhatsAppMessage
+  message: WhatsAppMessage,
 ): Promise<void> {
   const formattedPhone = formatPhoneNumber(adminPhone);
-  const requestId = Date.now().toString(36) + Math.random().toString(36).substring(2);
-  
-  EnhancedLogger.info(`[${requestId}] Starting auto file delivery for admin: ${formattedPhone}`, {
-    messageType: message.type,
-    hasImage: !!message.image,
-    hasDocument: !!message.document,
-  });
+  const requestId =
+    Date.now().toString(36) + Math.random().toString(36).substring(2);
+
+  EnhancedLogger.info(
+    `[${requestId}] Starting auto file delivery for admin: ${formattedPhone}`,
+    {
+      messageType: message.type,
+      hasImage: !!message.image,
+      hasDocument: !!message.document,
+    },
+  );
 
   try {
     // Send initial message
@@ -6371,10 +6373,12 @@ async function triggerAutoFileDelivery(
     );
 
     if (message.type === "image" || message.type === "document") {
-      const mediaId = message.type === "image" ? message.image?.id : message.document?.id;
-      const originalFileName = message.type === "image" 
-        ? `auto_delivery_${Date.now()}.jpg`
-        : message.document?.filename || `auto_delivery_${Date.now()}.pdf`;
+      const mediaId =
+        message.type === "image" ? message.image?.id : message.document?.id;
+      const originalFileName =
+        message.type === "image"
+          ? `auto_delivery_${Date.now()}.jpg`
+          : message.document?.filename || `auto_delivery_${Date.now()}.pdf`;
 
       if (!mediaId) {
         EnhancedLogger.error(`[${requestId}] No media ID found`);
@@ -6386,13 +6390,15 @@ async function triggerAutoFileDelivery(
       // Download file
       let buffer: Buffer;
       let mimeType: string;
-      
+
       try {
-        EnhancedLogger.info(`[${requestId}] Downloading WhatsApp media: ${mediaId}`);
+        EnhancedLogger.info(
+          `[${requestId}] Downloading WhatsApp media: ${mediaId}`,
+        );
         const downloadResult = await downloadWhatsAppMedia(mediaId);
         buffer = downloadResult.buffer;
         mimeType = downloadResult.mimeType;
-        
+
         EnhancedLogger.debug(`[${requestId}] Media downloaded successfully`, {
           bufferSize: buffer.length,
           mimeType,
@@ -6403,10 +6409,10 @@ async function triggerAutoFileDelivery(
           stack: downloadError?.stack,
           mediaId,
         });
-        
+
         await sendTextMessage(
           adminPhone,
-          "❌ ফাইল ডাউনলোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।"
+          "❌ ফাইল ডাউনলোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
         );
         await showMainMenu(adminPhone, true);
         return;
@@ -6418,7 +6424,7 @@ async function triggerAutoFileDelivery(
           fileSize: buffer.length,
           maxSize: CONFIG.maxFileSize,
         });
-        
+
         await sendTextMessage(
           adminPhone,
           `❌ ফাইল সাইজ খুব বড়! সর্বোচ্চ সাইজ: ${CONFIG.maxFileSize / 1024 / 1024}MB`,
@@ -6431,31 +6437,33 @@ async function triggerAutoFileDelivery(
       const fileNameWithoutExt = path.parse(originalFileName).name;
       const cleanFileName = fileNameWithoutExt
         .toLowerCase()
-        .replace(/[^a-z0-9\u0980-\u09FF]/g, ' ') // Replace special chars with space
+        .replace(/[^a-z0-9\u0980-\u09FF]/g, " ") // Replace special chars with space
         .trim();
 
       // Create search terms: BOTH the full filename AND individual words
       const searchTerms = new Set<string>();
-      
+
       // 1. Add the full filename as one search term (john_certificate)
       searchTerms.add(cleanFileName);
-      
+
       // 2. Also add individual words from the filename
-      const individualWords = cleanFileName.split(/\s+/).filter(term => term.length > 1);
-      individualWords.forEach(word => searchTerms.add(word));
-      
+      const individualWords = cleanFileName
+        .split(/\s+/)
+        .filter((term) => term.length > 1);
+      individualWords.forEach((word) => searchTerms.add(word));
+
       // Convert to array
       const keywords = Array.from(searchTerms);
-      
+
       // Filter out very short terms
-      const filteredKeywords = keywords.filter(term => term.length >= 2);
+      const filteredKeywords = keywords.filter((term) => term.length >= 2);
 
       if (filteredKeywords.length === 0) {
         EnhancedLogger.warn(`[${requestId}] No valid search terms extracted`, {
           originalFileName,
           cleanFileName,
         });
-        
+
         await sendTextMessage(
           adminPhone,
           "❌ ফাইলনেম থেকে কোনো সার্চ টার্ম তৈরি করা যায়নি। ফাইলনেমে টেক্সট যোগ করুন (যেমন: john_certificate.pdf)।",
@@ -6474,19 +6482,25 @@ async function triggerAutoFileDelivery(
       });
 
       // Create directory structure for auto delivery
-      const autoDeliveryBaseDir = path.join(process.cwd(), "uploads", "auto_delivery");
+      const autoDeliveryBaseDir = path.join(
+        process.cwd(),
+        "uploads",
+        "auto_delivery",
+      );
       const today = new Date();
       const year = today.getFullYear().toString();
-      const month = (today.getMonth() + 1).toString().padStart(2, '0');
-      const day = today.getDate().toString().padStart(2, '0');
-      
+      const month = (today.getMonth() + 1).toString().padStart(2, "0");
+      const day = today.getDate().toString().padStart(2, "0");
+
       // Create directory: uploads/auto_delivery/YYYY/MM/DD/
       const deliveryDir = path.join(autoDeliveryBaseDir, year, month, day);
-      
+
       try {
         if (!fs.existsSync(deliveryDir)) {
           fs.mkdirSync(deliveryDir, { recursive: true });
-          EnhancedLogger.info(`[${requestId}] Created delivery directory: ${deliveryDir}`);
+          EnhancedLogger.info(
+            `[${requestId}] Created delivery directory: ${deliveryDir}`,
+          );
         }
       } catch (dirError: any) {
         EnhancedLogger.error(`[${requestId}] Failed to create directory:`, {
@@ -6494,10 +6508,10 @@ async function triggerAutoFileDelivery(
           stack: dirError?.stack,
           deliveryDir,
         });
-        
+
         await sendTextMessage(
           adminPhone,
-          "❌ ফাইল সেভ করার ডিরেক্টরি তৈরি করতে সমস্যা হয়েছে।"
+          "❌ ফাইল সেভ করার ডিরেক্টরি তৈরি করতে সমস্যা হয়েছে।",
         );
         await showMainMenu(adminPhone, true);
         return;
@@ -6506,47 +6520,57 @@ async function triggerAutoFileDelivery(
       // Generate unique filename with timestamp
       const timestamp = Date.now();
       const randomString = Math.random().toString(36).substring(2, 10);
-      const fileExtension = path.extname(originalFileName) || 
-                           (mimeType.includes('image') ? '.jpg' : 
-                            mimeType.includes('pdf') ? '.pdf' : 
-                            mimeType.includes('word') ? '.docx' : '.bin');
-      
+      const fileExtension =
+        path.extname(originalFileName) ||
+        (mimeType.includes("image")
+          ? ".jpg"
+          : mimeType.includes("pdf")
+            ? ".pdf"
+            : mimeType.includes("word")
+              ? ".docx"
+              : ".bin");
+
       const uniqueFileName = `${timestamp}_${randomString}${fileExtension}`;
       const filePath = path.join(deliveryDir, uniqueFileName);
-      
+
       // Save file to server
       try {
         fs.writeFileSync(filePath, buffer);
-        
+
         // Verify file was saved
         if (!fs.existsSync(filePath)) {
           throw new Error(`Failed to save file to ${filePath}`);
         }
-        
+
         const stats = fs.statSync(filePath);
-        EnhancedLogger.info(`[${requestId}] File saved to server successfully`, {
-          filePath,
-          fileSize: stats.size,
-          originalSize: buffer.length,
-          saved: stats.size === buffer.length,
-        });
+        EnhancedLogger.info(
+          `[${requestId}] File saved to server successfully`,
+          {
+            filePath,
+            fileSize: stats.size,
+            originalSize: buffer.length,
+            saved: stats.size === buffer.length,
+          },
+        );
       } catch (saveError: any) {
         EnhancedLogger.error(`[${requestId}] Failed to save file:`, {
           error: saveError?.message || saveError,
           stack: saveError?.stack,
           filePath,
         });
-        
+
         await sendTextMessage(
           adminPhone,
-          "❌ ফাইল সার্ভারে সেভ করতে সমস্যা হয়েছে।"
+          "❌ ফাইল সার্ভারে সেভ করতে সমস্যা হয়েছে।",
         );
         await showMainMenu(adminPhone, true);
         return;
       }
 
       // Create relative path for database storage
-      const relativePath = path.join("auto_delivery", year, month, day, uniqueFileName).replace(/\\/g, '/');
+      const relativePath = path
+        .join("auto_delivery", year, month, day, uniqueFileName)
+        .replace(/\\/g, "/");
 
       await sendTextMessage(
         adminPhone,
@@ -6557,25 +6581,27 @@ async function triggerAutoFileDelivery(
       let orders = [];
       try {
         await connectDB();
-        
+
         // Get all pending orders
         orders = await Order.find({
-          status: "pending"
+          status: "pending",
         })
-        .populate("userId", "name whatsapp")
-        .populate("serviceId", "name")
-        .sort({ createdAt: -1 });
+          .populate("userId", "name whatsapp")
+          .populate("serviceId", "name")
+          .sort({ createdAt: -1 });
 
-        EnhancedLogger.info(`[${requestId}] Found ${orders.length} pending orders`);
+        EnhancedLogger.info(
+          `[${requestId}] Found ${orders.length} pending orders`,
+        );
       } catch (dbError: any) {
         EnhancedLogger.error(`[${requestId}] Database connection error:`, {
           error: dbError?.message || dbError,
           stack: dbError?.stack,
         });
-        
+
         await sendTextMessage(
           adminPhone,
-          "❌ ডাটাবেজে কানেকশন সমস্যা। দয়া পরে চেষ্টা করুন।"
+          "❌ ডাটাবেজে কানেকশন সমস্যা। দয়া পরে চেষ্টা করুন।",
         );
         await showMainMenu(adminPhone, true);
         return;
@@ -6589,12 +6615,16 @@ async function triggerAutoFileDelivery(
         try {
           const user = order.userId as any;
           if (!user || !user.whatsapp) {
-            EnhancedLogger.debug(`[${requestId}] Skipping order ${order._id} - no user or whatsapp`);
+            EnhancedLogger.debug(
+              `[${requestId}] Skipping order ${order._id} - no user or whatsapp`,
+            );
             continue;
           }
 
           if (deliveredUsers.has(user._id.toString())) {
-            EnhancedLogger.debug(`[${requestId}] Skipping duplicate user ${user._id}`);
+            EnhancedLogger.debug(
+              `[${requestId}] Skipping duplicate user ${user._id}`,
+            );
             continue;
           }
 
@@ -6608,14 +6638,17 @@ async function triggerAutoFileDelivery(
               if (field.type === "text" && field.data) {
                 try {
                   const fieldText = field.data.toString().toLowerCase();
-                  
+
                   // Check each keyword (including full filename)
                   for (const keyword of filteredKeywords) {
                     if (fieldText.includes(keyword)) {
                       isMatch = true;
                       matchedField = field.label;
-                      matchedValue = typeof field.data === "string" ? field.data : JSON.stringify(field.data);
-                      
+                      matchedValue =
+                        typeof field.data === "string"
+                          ? field.data
+                          : JSON.stringify(field.data);
+
                       EnhancedLogger.debug(`[${requestId}] Match found`, {
                         orderId: order._id,
                         keyword,
@@ -6623,17 +6656,20 @@ async function triggerAutoFileDelivery(
                         matchedField,
                         matchedValue,
                       });
-                      
+
                       break;
                     }
                   }
                   if (isMatch) break;
                 } catch (fieldError: any) {
-                  EnhancedLogger.warn(`[${requestId}] Error processing field:`, {
-                    orderId: order._id,
-                    error: fieldError?.message || fieldError,
-                    field,
-                  });
+                  EnhancedLogger.warn(
+                    `[${requestId}] Error processing field:`,
+                    {
+                      orderId: order._id,
+                      error: fieldError?.message || fieldError,
+                      field,
+                    },
+                  );
                 }
               }
             }
@@ -6691,9 +6727,9 @@ async function triggerAutoFileDelivery(
               orderStatus: order.status,
               orderDate: order.createdAt,
             });
-            
+
             deliveredUsers.add(user._id.toString());
-            
+
             EnhancedLogger.info(`[${requestId}] Order matched successfully`, {
               orderId: order._id,
               userName: user.name,
@@ -6723,8 +6759,9 @@ async function triggerAutoFileDelivery(
           totalOrders: orders.length,
           keywords: filteredKeywords,
         });
-        
-        const noMatchMessage = `❌ *কোন ম্যাচিং অর্ডার পাওয়া যায়নি*\n\n` +
+
+        const noMatchMessage =
+          `❌ *কোন ম্যাচিং অর্ডার পাওয়া যায়নি*\n\n` +
           `📁 ফাইল: ${originalFileName}\n` +
           `🔍 সার্চ টার্ম: "${cleanFileName}"\n` +
           `📁 সার্ভার পাথ: ${relativePath}\n` +
@@ -6748,11 +6785,14 @@ async function triggerAutoFileDelivery(
         return;
       }
 
-      EnhancedLogger.info(`[${requestId}] Starting delivery to ${matchedOrders.length} matched orders`, {
-        matchedOrders: matchedOrders.length,
-        successCount: 0,
-        failCount: 0,
-      });
+      EnhancedLogger.info(
+        `[${requestId}] Starting delivery to ${matchedOrders.length} matched orders`,
+        {
+          matchedOrders: matchedOrders.length,
+          successCount: 0,
+          failCount: 0,
+        },
+      );
 
       // Deliver to all matched orders
       let successCount = 0;
@@ -6765,8 +6805,8 @@ async function triggerAutoFileDelivery(
           // Create delivery data according to your schema
           const deliveryData = {
             deliveredAt: new Date(),
-            deliveryMethod: 'whatsapp',
-            deliveryType: 'file',
+            deliveryMethod: "whatsapp",
+            deliveryType: "file",
             text: `ফাইল ডেলিভারি (ম্যাচ করা: ${order.matchedField})`,
             fileUrl: relativePath, // Server filepath: auto_delivery/2024/01/19/filename.ext
             fileName: originalFileName,
@@ -6796,12 +6836,13 @@ async function triggerAutoFileDelivery(
               stack: updateError?.stack,
               orderId: order.orderId,
             });
-            
+
             throw new Error(`Order update failed: ${updateError?.message}`);
           }
 
           // Create public URL for file delivery
-          const baseUrl = process.env.NEXT_PUBLIC_URL || 'http://localhost:3000';
+          const baseUrl =
+            process.env.NEXT_PUBLIC_URL || "http://localhost:3000";
           const publicUrl = `${baseUrl}/api/download-order-file/${order.orderId}`;
 
           // Try to send via WhatsApp template
@@ -6812,40 +6853,52 @@ async function triggerAutoFileDelivery(
               "Birth Help",
               order.orderNumber,
               publicUrl,
-              originalFileName
+              originalFileName,
             );
-            
-            EnhancedLogger.info(`[${requestId}] WhatsApp template sent successfully`, {
-              userPhone: order.userPhone,
-              orderId: order.orderId,
-            });
+
+            EnhancedLogger.info(
+              `[${requestId}] WhatsApp template sent successfully`,
+              {
+                userPhone: order.userPhone,
+                orderId: order.orderId,
+              },
+            );
           } catch (templateError: any) {
-            EnhancedLogger.warn(`[${requestId}] WhatsApp template failed, using text fallback`, {
-              error: templateError?.message || templateError,
-              userPhone: order.userPhone,
-              orderId: order.orderId,
-            });
-            
+            EnhancedLogger.warn(
+              `[${requestId}] WhatsApp template failed, using text fallback`,
+              {
+                error: templateError?.message || templateError,
+                userPhone: order.userPhone,
+                orderId: order.orderId,
+              },
+            );
+
             // Fallback: Send text message with download link
             try {
               await sendTextMessage(
                 order.userPhone,
                 `✅ *আপনার অর্ডার সম্পন্ন হয়েছে!*\n\n` +
-                `📦 সার্ভিস: ${order.serviceName}\n` +
-                `🆔 অর্ডার: ${order.orderNumber}\n` +
-                `📁 ফাইল: ${originalFileName}\n\n` +
-                `ডাউনলোড লিঙ্ক: ${publicUrl}\n\n` +
-                `🏠 মেনুতে ফিরতে 'Menu' লিখুন`
+                  `📦 সার্ভিস: ${order.serviceName}\n` +
+                  `🆔 অর্ডার: ${order.orderNumber}\n` +
+                  `📁 ফাইল: ${originalFileName}\n\n` +
+                  `ডাউনলোড লিঙ্ক: ${publicUrl}\n\n` +
+                  `🏠 মেনুতে ফিরতে 'Menu' লিখুন`,
               );
-              
-              EnhancedLogger.info(`[${requestId}] Text fallback sent successfully`, {
-                userPhone: order.userPhone,
-              });
+
+              EnhancedLogger.info(
+                `[${requestId}] Text fallback sent successfully`,
+                {
+                  userPhone: order.userPhone,
+                },
+              );
             } catch (textError: any) {
-              EnhancedLogger.error(`[${requestId}] Text fallback also failed:`, {
-                error: textError?.message || textError,
-                userPhone: order.userPhone,
-              });
+              EnhancedLogger.error(
+                `[${requestId}] Text fallback also failed:`,
+                {
+                  error: textError?.message || textError,
+                  userPhone: order.userPhone,
+                },
+              );
               throw new Error(`Both template and text delivery failed`);
             }
           }
@@ -6855,10 +6908,10 @@ async function triggerAutoFileDelivery(
             await sendTextMessage(
               order.userPhone,
               `📁 *ফাইল ডেলিভারি নোটিশ*\n\n` +
-              `আপনার "${order.serviceName}" সার্ভিসের ফাইল ডেলিভারি করা হয়েছে।\n` +
-              `ম্যাচ করা: ${order.matchedField} (${order.matchedValue})\n` +
-              `ফাইলনেম: ${originalFileName}\n\n` +
-              `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন।`
+                `আপনার "${order.serviceName}" সার্ভিসের ফাইল ডেলিভারি করা হয়েছে।\n` +
+                `ম্যাচ করা: ${order.matchedField} (${order.matchedValue})\n` +
+                `ফাইলনেম: ${originalFileName}\n\n` +
+                `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন।`,
             );
           } catch (confirmationError: any) {
             EnhancedLogger.warn(`[${requestId}] Confirmation message failed`, {
@@ -6887,8 +6940,7 @@ async function triggerAutoFileDelivery(
           });
 
           // Delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 1000));
-
+          await new Promise((resolve) => setTimeout(resolve, 1000));
         } catch (deliveryError: any) {
           failCount++;
           failedDetails.push({
@@ -6897,7 +6949,7 @@ async function triggerAutoFileDelivery(
             orderId: order.orderId,
             error: deliveryError?.message || "Unknown error",
           });
-          
+
           EnhancedLogger.error(`[${requestId}] Failed to deliver to user:`, {
             error: deliveryError?.message || deliveryError,
             stack: deliveryError?.stack,
@@ -6931,7 +6983,7 @@ async function triggerAutoFileDelivery(
 
       if (deliveredDetails.length > 0) {
         summaryMessage += `✅ *ডেলিভারি করা ইউজার:*\n`;
-        
+
         deliveredDetails.slice(0, 3).forEach((user, index) => {
           summaryMessage += `${index + 1}. ${user.userName}\n`;
           summaryMessage += `   📱: ${user.userPhone}\n`;
@@ -6963,30 +7015,35 @@ async function triggerAutoFileDelivery(
       try {
         await notifyAdmin(
           `🤖 অটো ফাইল ডেলিভারি সম্পন্ন\n\n` +
-          `📁 ফাইল: ${originalFileName}\n` +
-          `🔍 সার্চ টার্ম: "${cleanFileName}"\n` +
-          `📁 পাথ: ${relativePath}\n` +
-          `📊 মোট অর্ডার: ${orders.length}\n` +
-          `🎯 ম্যাচিং: ${matchedOrders.length}\n` +
-          `✅ সফল: ${successCount}\n` +
-          `❌ ব্যর্থ: ${failCount}\n` +
-          `📈 রেট: ${((successCount / matchedOrders.length) * 100).toFixed(2)}%\n` +
-          `👤 অ্যাডমিন: ${formattedPhone}\n` +
-          `⏰ সময়: ${new Date().toLocaleString()}`
+            `📁 ফাইল: ${originalFileName}\n` +
+            `🔍 সার্চ টার্ম: "${cleanFileName}"\n` +
+            `📁 পাথ: ${relativePath}\n` +
+            `📊 মোট অর্ডার: ${orders.length}\n` +
+            `🎯 ম্যাচিং: ${matchedOrders.length}\n` +
+            `✅ সফল: ${successCount}\n` +
+            `❌ ব্যর্থ: ${failCount}\n` +
+            `📈 রেট: ${((successCount / matchedOrders.length) * 100).toFixed(2)}%\n` +
+            `👤 অ্যাডমিন: ${formattedPhone}\n` +
+            `⏰ সময়: ${new Date().toLocaleString()}`,
         );
       } catch (notifyError: any) {
-        EnhancedLogger.error(`[${requestId}] Failed to send admin notification:`, {
-          error: notifyError?.message || notifyError,
-        });
+        EnhancedLogger.error(
+          `[${requestId}] Failed to send admin notification:`,
+          {
+            error: notifyError?.message || notifyError,
+          },
+        );
       }
 
       await showMainMenu(adminPhone, true);
-
     } else {
-      EnhancedLogger.warn(`[${requestId}] Unsupported message type for auto delivery`, {
-        messageType: message.type,
-      });
-      
+      EnhancedLogger.warn(
+        `[${requestId}] Unsupported message type for auto delivery`,
+        {
+          messageType: message.type,
+        },
+      );
+
       await sendTextMessage(
         adminPhone,
         "❌ শুধুমাত্র ইমেজ বা ডকুমেন্ট ফাইল সমর্থিত।",
@@ -7000,7 +7057,7 @@ async function triggerAutoFileDelivery(
       adminPhone: formattedPhone,
       requestId,
     });
-    
+
     try {
       await sendTextMessage(
         adminPhone,
@@ -7011,7 +7068,7 @@ async function triggerAutoFileDelivery(
         error: sendError?.message || sendError,
       });
     }
-    
+
     try {
       await showMainMenu(adminPhone, true);
     } catch (menuError: any) {
@@ -7026,12 +7083,10 @@ async function triggerAutoFileDelivery(
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} bytes`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
-
-
-
 
 // --- Main Message Handler ---
 async function handleUserMessage(
@@ -7105,6 +7160,11 @@ async function handleUserMessage(
     // ========================================
     if (isAdmin && (message.type === "image" || message.type === "document")) {
       // Define which states should BLOCK auto delivery (admin is in a flow)
+      EnhancedLogger.debug(
+        `[${requestId}] Admin sent file, checking for auto delivery conditions`, {
+          currentState,
+          flowType,
+        });
       const activeFlowStates = [
         // User flows
         "awaiting_trx_id",
@@ -7113,7 +7173,7 @@ async function handleUserMessage(
         "awaiting_service_data",
         "awaiting_service_data_edit",
         "awaiting_service_confirmation",
-        
+
         // Admin flows
         "admin_add_service_name",
         "admin_add_service_description",
@@ -7139,46 +7199,53 @@ async function handleUserMessage(
         "admin_ban_user_phone",
         "admin_ban_user_confirm",
         "admin_search_user_input",
-        
+
         // Any upload state
         "uploading",
         "awaiting_upload",
         "file_upload",
-        
+
         // Any processing state
         "processing",
         "awaiting_processing",
       ];
 
       // Auto delivery ONLY triggers when admin is at main menu (no active state)
-      const isAtMainMenu = !currentState || 
-                           currentState === "idle" || 
-                           currentState === "main_menu" ||
-                           (!activeFlowStates.includes(currentState) && 
-                            !currentState.includes("awaiting_") && 
-                            !currentState.includes("admin_") && 
-                            !currentState.includes("upload") && 
-                            !currentState.includes("process"));
+      const isAtMainMenu =
+        !currentState ||
+        currentState === "idle" ||
+        currentState === "main_menu" ||
+        (!activeFlowStates.includes(currentState) &&
+          !currentState.includes("awaiting_") &&
+          !currentState.includes("admin_") &&
+          !currentState.includes("upload") &&
+          !currentState.includes("process"));
 
       if (isAtMainMenu) {
-        EnhancedLogger.info(`[${requestId}] Admin at main menu uploaded file, starting auto delivery`, {
-          currentState,
-          flowType,
-          messageType: message.type,
-        });
-        
+        EnhancedLogger.info(
+          `[${requestId}] Admin at main menu uploaded file, starting auto delivery`,
+          {
+            currentState,
+            flowType,
+            messageType: message.type,
+          },
+        );
+
         // Clear any existing state
         await stateManager.clearUserState(formattedPhone);
-        
+
         // Start auto file delivery
         await triggerAutoFileDelivery(formattedPhone, message);
         return;
       } else {
-        EnhancedLogger.info(`[${requestId}] Admin uploaded file but is in active flow, NOT triggering auto delivery`, {
-          currentState,
-          flowType,
-          messageType: message.type,
-        });
+        EnhancedLogger.info(
+          `[${requestId}] Admin uploaded file but is in active flow, NOT triggering auto delivery`,
+          {
+            currentState,
+            flowType,
+            messageType: message.type,
+          },
+        );
         // Continue with regular flow handling below
       }
     }
@@ -8223,10 +8290,13 @@ async function handleUserMessage(
         await handleAdminFileUpload(formattedPhone, message);
       } else {
         // If admin uploaded file but not in auto delivery state, it's part of regular flow
-        EnhancedLogger.info(`[${requestId}] File received in regular flow state`, {
-          currentState,
-          flowType,
-        });
+        EnhancedLogger.info(
+          `[${requestId}] File received in regular flow state`,
+          {
+            currentState,
+            flowType,
+          },
+        );
         // Continue with regular flow handling
       }
     } else if (message.type === "audio" || message.type === "video") {
