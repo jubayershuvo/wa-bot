@@ -579,7 +579,7 @@ async function handleDakhilaApprovalCheck(
 
     // Call Dakhila API
     const result = await checkDakhilaApproval(dakhilaUrl);
-
+    console.log(result);
     // Deduct balance
     const oldBalance = user.balance;
     user.balance -= service.price;
