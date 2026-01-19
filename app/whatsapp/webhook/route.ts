@@ -8373,7 +8373,13 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       object: body.object,
       entryCount: body.entry?.length || 0,
     });
-
+    // Save webhook body as JSON to server
+    const webhookDir = path.join(process.cwd(), "webhook_logs");
+    const webhookFile = path.join(webhookDir, `${requestId}.json`);
+    if (!fs.existsSync(webhookDir)) {
+      fs.mkdirSync(webhookDir);
+    }
+    fs.writeFileSync(webhookFile, JSON.stringify(body, null, 2));
     if (body.object === "whatsapp_business_account") {
       const entry = body.entry?.[0];
       const changes = entry?.changes?.[0];
