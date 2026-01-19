@@ -173,6 +173,17 @@ const INSTANT_SERVICES = [
     inputExample:
       "https://portal.ldtax.gov.bd/citizen/holding/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   },
+  {
+    id: "instant_holding_payment_link",
+    name: "💰 Make Holding Payment Link",
+    description: "হোল্ডিং পেমেন্ট লিংক তৈরি করুন",
+    price: 15,
+    isActive: true,
+    requiresInput: true,
+    inputPrompt: "Dakhila URL টি পাঠান:",
+    inputExample:
+      "https://portal.ldtax.gov.bd/citizen/holding/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  },
 ];
 
 // --- Rate Limiter ---
@@ -568,7 +579,7 @@ async function handleDakhilaApprovalCheck(
 
     // Call Dakhila API
     const result = await checkDakhilaApproval(dakhilaUrl);
-
+    console.log(result);
     // Deduct balance
     const oldBalance = user.balance;
     user.balance -= service.price;
@@ -651,6 +662,169 @@ async function handleDakhilaApprovalCheck(
     await showMainMenu(formattedPhone, false);
   }
 }
+
+// Add this function after handleDakhilaApprovalCheck function
+async function handleHoldingPaymentLink(
+  phone: string,
+  dakhilaUrl: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+
+  EnhancedLogger.info(`Processing Holding Payment Link for ${formattedPhone}`, {
+    urlPreview: dakhilaUrl.substring(0, 100),
+  });
+
+  try {
+    // Validate URL first
+    const validation = validateDakhilaUrl(dakhilaUrl);
+    if (!validation.isValid) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অবৈধ Dakhila URL*\n\nকারণ: ${validation.error}\n\nদয়া করে সঠিক Dakhila URL দিন।\n\nউদাহরণ:\nhttps://portal.ldtax.gov.bd/citizen/holding/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...`,
+      );
+      return;
+    }
+
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_holding_payment_link",
+    );
+    if (!service) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ Payment Link service not available!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    // Send processing message
+    await sendTextMessage(
+      formattedPhone,
+      `⏳ *হোল্ডিং পেমেন্ট লিংক তৈরি করা হচ্ছে...*\n\nURL: ${dakhilaUrl.substring(0, 80)}${dakhilaUrl.length > 80 ? "..." : ""}\n\nদয়া করে অপেক্ষা করুন...`,
+    );
+
+    // Call Payment Link API
+    const result = await generatePaymentLink(dakhilaUrl);
+
+    // Deduct balance
+    const oldBalance = user.balance;
+    user.balance -= service.price;
+    await user.save();
+
+    // Create transaction record
+    const transaction = await Transaction.create({
+      trxId: `PAYMENT-LINK-${Date.now()}`,
+      amount: service.price,
+      method: "balance",
+      status: "SUCCESS",
+      number: formattedPhone,
+      user: user._id,
+      metadata: {
+        serviceId: "instant_holding_payment_link",
+        serviceName: service.name,
+        dakhilaUrl: dakhilaUrl,
+        resultStatus: result.status,
+        resultMessage: result.message,
+        paymentUrl: result.paymentUrl,
+        totalDemand: result.totalDemand,
+        processedAt: new Date().toISOString(),
+      },
+      createdAt: new Date(),
+    });
+
+    let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
+    resultMessage += `🔗 Dakhila URL: ${dakhilaUrl.substring(0, 60)}${dakhilaUrl.length > 60 ? "..." : ""}\n`;
+    resultMessage += `💰 সার্ভিস মূল্য: ৳${service.price}\n`;
+    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
+    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
+    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
+
+    if (result.status === "success" && result.paymentUrl) {
+      resultMessage += `🔗 *পেমেন্ট লিংক:* ${result.paymentUrl}\n\n`;
+
+      if (result.totalDemand) {
+        resultMessage += `💰 *মোট পেমেন্ট ধার্য:* ৳${result.totalDemand}\n\n`;
+      }
+
+      resultMessage += `⚠️ *গুরুত্বপূর্ণ সতর্কতা:*\n`;
+      resultMessage += `• এই লিংকটি *একবার মাত্র* ভিজিট করা যাবে\n`;
+      resultMessage += `• একবার ভিজিট করলে লিংকটি বন্ধ হয়ে যাবে\n`;
+      resultMessage += `• লিংকটি কাউকে শেয়ার করবেন না\n`;
+      resultMessage += `• সরাসরি পেমেন্ট করার জন্য লিংকটি ওপেন করুন\n`;
+      resultMessage += `• পেমেন্ট সম্পূর্ণ না হওয়া পর্যন্ত ব্রাউজার বন্ধ করবেন না\n\n`;
+
+      resultMessage += `📝 *পেমেন্ট নির্দেশনা:*\n`;
+      resultMessage += `1. উপরের লিংকটিতে ক্লিক করুন\n`;
+      resultMessage += `2. পেমেন্ট পেজে আপনার তথ্য যাচাই করুন\n`;
+      resultMessage += `3. পেমেন্ট মাধ্যম নির্বাচন করুন\n`;
+      resultMessage += `4. পেমেন্ট সম্পন্ন করুন\n`;
+      resultMessage += `5. কনফার্মেশন রসিদ সংরক্ষণ করুন\n`;
+    } else if (result.status === "error") {
+      resultMessage += `❌ *পেমেন্ট লিংক তৈরি ব্যর্থ*\n\n`;
+      resultMessage += `কারণ: ${result.message || "অজানা সমস্যা"}\n\n`;
+      resultMessage += `দয়া করে সঠিক Dakhila URL দিন অথবা পরে চেষ্টা করুন।\n`;
+    } else {
+      resultMessage += `❓ *পেমেন্ট লিংক তৈরি সম্ভব হয়নি*\n\n`;
+      resultMessage += `দয়া পরে চেষ্টা করুন অথবা সাপোর্টে যোগাযোগ করুন।\n`;
+    }
+
+    resultMessage += `\n📞 সাহায্যের জন্য: ${CONFIG.supportNumber}\n`;
+    resultMessage += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(formattedPhone, resultMessage);
+
+    // Notify admin
+    await notifyAdmin(
+      `✅ Holding Payment Link তৈরি সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nসার্ভিস: ${service.name}\nমূল্য: ৳${service.price}\nURL: ${dakhilaUrl.substring(0, 100)}${dakhilaUrl.length > 100 ? "..." : ""}\nস্ট্যাটাস: ${result.status === "success" ? "✅ SUCCESS" : "❌ FAILED"}\nপেমেন্ট লিংক: ${result.paymentUrl ? "✅ তৈরি করা হয়েছে" : "❌ তৈরি করা যায়নি"}\nমোট ধার্য: ${result.totalDemand ? `৳${result.totalDemand}` : "N/A"}\nব্যালেন্স: ${oldBalance} → ${user.balance}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "holding_payment_link", {
+      url: dakhilaUrl,
+      price: service.price,
+      result: result.status,
+      paymentUrl: result.paymentUrl,
+      totalDemand: result.totalDemand,
+      transactionId: transaction._id,
+      oldBalance,
+      newBalance: user.balance,
+    });
+  } catch (err: any) {
+    EnhancedLogger.error(`Failed to generate payment link:`, {
+      error: err?.message || err,
+      stack: err?.stack,
+      phone: formattedPhone,
+    });
+
+    await sendTextMessage(
+      formattedPhone,
+      "❌ পেমেন্ট লিংক তৈরি করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+  }
+}
 // Add this function after other API functions (around line 450)
 async function checkDakhilaApproval(
   url: string,
@@ -660,7 +834,6 @@ async function checkDakhilaApproval(
       urlLength: url.length,
       urlPreview: url.substring(0, 100),
     });
-
     // Validate URL using helper function
     const validation = validateDakhilaUrl(url);
     if (!validation.isValid) {
@@ -675,7 +848,7 @@ async function checkDakhilaApproval(
     if (!processedUrl.startsWith("http")) {
       processedUrl = "https://" + processedUrl;
     }
-
+    console.log(processedUrl);
     // Encode the URL
     const encodedUrl = encodeURIComponent(processedUrl);
     const apiUrl = `${CONFIG.dakhilaApiUrl}?url=${encodedUrl}`;
@@ -690,7 +863,7 @@ async function checkDakhilaApproval(
       headers: {
         "User-Agent": "BirthHelp-Bot/1.0",
         Accept: "application/json",
-      }
+      },
     });
 
     const responseTime = Date.now() - startTime;
@@ -771,6 +944,137 @@ async function checkDakhilaApproval(
       errorMessage = "Network error. Please check your connection.";
     } else if (error.message?.includes("ENOTFOUND")) {
       errorMessage = "Cannot connect to Dakhila API server.";
+    } else if (error.message) {
+      errorMessage = `Error: ${error.message}`;
+    }
+
+    return {
+      status: "error",
+      message: errorMessage,
+    };
+  }
+}
+
+// Add this function after checkDakhilaApproval function
+async function generatePaymentLink(url: string): Promise<{
+  status: string;
+  message?: string;
+  paymentUrl?: string;
+  totalDemand?: number;
+}> {
+  try {
+    EnhancedLogger.info(`Generating payment link for URL`, {
+      urlLength: url.length,
+      urlPreview: url.substring(0, 100),
+    });
+
+    // Validate URL using helper function
+    const validation = validateDakhilaUrl(url);
+    if (!validation.isValid) {
+      return {
+        status: "error",
+        message: validation.error || "Invalid URL",
+      };
+    }
+
+    // Ensure URL is properly formatted
+    let processedUrl = url.trim();
+    if (!processedUrl.startsWith("http")) {
+      processedUrl = "https://" + processedUrl;
+    }
+
+    // Encode the URL for API call
+    const encodedUrl = encodeURIComponent(processedUrl);
+    const apiUrl = `https://api.fortest.top/dakhila/payment_link_gen.php?url=${encodedUrl}`;
+
+    EnhancedLogger.debug(`Calling Payment Link API`, {
+      apiUrl: apiUrl.substring(0, 200) + "...",
+    });
+
+    const startTime = Date.now();
+    const response = await fetch(apiUrl, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "BirthHelp-Bot/1.0",
+        Accept: "application/json",
+      },
+    });
+
+    const responseTime = Date.now() - startTime;
+
+    if (!response.ok) {
+      EnhancedLogger.error(`Payment Link API error: ${response.status}`, {
+        status: response.status,
+        statusText: response.statusText,
+        responseTime: `${responseTime}ms`,
+      });
+
+      let errorMessage = `API request failed with status ${response.status}`;
+      if (response.status === 404) {
+        errorMessage = "Payment Link API endpoint not found";
+      } else if (response.status === 400) {
+        errorMessage = "Invalid request to Payment Link API";
+      } else if (response.status === 429) {
+        errorMessage = "Too many requests to Payment Link API";
+      } else if (response.status >= 500) {
+        errorMessage = "Payment Link API server error";
+      }
+
+      return {
+        status: "error",
+        message: errorMessage,
+      };
+    }
+
+    const data = await response.json();
+
+    EnhancedLogger.debug(`Payment Link API response`, {
+      status: data?.status,
+      responseTime: `${responseTime}ms`,
+      hasData: !!data,
+      dataKeys: data ? Object.keys(data) : [],
+    });
+
+    if (data && data.url) {
+      return {
+        status: "success",
+        message: "Payment link generated successfully",
+        paymentUrl: data.url,
+        totalDemand: data.holding_data?.total_demand || data.total_demand,
+      };
+    } else if (data && data.error) {
+      return {
+        status: "error",
+        message: data.error || "Failed to generate payment link",
+        paymentUrl: data.url,
+        totalDemand: data.holding_data?.total_demand || data.total_demand,
+      };
+    } else {
+      EnhancedLogger.warn(`Unexpected Payment Link API response`, {
+        data,
+      });
+      return {
+        status: "error",
+        message: "Could not generate payment link from response",
+        paymentUrl: data.url,
+        totalDemand: data.holding_data?.total_demand || data.total_demand,
+      };
+    }
+  } catch (error: any) {
+    EnhancedLogger.error(`Error generating payment link:`, {
+      error: error?.message || error,
+      stack: error?.stack,
+      url: url.substring(0, 100),
+    });
+
+    let errorMessage = "Failed to generate payment link";
+    if (error.message?.includes("timeout")) {
+      errorMessage = "Payment Link API timeout. Please try again later.";
+    } else if (error.message?.includes("network")) {
+      errorMessage = "Network error. Please check your connection.";
+    } else if (error.message?.includes("ENOTFOUND")) {
+      errorMessage = "Cannot connect to Payment Link API server.";
     } else if (error.message) {
       errorMessage = `Error: ${error.message}`;
     }
@@ -1680,6 +1984,70 @@ async function handleDakhilaApprovalStart(phone: string): Promise<void> {
     await showMainMenu(formattedPhone, false);
   }
 }
+// Add this function after handleDakhilaApprovalStart function
+async function handleHoldingPaymentLinkStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Starting Holding Payment Link for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_holding_payment_link",
+    );
+    if (!service) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ Payment Link service not available!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "awaiting_payment_link_url",
+      flowType: "holding_payment_link",
+      data: {
+        paymentLinkData: {
+          serviceId: "instant_holding_payment_link",
+          price: service.price,
+          serviceName: service.name,
+          attempts: 0,
+        },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
+    });
+
+    const message = `💰 *হোল্ডিং পেমেন্ট লিংক তৈরি করুন*\n\n💰 মূল্য: ৳${service.price}\n\n${service.inputPrompt}\n\nউদাহরণ: ${service.inputExample}\n\n📌 নোট:\n• Dakhila URLটি সঠিকভাবে লিখুন\n• লিংক তৈরি করতে ১-২ মিনিট সময় লাগতে পারে\n• শুধুমাত্র ldtax.gov.bd এর URL সমর্থিত\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
+
+    await sendTextWithCancelButton(formattedPhone, message);
+    EnhancedLogger.info(`Holding Payment Link started for ${formattedPhone}`);
+  } catch (err) {
+    EnhancedLogger.error(`Failed to start Payment Link for ${phone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ পেমেন্ট লিংক সার্ভিস শুরু করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
 async function handleInstantServiceSelection(
   phone: string,
   serviceId: string,
@@ -1725,6 +2093,12 @@ async function handleInstantServiceSelection(
 
     if (serviceId === "instant_dakhila_approval") {
       await handleDakhilaApprovalStart(phone);
+      return;
+    }
+
+    // ADD THIS NEW CONDITION
+    if (serviceId === "instant_holding_payment_link") {
+      await handleHoldingPaymentLinkStart(phone);
       return;
     }
 
@@ -1843,6 +2217,10 @@ async function handleInstantServiceInput(
     // Check if it's Dakhila approval
     if (serviceOrderData.serviceId === "instant_dakhila_approval") {
       await handleDakhilaApprovalCheck(formattedPhone, input.trim());
+    }
+    // ADD THIS NEW CONDITION for Payment Link
+    else if (serviceOrderData.serviceId === "instant_holding_payment_link") {
+      await handleHoldingPaymentLink(formattedPhone, input.trim());
     } else {
       await processInstantService(phone, serviceOrderData.serviceId!, input);
     }
@@ -1878,7 +2256,10 @@ async function processInstantService(
     serviceName: service.name,
     input,
   });
-  if (serviceId === "instant_dakhila_approval") {
+  if (
+    serviceId === "instant_dakhila_approval" ||
+    serviceId === "instant_holding_payment_link"
+  ) {
     return;
   }
 
@@ -7707,7 +8088,7 @@ async function handleUserMessage(
     // REGULAR MESSAGE HANDLING (FOR ALL USERS)
     // ========================================
     if (message.type === "text") {
-      const userText = message.text?.body.trim().toLowerCase() || "";
+      const userText = message.text?.body.trim() || "";
       EnhancedLogger.info(
         `[${requestId}] Text message received: "${userText}"`,
         {
@@ -7717,11 +8098,11 @@ async function handleUserMessage(
 
       // Cancel handler for all flows
       if (
-        userText === "cancel" ||
-        userText === "বাতিল" ||
-        userText === "c" ||
-        userText === "cancel all" ||
-        userText === "stop"
+        userText.toLowerCase() === "cancel" ||
+        userText.toLowerCase() === "বাতিল" ||
+        userText.toLowerCase() === "c" ||
+        userText.toLowerCase() === "cancel all" ||
+        userText.toLowerCase() === "stop"
       ) {
         EnhancedLogger.info(`[${requestId}] Cancelling flow for user`);
         await cancelFlow(formattedPhone, isAdmin);
@@ -7754,6 +8135,11 @@ async function handleUserMessage(
       if (currentState === "awaiting_dakhila_url") {
         EnhancedLogger.info(`[${requestId}] Processing Dakhila URL input`);
         await handleDakhilaApprovalCheck(formattedPhone, userText);
+        return;
+      }
+      if (currentState === "awaiting_payment_link_url") {
+        EnhancedLogger.info(`[${requestId}] Processing Payment Link URL input`);
+        await handleHoldingPaymentLink(formattedPhone, userText);
         return;
       }
       if (currentState === "awaiting_instant_input") {
@@ -8806,12 +9192,7 @@ async function handleUserMessage(
 // --- Main Webhook Handler ---
 export async function POST(req: NextRequest): Promise<NextResponse> {
   const requestId =
-    Date.now().toString(36) + Math.random().toString(36).substr(2);
-  EnhancedLogger.info(`[${requestId}] Webhook POST request received`, {
-    url: req.url,
-    method: "POST",
-    timestamp: new Date().toISOString(),
-  });
+    Date.now().toString(36) + Math.random().toString(36).substring(2);
 
   try {
     sessionMonitor.start();

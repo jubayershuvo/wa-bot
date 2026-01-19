@@ -184,6 +184,17 @@ const INSTANT_SERVICES = [
     inputExample:
       "https://portal.ldtax.gov.bd/citizen/holding/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   },
+  {
+    id: "instant_missing_holding",
+    name: "🔍 Find Missing Holding",
+    description: "হোল্ডিং খুঁজে বের করুন",
+    price: 15,
+    isActive: true,
+    requiresInput: true,
+    inputPrompt: "Dakhila URL টি পাঠান:",
+    inputExample:
+      "https://portal.ldtax.gov.bd/citizen/holding/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  },
 ];
 
 // --- Rate Limiter ---
@@ -1085,6 +1096,139 @@ async function generatePaymentLink(url: string): Promise<{
     };
   }
 }
+
+// Add this function after generatePaymentLink function (around line 1650)
+async function findMissingHolding(url: string): Promise<{
+  status: string;
+  message?: string;
+  pdfUrls?: string[];
+  data?: any;
+}> {
+  try {
+    EnhancedLogger.info(`Finding missing holding for URL`, {
+      urlLength: url.length,
+      urlPreview: url.substring(0, 100),
+    });
+
+    // Validate URL using helper function
+    const validation = validateDakhilaUrl(url);
+    if (!validation.isValid) {
+      return {
+        status: "error",
+        message: validation.error || "Invalid URL",
+      };
+    }
+
+    // Ensure URL is properly formatted
+    let processedUrl = url.trim();
+    if (!processedUrl.startsWith("http")) {
+      processedUrl = "https://" + processedUrl;
+    }
+
+    // Encode the URL for API call
+    const encodedUrl = encodeURIComponent(processedUrl);
+    const apiUrl = `https://api.fortest.top/dakhila/find_dakhila.php?input=${encodedUrl}`;
+
+    EnhancedLogger.debug(`Calling Find Missing Holding API`, {
+      apiUrl: apiUrl.substring(0, 200) + "...",
+    });
+
+    const startTime = Date.now();
+    const response = await fetch(apiUrl, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "BirthHelp-Bot/1.0",
+        Accept: "application/json",
+      },
+    });
+
+    const responseTime = Date.now() - startTime;
+
+    if (!response.ok) {
+      EnhancedLogger.error(
+        `Find Missing Holding API error: ${response.status}`,
+        {
+          status: response.status,
+          statusText: response.statusText,
+          responseTime: `${responseTime}ms`,
+        },
+      );
+
+      let errorMessage = `API request failed with status ${response.status}`;
+      if (response.status === 404) {
+        errorMessage = "Find Missing Holding API endpoint not found";
+      } else if (response.status === 400) {
+        errorMessage = "Invalid request to Find Missing Holding API";
+      } else if (response.status === 429) {
+        errorMessage = "Too many requests to Find Missing Holding API";
+      } else if (response.status >= 500) {
+        errorMessage = "Find Missing Holding API server error";
+      }
+
+      return {
+        status: "error",
+        message: errorMessage,
+      };
+    }
+
+    const data = await response.json();
+
+    EnhancedLogger.debug(`Find Missing Holding API response`, {
+      status: "success",
+      responseTime: `${responseTime}ms`,
+      hasData: !!data,
+      dataKeys: data ? Object.keys(data) : [],
+    });
+
+    if (data && data.pdf_urls) {
+      return {
+        status: "success",
+        message: "Missing holding found successfully",
+        pdfUrls: data.pdf_urls,
+        data: data,
+      };
+    } else if (data && data.error) {
+      return {
+        status: "error",
+        message: data.error || "Failed to find missing holding",
+        data: data,
+      };
+    } else {
+      EnhancedLogger.warn(`Unexpected Find Missing Holding API response`, {
+        data,
+      });
+      return {
+        status: "error",
+        message: "Could not find missing holding from response",
+        data: data,
+      };
+    }
+  } catch (error: any) {
+    EnhancedLogger.error(`Error finding missing holding:`, {
+      error: error?.message || error,
+      stack: error?.stack,
+      url: url.substring(0, 100),
+    });
+
+    let errorMessage = "Failed to find missing holding";
+    if (error.message?.includes("timeout")) {
+      errorMessage =
+        "Find Missing Holding API timeout. Please try again later.";
+    } else if (error.message?.includes("network")) {
+      errorMessage = "Network error. Please check your connection.";
+    } else if (error.message?.includes("ENOTFOUND")) {
+      errorMessage = "Cannot connect to Find Missing Holding API server.";
+    } else if (error.message) {
+      errorMessage = `Error: ${error.message}`;
+    }
+
+    return {
+      status: "error",
+      message: errorMessage,
+    };
+  }
+}
 async function sendTextMessage(to: string, text: string): Promise<any> {
   const formattedTo = formatPhoneNumber(to);
   EnhancedLogger.info(`Sending text message to ${formattedTo}`, {
@@ -1695,8 +1839,12 @@ async function cancelFlow(
     const state = await stateManager.getUserState(formattedPhone);
     const flowType = state?.flowType;
 
-    // Special handling for different flow types
-    if (flowType === "dakhila_approval") {
+    if (flowType === "missing_holding") {
+      await sendTextMessage(
+        formattedPhone,
+        "🚫 হোল্ডিং খুঁজে বের করা বাতিল করা হয়েছে।",
+      );
+    } else if (flowType === "dakhila_approval") {
       await sendTextMessage(
         formattedPhone,
         "🚫 Dakhila approval check বাতিল করা হয়েছে।",
@@ -2048,6 +2196,251 @@ async function handleHoldingPaymentLinkStart(phone: string): Promise<void> {
     await showMainMenu(formattedPhone, false);
   }
 }
+// Add this function after handleHoldingPaymentLink function (around line 1050)
+async function handleMissingHoldingSearch(
+  phone: string,
+  dakhilaUrl: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+
+  EnhancedLogger.info(
+    `Processing Missing Holding search for ${formattedPhone}`,
+    {
+      urlPreview: dakhilaUrl.substring(0, 100),
+    },
+  );
+
+  try {
+    // Validate URL first
+    const validation = validateDakhilaUrl(dakhilaUrl);
+    if (!validation.isValid) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অবৈধ Dakhila URL*\n\nকারণ: ${validation.error}\n\nদয়া করে সঠিক Dakhila URL দিন।\n\nউদাহরণ:\nhttps://portal.ldtax.gov.bd/citizen/holding/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...`,
+      );
+      return;
+    }
+
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_missing_holding",
+    );
+    if (!service) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ Missing Holding service not available!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    // Send processing message
+    await sendTextMessage(
+      formattedPhone,
+      `⏳ *হোল্ডিং খুঁজে বের করা হচ্ছে...*\n\nURL: ${dakhilaUrl.substring(0, 80)}${dakhilaUrl.length > 80 ? "..." : ""}\n\nদয়া করে অপেক্ষা করুন...`,
+    );
+
+    // Call Find Missing Holding API
+    const result = await findMissingHolding(dakhilaUrl);
+
+    // Deduct balance
+    const oldBalance = user.balance;
+    user.balance -= service.price;
+    await user.save();
+
+    // Create transaction record
+    const transaction = await Transaction.create({
+      trxId: `MISSING-HOLDING-${Date.now()}`,
+      amount: service.price,
+      method: "balance",
+      status: "SUCCESS",
+      number: formattedPhone,
+      user: user._id,
+      metadata: {
+        serviceId: "instant_missing_holding",
+        serviceName: service.name,
+        dakhilaUrl: dakhilaUrl,
+        resultStatus: result.status,
+        resultMessage: result.message,
+        pdfUrls: result.pdfUrls,
+        processedAt: new Date().toISOString(),
+      },
+      createdAt: new Date(),
+    });
+
+    let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
+    resultMessage += `🔗 Dakhila URL: ${dakhilaUrl.substring(0, 60)}${dakhilaUrl.length > 60 ? "..." : ""}\n`;
+    resultMessage += `💰 সার্ভিস মূল্য: ৳${service.price}\n`;
+    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
+    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
+    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
+
+    if (
+      result.status === "success" &&
+      result.pdfUrls &&
+      result.pdfUrls.length > 0
+    ) {
+      resultMessage += `✅ *হোল্ডিং পাওয়া গেছে!*\n\n`;
+      resultMessage += `📄 *ডাউনলোড লিঙ্কসমূহ:*\n\n`;
+
+      result.pdfUrls.forEach((pdfUrl: string, index: number) => {
+        resultMessage += `${index + 1}. ${pdfUrl}\n`;
+      });
+
+      resultMessage += `\n📝 *নির্দেশনা:*\n`;
+      resultMessage += `• উপরের লিঙ্কগুলোতে ক্লিক করে PDF ডাউনলোড করুন\n`;
+      resultMessage += `• প্রতিটি লিঙ্ক একটি আলাদা ডকুমেন্ট\n`;
+      resultMessage += `• ডকুমেন্টগুলি সংরক্ষণ করুন\n`;
+      resultMessage += `• প্রয়োজন অনুযায়ী ব্যবহার করুন\n\n`;
+
+      if (result.pdfUrls.length === 1) {
+        resultMessage += `📊 *মোট ১টি ডকুমেন্ট পাওয়া গেছে*\n`;
+      } else {
+        resultMessage += `📊 *মোট ${result.pdfUrls.length}টি ডকুমেন্ট পাওয়া গেছে*\n`;
+      }
+    } else if (result.status === "error") {
+      resultMessage += `❌ *হোল্ডিং খুঁজে পাওয়া যায়নি*\n\n`;
+      resultMessage += `কারণ: ${result.message || "অজানা সমস্যা"}\n\n`;
+      resultMessage += `দয়া করে সঠিক Dakhila URL দিন অথবা পরে চেষ্টা করুন।\n`;
+    } else {
+      resultMessage += `❓ *হোল্ডিং খুঁজে বের করা সম্ভব হয়নি*\n\n`;
+      resultMessage += `দয়া পরে চেষ্টা করুন অথবা সাপোর্টে যোগাযোগ করুন।\n`;
+    }
+
+    resultMessage += `\n📞 সাহায্যের জন্য: ${CONFIG.supportNumber}\n`;
+    resultMessage += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+    await sendTextMessage(formattedPhone, resultMessage);
+
+    // Notify admin
+    let adminMessage = `✅ Missing Holding Search সম্পন্ন\n\n`;
+    adminMessage += `ব্যবহারকারী: ${formattedPhone}\n`;
+    adminMessage += `সার্ভিস: ${service.name}\n`;
+    adminMessage += `মূল্য: ৳${service.price}\n`;
+    adminMessage += `URL: ${dakhilaUrl.substring(0, 100)}${dakhilaUrl.length > 100 ? "..." : ""}\n`;
+    adminMessage += `স্ট্যাটাস: ${result.status === "success" ? "✅ SUCCESS" : "❌ FAILED"}\n`;
+
+    if (result.pdfUrls && result.pdfUrls.length > 0) {
+      adminMessage += `ডকুমেন্ট পাওয়া গেছে: ${result.pdfUrls.length}\n`;
+      result.pdfUrls.forEach((url: string, index: number) => {
+        adminMessage += `${index + 1}. ${url}\n`;
+      });
+    }
+
+    adminMessage += `ব্যালেন্স: ${oldBalance} → ${user.balance}`;
+
+    await notifyAdmin(adminMessage);
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+
+    EnhancedLogger.logFlowCompletion(formattedPhone, "missing_holding", {
+      url: dakhilaUrl,
+      price: service.price,
+      result: result.status,
+      pdfUrls: result.pdfUrls,
+      transactionId: transaction._id,
+      oldBalance,
+      newBalance: user.balance,
+    });
+  } catch (err: any) {
+    EnhancedLogger.error(`Failed to find missing holding:`, {
+      error: err?.message || err,
+      stack: err?.stack,
+      phone: formattedPhone,
+    });
+
+    await sendTextMessage(
+      formattedPhone,
+      "❌ হোল্ডিং খুঁজে বের করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+  }
+}
+// Add this function after handleHoldingPaymentLinkStart function (around line 1150)
+async function handleMissingHoldingStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Starting Missing Holding search for ${formattedPhone}`);
+
+  try {
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_missing_holding",
+    );
+    if (!service) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ Missing Holding service not available!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "awaiting_missing_holding_url",
+      flowType: "missing_holding",
+      data: {
+        missingHoldingData: {
+          serviceId: "instant_missing_holding",
+          price: service.price,
+          serviceName: service.name,
+          attempts: 0,
+        },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
+    });
+
+    const message = `🔍 *হোল্ডিং খুঁজে বের করুন*\n\n💰 মূল্য: ৳${service.price}\n\n${service.inputPrompt}\n\nউদাহরণ: ${service.inputExample}\n\n📌 নোট:\n• Dakhila URLটি সঠিকভাবে লিখুন\n• সার্চ করতে ১-২ মিনিট সময় লাগতে পারে\n• শুধুমাত্র ldtax.gov.bd এর URL সমর্থিত\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
+
+    await sendTextWithCancelButton(formattedPhone, message);
+    EnhancedLogger.info(`Missing Holding search started for ${formattedPhone}`);
+  } catch (err) {
+    EnhancedLogger.error(`Failed to start Missing Holding for ${phone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ হোল্ডিং সার্চ সার্ভিস শুরু করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
 async function handleInstantServiceSelection(
   phone: string,
   serviceId: string,
@@ -2096,9 +2489,14 @@ async function handleInstantServiceSelection(
       return;
     }
 
-    // ADD THIS NEW CONDITION
     if (serviceId === "instant_holding_payment_link") {
       await handleHoldingPaymentLinkStart(phone);
+      return;
+    }
+
+    // ADD THIS NEW CONDITION FOR MISSING HOLDING
+    if (serviceId === "instant_missing_holding") {
+      await handleMissingHoldingStart(phone);
       return;
     }
 
@@ -2192,6 +2590,7 @@ function validateDakhilaUrl(url: string): { isValid: boolean; error?: string } {
     };
   }
 }
+
 async function handleInstantServiceInput(
   phone: string,
   input: string,
@@ -2218,9 +2617,13 @@ async function handleInstantServiceInput(
     if (serviceOrderData.serviceId === "instant_dakhila_approval") {
       await handleDakhilaApprovalCheck(formattedPhone, input.trim());
     }
-    // ADD THIS NEW CONDITION for Payment Link
+    // Handle Payment Link
     else if (serviceOrderData.serviceId === "instant_holding_payment_link") {
       await handleHoldingPaymentLink(formattedPhone, input.trim());
+    }
+    // ADD THIS NEW CONDITION FOR MISSING HOLDING
+    else if (serviceOrderData.serviceId === "instant_missing_holding") {
+      await handleMissingHoldingSearch(formattedPhone, input.trim());
     } else {
       await processInstantService(phone, serviceOrderData.serviceId!, input);
     }
@@ -2258,7 +2661,8 @@ async function processInstantService(
   });
   if (
     serviceId === "instant_dakhila_approval" ||
-    serviceId === "instant_holding_payment_link"
+    serviceId === "instant_holding_payment_link" ||
+    serviceId === "instant_missing_holding"
   ) {
     return;
   }
@@ -8147,7 +8551,14 @@ async function handleUserMessage(
         await handleInstantServiceInput(formattedPhone, userText);
         return;
       }
-
+      // In the handleUserMessage function, add this case (around line 3800)
+      if (currentState === "awaiting_missing_holding_url") {
+        EnhancedLogger.info(
+          `[${requestId}] Processing Missing Holding URL input`,
+        );
+        await handleMissingHoldingSearch(formattedPhone, userText);
+        return;
+      }
       if (currentState === "awaiting_service_data") {
         EnhancedLogger.info(`[${requestId}] Processing service field input`);
         await handleServiceFieldInput(formattedPhone, userText);
