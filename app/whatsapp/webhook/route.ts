@@ -652,7 +652,6 @@ async function handleDakhilaApprovalCheck(
   }
 }
 // Add this function after other API functions (around line 450)
-// Update the checkDakhilaApproval function
 async function checkDakhilaApproval(
   url: string,
 ): Promise<{ status: string; message?: string; data?: any }> {
@@ -1389,10 +1388,42 @@ async function cancelFlow(
   EnhancedLogger.info(`Canceling flow for ${formattedPhone}`);
 
   try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const flowType = state?.flowType;
+
+    // Special handling for different flow types
+    if (flowType === "dakhila_approval") {
+      await sendTextMessage(
+        formattedPhone,
+        "🚫 Dakhila approval check বাতিল করা হয়েছে।",
+      );
+    } else if (flowType === "ubrn_verification") {
+      await sendTextMessage(
+        formattedPhone,
+        "🚫 UBRN verification বাতিল করা হয়েছে।",
+      );
+    } else if (flowType === "recharge") {
+      await sendTextMessage(formattedPhone, "🚫 রিচার্জ বাতিল করা হয়েছে।");
+    } else if (flowType === "service_order") {
+      await sendTextMessage(
+        formattedPhone,
+        "🚫 সার্ভিস অর্ডার বাতিল করা হয়েছে।",
+      );
+    } else if (flowType === "instant_service") {
+      await sendTextMessage(
+        formattedPhone,
+        "🚫 ইন্সট্যান্ট সার্ভিস বাতিল করা হয়েছে।",
+      );
+    } else {
+      await sendTextMessage(formattedPhone, "🚫 অপারেশন বাতিল করা হয়েছে।");
+    }
+
     await stateManager.clearUserState(formattedPhone);
-    await sendTextMessage(formattedPhone, "🚫 অপারেশন বাতিল করা হয়েছে।");
     await showMainMenu(formattedPhone, isAdmin);
-    EnhancedLogger.logFlowCompletion(formattedPhone, "cancel", { isAdmin });
+    EnhancedLogger.logFlowCompletion(formattedPhone, "cancel", {
+      isAdmin,
+      flowType,
+    });
   } catch (err) {
     EnhancedLogger.error(`Failed to cancel flow for ${formattedPhone}:`, err);
     await sendTextMessage(
@@ -1625,7 +1656,7 @@ async function handleDakhilaApprovalStart(phone: string): Promise<void> {
       currentState: "awaiting_dakhila_url",
       flowType: "dakhila_approval",
       data: {
-        serviceOrder: {
+        dakhilaData: {
           serviceId: "instant_dakhila_approval",
           price: service.price,
           serviceName: service.name,
@@ -1766,14 +1797,16 @@ function validateDakhilaUrl(url: string): { isValid: boolean; error?: string } {
       };
     }
 
-    // Check for JWT token in URL (typical Dakhila URL pattern)
+    // Check for JWT token in URL path
     const pathParts = urlObj.pathname.split("/");
     const token = pathParts[pathParts.length - 1];
 
-    if (!token || token.length < 50) {
+    // JWT tokens have 3 parts separated by dots
+    const tokenParts = token.split(".");
+    if (tokenParts.length !== 3) {
       return {
         isValid: false,
-        error: "Invalid Dakhila token in URL",
+        error: "Invalid Dakhila token format. Token should have 3 parts.",
       };
     }
 
@@ -1781,7 +1814,7 @@ function validateDakhilaUrl(url: string): { isValid: boolean; error?: string } {
   } catch (error) {
     return {
       isValid: false,
-      error: "Invalid URL format",
+      error: "Invalid URL format. Make sure the URL starts with https://",
     };
   }
 }
@@ -7718,7 +7751,11 @@ async function handleUserMessage(
         await handleUbrnInput(formattedPhone, userText);
         return;
       }
-
+      if (currentState === "awaiting_dakhila_url") {
+        EnhancedLogger.info(`[${requestId}] Processing Dakhila URL input`);
+        await handleDakhilaApprovalCheck(formattedPhone, userText);
+        return;
+      }
       if (currentState === "awaiting_instant_input") {
         EnhancedLogger.info(`[${requestId}] Processing instant service input`);
         await handleInstantServiceInput(formattedPhone, userText);
