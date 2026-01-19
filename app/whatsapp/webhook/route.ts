@@ -4271,6 +4271,8 @@ async function handleAdminViewOrders(phone: string): Promise<void> {
   }
 }
 
+
+
 // --- Admin Process Order ---
 async function handleAdminProcessOrderStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
@@ -6353,6 +6355,484 @@ async function handleAdminBanUserConfirm(
   }
 }
 
+async function triggerAutoFileDelivery(
+  adminPhone: string,
+  message: WhatsAppMessage
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(adminPhone);
+  
+  EnhancedLogger.info(`Starting auto file delivery for admin: ${formattedPhone}`);
+
+  try {
+    // Send initial message
+    await sendTextMessage(
+      adminPhone,
+      "🤖 *অটো ফাইল ডেলিভারি শুরু হয়েছে*\n\n📁 ফাইল ডাউনলোড করা হচ্ছে...",
+    );
+
+    if (message.type === "image" || message.type === "document") {
+      const mediaId = message.type === "image" ? message.image?.id : message.document?.id;
+      const originalFileName = message.type === "image" 
+        ? `auto_delivery_${Date.now()}.jpg`
+        : message.document?.filename || `auto_delivery_${Date.now()}.pdf`;
+
+      if (!mediaId) {
+        await sendTextMessage(adminPhone, "❌ ফাইল আইডি পাওয়া যায়নি!");
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      // Download file
+      const { buffer, mimeType } = await downloadWhatsAppMedia(mediaId);
+
+      // Check file size
+      if (buffer.length > CONFIG.maxFileSize) {
+        await sendTextMessage(
+          adminPhone,
+          `❌ ফাইল সাইজ খুব বড়! সর্বোচ্চ সাইজ: ${CONFIG.maxFileSize / 1024 / 1024}MB`,
+        );
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      // Extract filename without extension
+      const fileNameWithoutExt = path.parse(originalFileName).name;
+      const cleanFileName = fileNameWithoutExt
+        .toLowerCase()
+        .replace(/[^a-z0-9\u0980-\u09FF]/g, ' ') // Replace special chars with space
+        .trim();
+
+      // Create search terms: BOTH the full filename AND individual words
+      const searchTerms = new Set<string>();
+      
+      // 1. Add the full filename as one search term (john_certificate)
+      searchTerms.add(cleanFileName);
+      
+      // 2. Also add individual words from the filename
+      const individualWords = cleanFileName.split(/\s+/).filter(term => term.length > 1);
+      individualWords.forEach(word => searchTerms.add(word));
+      
+      // Convert to array
+      const keywords = Array.from(searchTerms);
+      
+      // Filter out very short terms (optional)
+      const filteredKeywords = keywords.filter(term => term.length >= 2);
+
+      if (filteredKeywords.length === 0) {
+        await sendTextMessage(
+          adminPhone,
+          "❌ ফাইলনেম থেকে কোনো সার্চ টার্ম তৈরি করা যায়নি। ফাইলনেমে টেক্সট যোগ করুন (যেমন: john_certificate.pdf)।",
+        );
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      EnhancedLogger.info(`Auto delivery - Extracted keywords`, {
+        originalFileName,
+        fileNameWithoutExt,
+        cleanFileName,
+        keywords: filteredKeywords,
+        fileSize: buffer.length,
+        mimeType,
+      });
+
+      // Create directory structure for auto delivery
+      const autoDeliveryBaseDir = path.join(process.cwd(), "uploads", "auto_delivery");
+      const today = new Date();
+      const year = today.getFullYear().toString();
+      const month = (today.getMonth() + 1).toString().padStart(2, '0');
+      const day = today.getDate().toString().padStart(2, '0');
+      
+      // Create directory: uploads/auto_delivery/YYYY/MM/DD/
+      const deliveryDir = path.join(autoDeliveryBaseDir, year, month, day);
+      
+      if (!fs.existsSync(deliveryDir)) {
+        fs.mkdirSync(deliveryDir, { recursive: true });
+        EnhancedLogger.info(`Created delivery directory: ${deliveryDir}`);
+      }
+
+      // Generate unique filename with timestamp
+      const timestamp = Date.now();
+      const randomString = Math.random().toString(36).substring(2, 10);
+      const fileExtension = path.extname(originalFileName) || 
+                           (mimeType.includes('image') ? '.jpg' : 
+                            mimeType.includes('pdf') ? '.pdf' : 
+                            mimeType.includes('word') ? '.docx' : '.bin');
+      
+      const uniqueFileName = `${timestamp}_${randomString}${fileExtension}`;
+      const filePath = path.join(deliveryDir, uniqueFileName);
+      
+      // Save file to server
+      fs.writeFileSync(filePath, buffer);
+      
+      // Verify file was saved
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`Failed to save file to ${filePath}`);
+      }
+      
+      const stats = fs.statSync(filePath);
+      EnhancedLogger.info(`File saved to server`, {
+        filePath,
+        fileSize: stats.size,
+        originalSize: buffer.length,
+      });
+
+      // Create relative path for database storage
+      // This will be stored as: auto_delivery/2024/01/19/1705647200_abc123.jpg
+      const relativePath = path.join("auto_delivery", year, month, day, uniqueFileName).replace(/\\/g, '/');
+      
+
+
+      await sendTextMessage(
+        adminPhone,
+        `✅ *ফাইল প্রসেস সম্পন্ন*\n\n📁 অরিজিনাল ফাইল: ${originalFileName}\n📁 সার্চ টার্ম: "${cleanFileName}"\n📊 সাইজ: ${formatFileSize(buffer.length)}\n📁 সেভ করা হয়েছে: ${relativePath}\n🔍 সার্চ করা হবে: "${filteredKeywords.join('", "')}"\n\n⏳ অর্ডার ম্যাচ খুঁজছি...`,
+      );
+
+      // Connect to database and search for orders
+      await connectDB();
+      
+      // Get all pending orders
+      const orders = await Order.find({
+        status: "pending"
+      })
+      .populate("userId", "name whatsapp")
+      .populate("serviceId", "name")
+      .sort({ createdAt: -1 });
+
+      EnhancedLogger.info(`Auto searching orders with keywords`, {
+        keywords: filteredKeywords,
+        totalOrders: orders.length,
+        adminPhone: formattedPhone,
+      });
+
+      const matchedOrders = [];
+      const deliveredUsers = new Set(); // To avoid duplicate deliveries
+
+      // Search through orders
+      for (const order of orders) {
+        const user = order.userId as any;
+        if (!user || !user.whatsapp || deliveredUsers.has(user._id.toString())) {
+          continue;
+        }
+
+        let isMatch = false;
+        let matchedField = "";
+        let matchedValue = "";
+
+        // Search in service data fields
+        if (order.serviceData && Array.isArray(order.serviceData)) {
+          for (const field of order.serviceData) {
+            if (field.type === "text" && field.data) {
+              const fieldText = field.data.toString().toLowerCase();
+              
+              // Check each keyword (including full filename)
+              for (const keyword of filteredKeywords) {
+                if (fieldText.includes(keyword)) {
+                  isMatch = true;
+                  matchedField = field.label;
+                  matchedValue = typeof field.data === "string" ? field.data : JSON.stringify(field.data);
+                  
+                  EnhancedLogger.debug(`Match found`, {
+                    keyword,
+                    fieldText,
+                    matchedField,
+                    matchedValue,
+                  });
+                  
+                  break;
+                }
+              }
+              if (isMatch) break;
+            }
+          }
+        }
+
+        // Also search in user's name
+        if (!isMatch && user.name) {
+          const userName = user.name.toLowerCase();
+          for (const keyword of filteredKeywords) {
+            if (userName.includes(keyword)) {
+              isMatch = true;
+              matchedField = "ইউজার নাম";
+              matchedValue = user.name;
+              break;
+            }
+          }
+        }
+
+        // Search in service name
+        if (!isMatch && order.serviceName) {
+          const serviceName = order.serviceName.toLowerCase();
+          for (const keyword of filteredKeywords) {
+            if (serviceName.includes(keyword)) {
+              isMatch = true;
+              matchedField = "সার্ভিস নাম";
+              matchedValue = order.serviceName;
+              break;
+            }
+          }
+        }
+
+        // Search in order ID
+        if (!isMatch && order.orderId) {
+          const orderId = order.orderId.toLowerCase();
+          for (const keyword of filteredKeywords) {
+            if (orderId.includes(keyword)) {
+              isMatch = true;
+              matchedField = "অর্ডার আইডি";
+              matchedValue = order.orderId;
+              break;
+            }
+          }
+        }
+
+        if (isMatch) {
+          matchedOrders.push({
+            orderId: order._id,
+            orderNumber: order.orderId,
+            userId: user._id,
+            userName: user.name,
+            userPhone: user.whatsapp,
+            serviceName: order.serviceName,
+            matchedField,
+            matchedValue,
+            orderStatus: order.status,
+            orderDate: order.createdAt,
+          });
+          
+          deliveredUsers.add(user._id.toString());
+          
+          EnhancedLogger.info(`Order matched`, {
+            orderId: order._id,
+            userName: user.name,
+            matchedField,
+            matchedValue,
+          });
+        }
+      }
+
+      // Send progress update
+      await sendTextMessage(
+        adminPhone,
+        `🔍 *${matchedOrders.length}টি ম্যাচিং অর্ডার পাওয়া গেছে*\n\n📊 মোট চেক করা: ${orders.length}\n🎯 ম্যাচিং: ${matchedOrders.length}\n\n⏳ স্বয়ংক্রিয় ডেলিভারি শুরু হচ্ছে...`,
+      );
+
+      // If no matches found
+      if (matchedOrders.length === 0) {
+        const noMatchMessage = `❌ *কোন ম্যাচিং অর্ডার পাওয়া যায়নি*\n\n` +
+          `📁 ফাইল: ${originalFileName}\n` +
+          `🔍 সার্চ টার্ম: "${cleanFileName}"\n` +
+          `📁 সার্ভার পাথ: ${relativePath}\n` +
+          `📊 চেক করা অর্ডার: ${orders.length}\n\n` +
+          `📌 *কিভাবে কাজ করে:*\n` +
+          `ফাইলনেম: "john_certificate.pdf"\n` +
+          `সার্চ হবে: "john_certificate", "john", "certificate"\n\n` +
+          `📝 *পরামর্শ:*\n` +
+          `1. ফাইলনেমে ইউজারের সম্পূর্ণ নাম ব্যবহার করুন\n` +
+          `2. আন্ডারস্কোর (_) ব্যবহার করুন (john_certificate)\n` +
+          `3. স্পেস ব্যবহার করবেন না\n` +
+          `4. বাংলা বা ইংরেজি টেক্সট ব্যবহার করুন\n\n` +
+          `উদাহরণ:\n` +
+          `• john_certificate.pdf → "john_certificate" সার্চ করবে\n` +
+          `• abdul_nid_card.pdf → "abdul_nid_card" সার্চ করবে\n` +
+          `• service_123_document.pdf → "service_123_document" সার্চ করবে\n\n` +
+          `🏠 মেনুতে ফিরতে 'Menu' লিখুন`;
+
+        await sendTextMessage(adminPhone, noMatchMessage);
+        await showMainMenu(adminPhone, true);
+        return;
+      }
+
+      // Deliver to all matched orders
+      let successCount = 0;
+      let failCount = 0;
+      const deliveredDetails = [];
+      const failedDetails = [];
+
+      for (const order of matchedOrders) {
+        try {
+          // Create delivery data according to your schema
+          const deliveryData = {
+            deliveredAt: new Date(),
+            deliveryMethod: 'whatsapp',
+            deliveryType: 'file',
+            text: `ফাইল ডেলিভারি (ম্যাচ করা: ${order.matchedField})`,
+            fileUrl: relativePath, // Server filepath: auto_delivery/2024/01/19/filename.ext
+            fileName: originalFileName,
+            fileType: mimeType,
+            deliveredBy: formattedPhone,
+            searchKeywords: filteredKeywords,
+            matchedField: order.matchedField,
+            matchedValue: order.matchedValue,
+            matchedFilename: cleanFileName,
+          };
+
+          // Update order status and add delivery data
+          await Order.findByIdAndUpdate(order.orderId, {
+            status: "completed",
+            deliveryData: deliveryData,
+            updatedAt: new Date(),
+          });
+
+          EnhancedLogger.info(`Updating order ${order.orderId} as completed`, {
+            deliveryData,
+          });
+
+          // Try to send via WhatsApp template
+          const publicUrl = `${process.env.NEXT_PUBLIC_URL}/${order.orderId}`;
+          try {
+            await sendOrderDeliveryTemplate(
+              order.userPhone,
+              order.serviceName || "সার্ভিস",
+              "Birth Help",
+              order.orderNumber,
+              publicUrl, // Use public URL for WhatsApp delivery
+              originalFileName
+            );
+            EnhancedLogger.info(`WhatsApp template sent to ${order.userPhone}`);
+          } catch (templateError: any) {
+            EnhancedLogger.warn(`WhatsApp template failed, using text fallback`, {
+              error: templateError?.message || templateError,
+              userPhone: order.userPhone,
+            });
+            
+            // Fallback: Send text message with download link
+            await sendTextMessage(
+              order.userPhone,
+              `✅ *আপনার অর্ডার সম্পন্ন হয়েছে!*\n\n` +
+              `📦 সার্ভিস: ${order.serviceName}\n` +
+              `🆔 অর্ডার: ${order.orderNumber}\n` +
+              `📁 ফাইল: ${originalFileName}\n\n` +
+              `ডাউনলোড লিঙ্ক: ${publicUrl}\n\n` +
+              `🏠 মেনুতে ফিরতে 'Menu' লিখুন`
+            );
+          }
+
+          // Send additional confirmation message
+          await sendTextMessage(
+            order.userPhone,
+            `📁 *ফাইল ডেলিভারি নোটিশ*\n\n` +
+            `আপনার "${order.serviceName}" সার্ভিসের ফাইল ডেলিভারি করা হয়েছে।\n` +
+            `ম্যাচ করা: ${order.matchedField} (${order.matchedValue})\n` +
+            `ফাইলনেম: ${originalFileName}\n\n` +
+            `📞 আরও সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন।`
+          );
+
+          successCount++;
+          deliveredDetails.push({
+            userName: order.userName,
+            userPhone: order.userPhone,
+            orderNumber: order.orderNumber,
+            serviceName: order.serviceName,
+            matchedField: order.matchedField,
+            matchedValue: order.matchedValue,
+            filePath: relativePath,
+          });
+
+          EnhancedLogger.info(`Successfully delivered to ${order.userPhone}`, {
+            successCount,
+            userName: order.userName,
+          });
+
+          // Delay to avoid rate limiting
+          await new Promise(resolve => setTimeout(resolve, 1000));
+
+        } catch (err: any) {
+          failCount++;
+          failedDetails.push({
+            userName: order.userName,
+            userPhone: order.userPhone,
+            error: err?.message || "Unknown error",
+          });
+          
+          EnhancedLogger.error(`Failed to deliver to ${order.userPhone}:`, {
+            error: err?.message || err,
+            orderId: order.orderId,
+            stack: err?.stack,
+          });
+        }
+      }
+
+      // Send final summary
+      let summaryMessage = `🎉 *অটো ফাইল ডেলিভারি সম্পন্ন!*\n\n`;
+
+      summaryMessage += `📁 *ফাইল:* ${originalFileName}\n`;
+      summaryMessage += `🔍 *সার্চ টার্ম:* "${cleanFileName}"\n`;
+      summaryMessage += `📁 *সার্ভার পাথ:* ${relativePath}\n\n`;
+
+      summaryMessage += `📊 *ডেলিভারি রিপোর্ট:*\n`;
+      summaryMessage += `• মোট চেক করা: ${orders.length}\n`;
+      summaryMessage += `• মোট ম্যাচিং: ${matchedOrders.length}\n`;
+      summaryMessage += `• ✅ সফল ডেলিভারি: ${successCount}\n`;
+      summaryMessage += `• ❌ ব্যর্থ ডেলিভারি: ${failCount}\n\n`;
+
+      if (deliveredDetails.length > 0) {
+        summaryMessage += `✅ *ডেলিভারি করা ইউজার:*\n`;
+        
+        deliveredDetails.slice(0, 3).forEach((user, index) => {
+          summaryMessage += `${index + 1}. ${user.userName}\n`;
+          summaryMessage += `   📱: ${user.userPhone}\n`;
+          summaryMessage += `   🛒: ${user.serviceName}\n`;
+          summaryMessage += `   🆔: ${user.orderNumber}\n`;
+          summaryMessage += `   🔍: ${user.matchedField} (${user.matchedValue})\n`;
+          summaryMessage += `   📁: ${user.filePath}\n\n`;
+        });
+
+        if (deliveredDetails.length > 3) {
+          summaryMessage += `... এবং আরও ${deliveredDetails.length - 3}জন\n\n`;
+        }
+      }
+
+      if (failedDetails.length > 0) {
+        summaryMessage += `❌ *ব্যর্থ ইউজার:* ${failedDetails.length}জন\n\n`;
+      }
+
+      summaryMessage += `🤖 *স্বয়ংক্রিয় প্রক্রিয়া সম্পন্ন*\n\n`;
+      summaryMessage += `🏠 মেনুতে ফিরতে 'Menu' লিখুন`;
+
+      await sendTextMessage(adminPhone, summaryMessage);
+
+      // Send admin notification
+      await notifyAdmin(
+        `🤖 অটো ফাইল ডেলিভারি সম্পন্ন\n\n` +
+        `📁 ফাইল: ${originalFileName}\n` +
+        `🔍 সার্চ টার্ম: "${cleanFileName}"\n` +
+        `📁 পাথ: ${relativePath}\n` +
+        `📊 মোট অর্ডার: ${orders.length}\n` +
+        `🎯 ম্যাচিং: ${matchedOrders.length}\n` +
+        `✅ সফল: ${successCount}\n` +
+        `❌ ব্যর্থ: ${failCount}\n` +
+        `👤 অ্যাডমিন: ${formattedPhone}\n` +
+        `⏰ সময়: ${new Date().toLocaleString()}`
+      );
+
+      await showMainMenu(adminPhone, true);
+
+    } else {
+      await sendTextMessage(
+        adminPhone,
+        "❌ শুধুমাত্র ইমেজ বা ডকুমেন্ট ফাইল সমর্থিত।",
+      );
+      await showMainMenu(adminPhone, true);
+    }
+  } catch (err: any) {
+    EnhancedLogger.error(`Auto file delivery failed:`, {
+      error: err?.message || err,
+      stack: err?.stack,
+      adminPhone: formattedPhone,
+    });
+    
+    await sendTextMessage(
+      adminPhone,
+      "❌ অটো ডেলিভারিতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+    );
+    await showMainMenu(adminPhone, true);
+  }
+}
+
+
+
+
 // --- Main Message Handler ---
 async function handleUserMessage(
   phone: string,
@@ -6362,7 +6842,7 @@ async function handleUserMessage(
 ): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   const requestId =
-    Date.now().toString(36) + Math.random().toString(36).substr(2);
+    Date.now().toString(36) + Math.random().toString(36).substring(2);
 
   EnhancedLogger.logRequest(formattedPhone, message, requestId);
 
@@ -6420,6 +6900,92 @@ async function handleUserMessage(
       flowType,
     });
 
+    // ========================================
+    // AUTO FILE DELIVERY FOR ADMIN (MAIN MENU ONLY)
+    // ========================================
+    if (isAdmin && (message.type === "image" || message.type === "document")) {
+      // Define which states should BLOCK auto delivery (admin is in a flow)
+      const activeFlowStates = [
+        // User flows
+        "awaiting_trx_id",
+        "awaiting_ubrn_number",
+        "awaiting_instant_input",
+        "awaiting_service_data",
+        "awaiting_service_data_edit",
+        "awaiting_service_confirmation",
+        
+        // Admin flows
+        "admin_add_service_name",
+        "admin_add_service_description",
+        "admin_add_service_price",
+        "admin_add_service_instructions",
+        "admin_edit_service_select",
+        "admin_edit_service_option",
+        "admin_edit_service_input",
+        "admin_delete_service_select",
+        "admin_delete_service_confirm",
+        "admin_toggle_service_select",
+        "admin_process_order_select",
+        "admin_process_order_status",
+        "admin_process_order_delivery_type",
+        "admin_process_order_text_input",
+        "admin_process_order_reason_input",
+        "admin_process_order_file_upload",
+        "admin_broadcast_message",
+        "admin_broadcast_type",
+        "admin_add_balance_phone",
+        "admin_add_balance_amount",
+        "admin_add_balance_reason",
+        "admin_ban_user_phone",
+        "admin_ban_user_confirm",
+        "admin_search_user_input",
+        
+        // Any upload state
+        "uploading",
+        "awaiting_upload",
+        "file_upload",
+        
+        // Any processing state
+        "processing",
+        "awaiting_processing",
+      ];
+
+      // Auto delivery ONLY triggers when admin is at main menu (no active state)
+      const isAtMainMenu = !currentState || 
+                           currentState === "idle" || 
+                           currentState === "main_menu" ||
+                           (!activeFlowStates.includes(currentState) && 
+                            !currentState.includes("awaiting_") && 
+                            !currentState.includes("admin_") && 
+                            !currentState.includes("upload") && 
+                            !currentState.includes("process"));
+
+      if (isAtMainMenu) {
+        EnhancedLogger.info(`[${requestId}] Admin at main menu uploaded file, starting auto delivery`, {
+          currentState,
+          flowType,
+          messageType: message.type,
+        });
+        
+        // Clear any existing state
+        await stateManager.clearUserState(formattedPhone);
+        
+        // Start auto file delivery
+        await triggerAutoFileDelivery(formattedPhone, message);
+        return;
+      } else {
+        EnhancedLogger.info(`[${requestId}] Admin uploaded file but is in active flow, NOT triggering auto delivery`, {
+          currentState,
+          flowType,
+          messageType: message.type,
+        });
+        // Continue with regular flow handling below
+      }
+    }
+
+    // ========================================
+    // REGULAR MESSAGE HANDLING (FOR ALL USERS)
+    // ========================================
     if (message.type === "text") {
       const userText = message.text?.body.trim().toLowerCase() || "";
       EnhancedLogger.info(
@@ -7139,7 +7705,7 @@ async function handleUserMessage(
                 EnhancedLogger.info(`[${requestId}] User cancelled flow`);
                 await cancelFlow(formattedPhone, isAdmin);
               }
-              // Handle field editing options - ADDED HERE
+              // Handle field editing options
               else if (
                 selectedId.startsWith("edit_field_") ||
                 selectedId === "edit_all_fields"
@@ -7271,7 +7837,7 @@ async function handleUserMessage(
             EnhancedLogger.info(`[${requestId}] User cancelled flow`);
             await cancelFlow(formattedPhone, isAdmin);
           }
-          // Handle field editing options - ALSO ADDED HERE FOR NON-ADMIN/USER CONTEXTS
+          // Handle field editing options
           else if (
             selectedId.startsWith("edit_field_") ||
             selectedId === "edit_all_fields"
@@ -7456,15 +8022,12 @@ async function handleUserMessage(
         );
         await handleAdminFileUpload(formattedPhone, message);
       } else {
-        EnhancedLogger.warn(`[${requestId}] File received in wrong state`, {
+        // If admin uploaded file but not in auto delivery state, it's part of regular flow
+        EnhancedLogger.info(`[${requestId}] File received in regular flow state`, {
           currentState,
           flowType,
         });
-        await sendTextMessage(
-          formattedPhone,
-          "❌ এই ধরনের মেসেজ এখন গ্রহণযোগ্য নয়।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
-        );
-        await showMainMenu(formattedPhone, isAdmin);
+        // Continue with regular flow handling
       }
     } else if (message.type === "audio" || message.type === "video") {
       EnhancedLogger.warn(`[${requestId}] Unsupported media type`, {

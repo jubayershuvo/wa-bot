@@ -108,7 +108,7 @@ const deliveryDataSchema = new Schema<DeliveryData>({
     enum: ['text', 'file', 'both'] 
   },
   text: String,
-  fileUrl: String,
+  fileUrl: String, // full filepath
   fileName: String,
   fileType: String,
   deliveredBy: String
