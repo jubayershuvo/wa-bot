@@ -8138,6 +8138,11 @@ async function handleUserMessage(
         await handleDakhilaApprovalCheck(formattedPhone, userText);
         return;
       }
+      if (currentState === "awaiting_payment_link_url") {
+        EnhancedLogger.info(`[${requestId}] Processing Payment Link URL input`);
+        await handleHoldingPaymentLink(formattedPhone, userText);
+        return;
+      }
       if (currentState === "awaiting_instant_input") {
         EnhancedLogger.info(`[${requestId}] Processing instant service input`);
         await handleInstantServiceInput(formattedPhone, userText);
