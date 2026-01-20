@@ -4029,7 +4029,7 @@ async function getApplicationPdf(
   try {
     EnhancedLogger.info(`Fetching Application PDF`, { appId, dob, appType });
 
-    const apiUrl = `https://api.sheva247.site/test/4.php?appId=${appId}&dob=${dob}&appType=${appType}`;
+    const apiUrl = `${process.env.NEXT_PUBLIC_URL}/api/make-application-pdf?appId=${appId}&dob=${dob}&appType=${appType}`;
 
     EnhancedLogger.debug(`Calling Application PDF API`, { apiUrl });
 
@@ -4443,7 +4443,7 @@ async function handleApplicationPdfDownload(
       return;
     }
 
-    const validTypes = APPLICATION_TYPES.map((t) => t.value);
+    const validTypes = APPLICATION_TYPES.map((t) => t.id);
     if (!validTypes.includes(appType)) {
       await sendTextMessage(
         formattedPhone,
@@ -10269,6 +10269,7 @@ async function handleUserMessage(
         }
         // Edit options for application
         else if (selectedId === "edit_app_id") {
+          const state = await stateManager.getUserState(formattedPhone);
           await stateManager.updateStateData(formattedPhone, {
             currentState: "awaiting_application_id",
             applicationData: {
@@ -10281,6 +10282,7 @@ async function handleUserMessage(
             "✏️ *Application ID এডিট করুন*\n\nনতুন Application ID দিন:\n\n📌 উদাহরণ: 254855436",
           );
         } else if (selectedId === "edit_dob") {
+          const state = await stateManager.getUserState(formattedPhone);
           await stateManager.updateStateData(formattedPhone, {
             currentState: "awaiting_application_dob",
             applicationData: {
@@ -10293,6 +10295,7 @@ async function handleUserMessage(
             "✏️ *DOB এডিট করুন*\n\nনতুন জন্ম তারিখ দিন (MM/DD/YYYY):\n\n📌 উদাহরণ: 03/02/1989",
           );
         } else if (selectedId === "edit_type") {
+          const state = await stateManager.getUserState(formattedPhone);
           const appData = state?.data?.applicationData;
           if (appData?.appId && appData?.dob) {
             await sendApplicationTypeMenu(phone, appData.appId, appData.dob);
