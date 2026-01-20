@@ -3873,7 +3873,7 @@ async function handleApplicationIdInput(
 
     await sendTextWithCancelButton(
       formattedPhone,
-      `✅ *Application ID সংরক্ষণ করা হয়েছে:* ${appId.trim()}\n\n📄 *ধাপ ২: জন্ম তারিখ (DOB)*\n\nদয়া করে জন্ম তারিখ দিন (MM/DD/YYYY ফরম্যাটে):\n\n📌 উদাহরণ: 03/02/1989\n\n🚫 বাতিল করতে 'cancel' লিখুন`,
+      `✅ *Application ID সংরক্ষণ করা হয়েছে:* ${appId.trim()}\n\n📄 *ধাপ ২: জন্ম তারিখ (DOB)*\n\nদয়া করে জন্ম তারিখ দিন (DD/MM/YYYY ফরম্যাটে):\n\n📌 উদাহরণ: 03/02/1989\n\n🚫 বাতিল করতে 'cancel' লিখুন`,
     );
   } catch (err) {
     EnhancedLogger.error(`Failed to process Application ID for ${phone}:`, err);
@@ -4315,17 +4315,15 @@ async function processApplicationPdfDownload(phone: string): Promise<void> {
     resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
 
     if (result.status === "success" && result.fileData) {
-
       resultMessage += `✅ *PDF ডাউনলোড সফল!*\n\n`;
       resultMessage += `📊 সাইজ: ${formatFileSize(result.fileData.length)}\n\n`;
       resultMessage += `⏳ ফাইল পাঠানো হচ্ছে...`;
 
       await sendTextMessage(formattedPhone, resultMessage);
-      const fileDataBase64 = `data:application/pdf;base64,${result.fileData.toString("base64")}`;
       try {
         await sendDeliveryFile(
           formattedPhone,
-          fileDataBase64,
+          `${process.env.NEXT_PUBLIC_URL}/api/make-application-pdf?appId=${applicationData.appId}&dob=${applicationData.dob}&appType=${applicationData.appType}`,
           `${applicationData.appId}.pdf`,
           "application/pdf",
           `Application PDF\nID: ${applicationData.appId}\nType: ${applicationData.appType}`,
