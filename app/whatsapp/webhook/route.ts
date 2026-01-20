@@ -2625,7 +2625,7 @@ async function handleInstantServiceInput(
 
     // Check if it's Dakhila approval
     if (serviceOrderData.serviceId === "instant_application_pdf_download") {
-      await handleApplicationPdfDownload(formattedPhone, input.trim());
+      await handleApplicationPdfStart(phone);
     } else if (serviceOrderData.serviceId === "instant_dakhila_approval") {
       await handleDakhilaApprovalCheck(formattedPhone, input.trim());
     }
