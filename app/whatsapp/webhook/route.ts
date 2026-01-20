@@ -2520,9 +2520,6 @@ async function handleInstantServiceSelection(
         formattedPhone,
         `⚡ *${service.name}*\n\n💰 মূল্য: ৳${service.price}\n\n${service.inputPrompt}\n\nউদাহরণ: ${service.inputExample}\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`,
       );
-    } else {
-      // Process service without input
-      await processInstantService(phone, serviceId, "");
     }
   } catch (err) {
     EnhancedLogger.error(
@@ -2624,8 +2621,6 @@ async function handleInstantServiceInput(
     // ADD THIS NEW CONDITION FOR MISSING HOLDING
     else if (serviceOrderData.serviceId === "instant_missing_holding") {
       await handleMissingHoldingSearch(formattedPhone, input.trim());
-    } else {
-      await processInstantService(phone, serviceOrderData.serviceId!, input);
     }
   } catch (err) {
     EnhancedLogger.error(
@@ -2640,141 +2635,7 @@ async function handleInstantServiceInput(
   }
 }
 
-async function processInstantService(
-  phone: string,
-  serviceId: string,
-  input: string,
-): Promise<void> {
-  const formattedPhone = formatPhoneNumber(phone);
-  const service = INSTANT_SERVICES.find((s) => s.id === serviceId);
 
-  if (!service) {
-    await sendTextMessage(formattedPhone, "❌ সার্ভিস পাওয়া যায়নি!");
-    await showMainMenu(formattedPhone, false);
-    return;
-  }
-
-  EnhancedLogger.info(`Processing instant service for ${formattedPhone}`, {
-    serviceId,
-    serviceName: service.name,
-    input,
-  });
-  if (
-    serviceId === "instant_dakhila_approval" ||
-    serviceId === "instant_holding_payment_link" ||
-    serviceId === "instant_missing_holding"
-  ) {
-    return;
-  }
-
-  try {
-    await connectDB();
-    const user = await User.findOne({ whatsapp: formattedPhone });
-
-    if (!user) {
-      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
-      await showMainMenu(formattedPhone, false);
-      return;
-    }
-
-    if (user.balance < service.price) {
-      await sendTextMessage(
-        formattedPhone,
-        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}`,
-      );
-      await stateManager.clearUserState(formattedPhone);
-      await showMainMenu(formattedPhone, false);
-      return;
-    }
-
-    // Deduct balance
-    user.balance -= service.price;
-    await user.save();
-
-    // Create transaction record
-    const transaction = await Transaction.create({
-      trxId: `INST-${Date.now()}`,
-      amount: service.price,
-      method: "balance",
-      status: "SUCCESS",
-      number: formattedPhone,
-      user: user._id,
-      metadata: {
-        serviceId: serviceId,
-        serviceName: service.name,
-        input: input || null,
-        processedAt: new Date().toISOString(),
-      },
-      createdAt: new Date(),
-    });
-
-    let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
-    resultMessage += `💰 খরচ: ৳${service.price}\n`;
-    resultMessage += `🆕 ব্যালেন্স: ৳${user.balance}\n`;
-    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
-
-    // Add input data if provided
-    if (input) {
-      resultMessage += `📋 প্রদত্ত তথ্য: ${input}\n\n`;
-    }
-
-    // Simulate processing for different services
-    if (serviceId === "instant_ubrn_verification") {
-      // UBRN verification handled separately
-      return;
-    } else if (serviceId === "instant_company_info") {
-      resultMessage += `📊 *কোম্পানি তথ্য:*\n`;
-      resultMessage += `• কোম্পানি নাম: টেস্ট কোম্পানি লিমিটেড\n`;
-      resultMessage += `• রেজিস্ট্রেশন নম্বর: ${input}\n`;
-      resultMessage += `• স্থিতি: সক্রিয়\n`;
-      resultMessage += `• প্রতিষ্ঠার তারিখ: ২০২০-০১-১৫\n`;
-      resultMessage += `• ঠিকানা: ঢাকা, বাংলাদেশ\n\n`;
-      resultMessage += `✅ তথ্য যাচাই সম্পন্ন হয়েছে।`;
-    } else if (serviceId === "instant_nid_verify") {
-      resultMessage += `📊 *এনআইডি ভেরিফিকেশন রেজাল্ট:*\n`;
-      resultMessage += `• এনআইডি নম্বর: ${input}\n`;
-      resultMessage += `• নাম: জন ডো\n`;
-      resultMessage += `• পিতা/স্বামীর নাম: রিচার্ড ডো\n`;
-      resultMessage += `• জন্ম তারিখ: ১৯৯০-০৫-১৫\n`;
-      resultMessage += `• স্থিতি: বৈধ\n\n`;
-      resultMessage += `✅ এনআইডি যাচাই সম্পন্ন হয়েছে।`;
-    } else {
-      resultMessage += `✅ আপনার রিকোয়েস্ট প্রসেস করা হয়েছে।\n`;
-    }
-
-    resultMessage += `\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-    await sendTextMessage(formattedPhone, resultMessage);
-
-    // Notify admin
-    await notifyAdmin(
-      `⚡ ইন্সট্যান্ট সার্ভিস সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nসার্ভিস: ${service.name}\nমূল্য: ৳${service.price}\nইনপুট: ${input || "N/A"}`,
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, false);
-
-    EnhancedLogger.logFlowCompletion(formattedPhone, "instant_service", {
-      serviceId,
-      serviceName: service.name,
-      price: service.price,
-      input,
-      transactionId: transaction._id,
-      newBalance: user.balance,
-    });
-  } catch (err) {
-    EnhancedLogger.error(
-      `Failed to process instant service for ${formattedPhone}:`,
-      err,
-    );
-    await sendTextMessage(
-      formattedPhone,
-      "❌ ইন্সট্যান্ট সার্ভিস প্রসেস করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
-    );
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, false);
-  }
-}
 
 async function handleUbrnVerificationStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
