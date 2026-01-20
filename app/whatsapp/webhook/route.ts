@@ -4345,7 +4345,7 @@ async function processApplicationPdfDownload(phone: string): Promise<void> {
       try {
         await sendDeliveryFile(
           formattedPhone,
-          fullUrl,
+          `${process.env.NEXT_PUBLIC_URL}/api/make-application-pdf?appId=${applicationData.appId}&dob=${applicationData.dob}&appType=${applicationData.appType}`,
           fileName,
           "application/pdf",
           `Application PDF\nID: ${applicationData.appId}\nType: ${applicationData.appType}`,
