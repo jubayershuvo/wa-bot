@@ -3753,7 +3753,6 @@ const APPLICATION_TYPES = [
   },
 ];
 
-// Start Application PDF Download
 async function handleApplicationPdfStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   EnhancedLogger.info(
@@ -3880,6 +3879,7 @@ async function handleApplicationIdInput(
   }
 }
 // Step 2: Handle DOB input
+// 3. Handle DOB input
 async function handleApplicationDobInput(
   phone: string,
   dob: string,
@@ -3927,11 +3927,18 @@ async function handleApplicationDobInput(
   }
 }
 // Step 3: Show Application Type menu
+
 async function sendApplicationTypeMenu(
   phone: string,
   appId: string,
   dob: string,
 ): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Showing Application Type menu for ${formattedPhone}`, {
+    appId,
+    dob,
+  });
+
   const typeRows = APPLICATION_TYPES.map((type) => ({
     id: `app_type_${type.id}`,
     title: type.title,
@@ -3949,6 +3956,7 @@ async function sendApplicationTypeMenu(
 }
 
 // Step 4: Handle Application Type selection
+// 5. Handle Application Type selection
 async function handleApplicationTypeSelection(
   phone: string,
   appType: string,
@@ -4158,6 +4166,7 @@ async function getApplicationPdf(
 }
 
 // Handle edit option
+// 7. Handle edit option
 async function handleApplicationEdit(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   EnhancedLogger.info(
@@ -4208,8 +4217,12 @@ async function handleApplicationEdit(phone: string): Promise<void> {
 }
 
 // Final step: Process Application PDF download
+// 6. Final step: Process Application PDF download
 async function processApplicationPdfDownload(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(
+    `Processing Application PDF download for ${formattedPhone}`,
+  );
 
   try {
     const state = await stateManager.getUserState(formattedPhone);
@@ -4373,226 +4386,6 @@ async function processApplicationPdfDownload(phone: string): Promise<void> {
         appId: applicationData.appId,
         dob: applicationData.dob,
         appType: applicationData.appType,
-        price: service.price,
-        result: result.status,
-        transactionId: transaction._id,
-        oldBalance,
-        newBalance: user.balance,
-      },
-    );
-  } catch (err: any) {
-    EnhancedLogger.error(`Failed to process Application PDF download:`, {
-      error: err?.message || err,
-      stack: err?.stack,
-      phone: formattedPhone,
-    });
-
-    await sendTextMessage(
-      formattedPhone,
-      "❌ Application PDF ডাউনলোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, false);
-  }
-}
-// Handle application PDF download
-async function handleApplicationPdfDownload(
-  phone: string,
-  input: string,
-): Promise<void> {
-  const formattedPhone = formatPhoneNumber(phone);
-
-  EnhancedLogger.info(
-    `Processing Application PDF download for ${formattedPhone}`,
-    {
-      input,
-    },
-  );
-
-  try {
-    // Parse input
-    const parts = input.trim().split(/\s+/);
-    if (parts.length < 3) {
-      await sendTextMessage(
-        formattedPhone,
-        "❌ দয়া করে Application ID, DOB এবং Type উভয়ই দিন।\n\nফরম্যাট: ApplicationID DOB Type\nউদাহরণ: 254855436 03/02/1989 br",
-      );
-      return;
-    }
-
-    const appId = parts[0].trim();
-    const dob = parts[1].trim();
-    const appType = parts[2].trim();
-
-    // Validate inputs
-    if (!/^\d+$/.test(appId)) {
-      await sendTextMessage(
-        formattedPhone,
-        "❌ Application ID শুধুমাত্র সংখ্যা হতে হবে!",
-      );
-      return;
-    }
-
-    const dobRegex = /^(0[1-9]|1[0-2])\/(0[1-9]|[12][0-9]|3[01])\/\d{4}$/;
-    if (!dobRegex.test(dob)) {
-      await sendTextMessage(
-        formattedPhone,
-        "❌ DOB ফরম্যাট সঠিক নয়।\nসঠিক ফরম্যাট: MM/DD/YYYY\nউদাহরণ: 03/02/1989",
-      );
-      return;
-    }
-
-    const validTypes = APPLICATION_TYPES.map((t) => t.id);
-    if (!validTypes.includes(appType)) {
-      await sendTextMessage(
-        formattedPhone,
-        `❌ টাইপ সঠিক নয়।\nভ্যালিড টাইপ:\n${validTypes.join(", ")}\n\nউদাহরণ: br, br_correction, dr, ইত্যাদি`,
-      );
-      return;
-    }
-
-    // Get user and service info
-    await connectDB();
-    const user = await User.findOne({ whatsapp: formattedPhone });
-    const service = INSTANT_SERVICES.find(
-      (s) => s.id === "instant_application_pdf_download",
-    );
-
-    if (!user || !service) {
-      await sendTextMessage(
-        formattedPhone,
-        "❌ ইউজার বা সার্ভিস পাওয়া যায়নি!",
-      );
-      await showMainMenu(formattedPhone, false);
-      return;
-    }
-
-    // Send processing message
-    await sendTextMessage(
-      formattedPhone,
-      `⏳ *Application PDF ডাউনলোড হচ্ছে...*\n\nApplication ID: ${appId}\nDOB: ${dob}\nType: ${appType}\n\nদয়া করে অপেক্ষা করুন...`,
-    );
-
-    // Call API to get PDF
-    const result = await getApplicationPdf(appId, dob, appType);
-
-    // Deduct balance
-    const oldBalance = user.balance;
-    user.balance -= service.price;
-    await user.save();
-
-    // Create transaction record
-    const transaction = await Transaction.create({
-      trxId: `APP-PDF-${Date.now()}`,
-      amount: service.price,
-      method: "balance",
-      status: result.status === "success" ? "SUCCESS" : "FAILED",
-      number: formattedPhone,
-      user: user._id,
-      metadata: {
-        serviceId: "instant_application_pdf_download",
-        serviceName: service.name,
-        appId: appId,
-        dob: dob,
-        appType: appType,
-        resultStatus: result.status,
-        resultMessage: result.message,
-        processedAt: new Date().toISOString(),
-      },
-      createdAt: new Date(),
-    });
-
-    let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
-    resultMessage += `🆔 Application ID: ${appId}\n`;
-    resultMessage += `📅 DOB: ${dob}\n`;
-    resultMessage += `📋 Type: ${appType}\n`;
-    resultMessage += `💰 সার্ভিস মূল্য: ৳${service.price}\n`;
-    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
-    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
-    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
-
-    if (result.status === "success" && result.fileData) {
-      // Save PDF to server
-      const uploadsDir = path.join(
-        process.cwd(),
-        "uploads",
-        "application_pdfs",
-      );
-      if (!fs.existsSync(uploadsDir)) {
-        fs.mkdirSync(uploadsDir, { recursive: true });
-      }
-
-      const fileName =
-        result.fileName || `application_${appId}_${Date.now()}.pdf`;
-      const filePath = path.join(uploadsDir, fileName);
-
-      // Save file
-      fs.writeFileSync(filePath, result.fileData);
-
-      // Create public URL
-      const publicUrl = `/uploads/application_pdfs/${fileName}`;
-      const fullUrl = `${process.env.NEXT_PUBLIC_URL || "http://localhost:3000"}${publicUrl}`;
-
-      resultMessage += `✅ *PDF ডাউনলোড সফল!*\n\n`;
-      resultMessage += `📁 ফাইল: ${fileName}\n`;
-      resultMessage += `📊 সাইজ: ${formatFileSize(result.fileData.length)}\n\n`;
-      resultMessage += `⏳ ফাইল পাঠানো হচ্ছে...`;
-
-      await sendTextMessage(formattedPhone, resultMessage);
-
-      // Send PDF file via WhatsApp
-      try {
-        await sendOrderDeliveryTemplate(
-          formattedPhone,
-          service.name,
-          "Birth Help",
-          `APP-${appId}`,
-          fullUrl,
-          fileName,
-          "bn_BD",
-        );
-
-        await sendTextMessage(
-          formattedPhone,
-          `✅ *PDF সফলভাবে পাঠানো হয়েছে!*\n\n📄 আপনার Application PDF এখন উপলব্ধ।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-        );
-      } catch (sendError: any) {
-        EnhancedLogger.error(`Failed to send PDF via WhatsApp:`, {
-          error: sendError?.message || sendError,
-          phone: formattedPhone,
-        });
-
-        // Fallback: Send download link
-        await sendTextMessage(
-          formattedPhone,
-          `✅ *PDF ডাউনলোড সফল!*\n\n📁 ডাউনলোড লিংক:\n${fullUrl}\n\n📄 PDF ডাউনলোড করতে লিংকে ক্লিক করুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-        );
-      }
-    } else {
-      resultMessage += `❌ *PDF ডাউনলোড ব্যর্থ*\n\n`;
-      resultMessage += `কারণ: ${result.message || "অজানা সমস্যা"}\n\n`;
-      resultMessage += `দয়া পরে চেষ্টা করুন অথবা সাপোর্টে যোগাযোগ করুন।\n\n`;
-      resultMessage += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
-
-      await sendTextMessage(formattedPhone, resultMessage);
-    }
-
-    // Notify admin
-    await notifyAdmin(
-      `📄 Application PDF Download সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nসার্ভিস: ${service.name}\nমূল্য: ৳${service.price}\nApplication ID: ${appId}\nDOB: ${dob}\nType: ${appType}\nস্ট্যাটাস: ${result.status === "success" ? "✅ SUCCESS" : "❌ FAILED"}\nব্যালেন্স: ${oldBalance} → ${user.balance}`,
-    );
-
-    await stateManager.clearUserState(formattedPhone);
-    await showMainMenu(formattedPhone, false);
-
-    EnhancedLogger.logFlowCompletion(
-      formattedPhone,
-      "application_pdf_download",
-      {
-        appId,
-        dob,
-        appType,
         price: service.price,
         result: result.status,
         transactionId: transaction._id,
@@ -9106,6 +8899,7 @@ function formatFileSize(bytes: number): string {
 }
 
 // --- Main Message Handler ---
+// --- Main Message Handler ---
 async function handleUserMessage(
   phone: string,
   name: string,
@@ -9362,6 +9156,18 @@ async function handleUserMessage(
           `[${requestId}] Processing Application Type selection (text)`,
         );
         await handleApplicationTypeSelection(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "awaiting_application_confirmation") {
+        EnhancedLogger.info(
+          `[${requestId}] Processing Application confirmation (text)`,
+        );
+        // For text input in confirmation, show button instructions
+        await sendTextMessage(
+          formattedPhone,
+          "ℹ️ দয়া করে উপরের বাটনগুলো ব্যবহার করুন।\n\n✅ কনফার্ম করতে '✅ তথ্য সঠিক' বাটন ক্লিক করুন\n✏️ এডিট করতে '✏️ তথ্য এডিট' বাটন ক্লিক করুন\n🚫 বাতিল করতে '🚫 বাতিল করুন' বাটন ক্লিক করুন",
+        );
         return;
       }
 
@@ -9822,7 +9628,7 @@ async function handleUserMessage(
               );
               await sendTextMessage(
                 formattedPhone,
-                "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন。",
+                "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন।",
               );
               await showMainMenu(formattedPhone, isAdmin);
           }
@@ -10342,7 +10148,7 @@ async function handleUserMessage(
           });
           await sendTextMessage(
             formattedPhone,
-            "ℹ️ দয়া করে লিস্ট মেনু ব্যবহার করুন। 'Menu' লিখুন।",
+            "ℹ️ দয়া করে লিস্ট মেনু ব্যবহার করুন। 'Menu' লিখুন。",
           );
           await showMainMenu(formattedPhone, isAdmin);
         }
