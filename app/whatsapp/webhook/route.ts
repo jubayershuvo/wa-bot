@@ -9138,24 +9138,21 @@ async function handleUserMessage(
       // ========================================
       // APPLICATION PDF DOWNLOAD STATE HANDLERS
       // ========================================
-
-      if (currentState === "awaiting_application_id") {
-        EnhancedLogger.info(`[${requestId}] Processing Application ID input`);
-        await handleApplicationIdInput(formattedPhone, userText);
-        return;
-      }
-
-      if (currentState === "awaiting_application_dob") {
-        EnhancedLogger.info(`[${requestId}] Processing DOB input`);
-        await handleApplicationDobInput(formattedPhone, userText);
-        return;
-      }
-
       if (currentState === "awaiting_application_type") {
         EnhancedLogger.info(
           `[${requestId}] Processing Application Type selection (text)`,
         );
         await handleApplicationTypeSelection(formattedPhone, userText);
+        return;
+      }
+      if (currentState === "awaiting_application_dob") {
+        EnhancedLogger.info(`[${requestId}] Processing DOB input`);
+        await handleApplicationDobInput(formattedPhone, userText);
+        return;
+      }
+      if (currentState === "awaiting_application_id") {
+        EnhancedLogger.info(`[${requestId}] Processing Application ID input`);
+        await handleApplicationIdInput(formattedPhone, userText);
         return;
       }
 
