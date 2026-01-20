@@ -4315,38 +4315,18 @@ async function processApplicationPdfDownload(phone: string): Promise<void> {
     resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
 
     if (result.status === "success" && result.fileData) {
-      const uploadsDir = path.join(
-        process.cwd(),
-        "uploads",
-        "application_pdfs",
-      );
-      if (!fs.existsSync(uploadsDir)) {
-        fs.mkdirSync(uploadsDir, { recursive: true });
-      }
-
-      const fileName =
-        result.fileName ||
-        `application_${applicationData.appId}_${Date.now()}.pdf`;
-      const filePath = path.join(uploadsDir, fileName);
-
-      fs.writeFileSync(filePath, result.fileData);
-
-      const publicUrl = `/uploads/application_pdfs/${fileName}`;
-      const baseUrl = process.env.NEXT_PUBLIC_URL || "http://localhost:3000";
-      const fullUrl = `${baseUrl}${publicUrl}`;
 
       resultMessage += `✅ *PDF ডাউনলোড সফল!*\n\n`;
-      resultMessage += `📁 ফাইল: ${fileName}\n`;
       resultMessage += `📊 সাইজ: ${formatFileSize(result.fileData.length)}\n\n`;
       resultMessage += `⏳ ফাইল পাঠানো হচ্ছে...`;
 
       await sendTextMessage(formattedPhone, resultMessage);
-
+      const fileDataBase64 = `data:application/pdf;base64,${result.fileData.toString("base64")}`;
       try {
         await sendDeliveryFile(
           formattedPhone,
-          `${process.env.NEXT_PUBLIC_URL}/api/make-application-pdf?appId=${applicationData.appId}&dob=${applicationData.dob}&appType=${applicationData.appType}`,
-          fileName,
+          fileDataBase64,
+          `${applicationData.appId}.pdf`,
           "application/pdf",
           `Application PDF\nID: ${applicationData.appId}\nType: ${applicationData.appType}`,
         );
@@ -4360,11 +4340,6 @@ async function processApplicationPdfDownload(phone: string): Promise<void> {
           error: sendError?.message || sendError,
           phone: formattedPhone,
         });
-
-        await sendTextMessage(
-          formattedPhone,
-          `✅ *PDF ডাউনলোড সফল!*\n\n📁 ডাউনলোড লিংক:\n${fullUrl}\n\n📄 PDF ডাউনলোড করতে লিংকে ক্লিক করুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
-        );
       }
     } else {
       resultMessage += `❌ *PDF ডাউনলোড ব্যর্থ*\n\n`;
