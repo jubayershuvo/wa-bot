@@ -3856,13 +3856,19 @@ async function handleApplicationIdInput(
       return;
     }
 
-    await stateManager.updateStateData(formattedPhone, {
-      applicationData: {
-        ...applicationData,
-        step: 2,
-        appId: appId.trim(),
-      },
+    // Update state correctly
+    await stateManager.setUserState(formattedPhone, {
       currentState: "awaiting_application_dob",
+      flowType: "application_pdf_download",
+      data: {
+        applicationData: {
+          ...applicationData,
+          step: 2,
+          appId: appId.trim(),
+        },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
     });
 
     await sendTextWithCancelButton(
@@ -3879,7 +3885,6 @@ async function handleApplicationIdInput(
   }
 }
 // Step 2: Handle DOB input
-// 3. Handle DOB input
 async function handleApplicationDobInput(
   phone: string,
   dob: string,
@@ -3906,13 +3911,19 @@ async function handleApplicationDobInput(
       return;
     }
 
-    await stateManager.updateStateData(formattedPhone, {
-      applicationData: {
-        ...applicationData,
-        step: 3,
-        dob: dob.trim(),
-      },
+    // Update state correctly
+    await stateManager.setUserState(formattedPhone, {
       currentState: "awaiting_application_type",
+      flowType: "application_pdf_download",
+      data: {
+        applicationData: {
+          ...applicationData,
+          step: 3,
+          dob: dob.trim(),
+        },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
     });
 
     await sendApplicationTypeMenu(
@@ -3926,7 +3937,6 @@ async function handleApplicationDobInput(
     await cancelFlow(formattedPhone, false);
   }
 }
-// Step 3: Show Application Type menu
 
 async function sendApplicationTypeMenu(
   phone: string,
@@ -3991,13 +4001,19 @@ async function handleApplicationTypeSelection(
     const typeInfo = APPLICATION_TYPES.find((t) => t.id === appType);
     const typeLabel = typeInfo ? typeInfo.title : appType;
 
-    await stateManager.updateStateData(formattedPhone, {
-      applicationData: {
-        ...applicationData,
-        step: 4,
-        appType: appType,
-      },
+    // Update state correctly
+    await stateManager.setUserState(formattedPhone, {
       currentState: "awaiting_application_confirmation",
+      flowType: "application_pdf_download",
+      data: {
+        applicationData: {
+          ...applicationData,
+          step: 4,
+          appType: appType,
+        },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
     });
 
     await sendQuickReplyMenu(
@@ -9138,21 +9154,52 @@ async function handleUserMessage(
       // ========================================
       // APPLICATION PDF DOWNLOAD STATE HANDLERS
       // ========================================
-      if (currentState === "awaiting_application_type") {
-        EnhancedLogger.info(
-          `[${requestId}] Processing Application Type selection (text)`,
-        );
-        await handleApplicationTypeSelection(formattedPhone, userText);
+
+      if (currentState === "awaiting_application_id") {
+        EnhancedLogger.info(`[${requestId}] Processing Application ID input`);
+        await handleApplicationIdInput(formattedPhone, userText);
         return;
       }
+
       if (currentState === "awaiting_application_dob") {
         EnhancedLogger.info(`[${requestId}] Processing DOB input`);
         await handleApplicationDobInput(formattedPhone, userText);
         return;
       }
-      if (currentState === "awaiting_application_id") {
-        EnhancedLogger.info(`[${requestId}] Processing Application ID input`);
-        await handleApplicationIdInput(formattedPhone, userText);
+
+      if (currentState === "awaiting_application_type") {
+        EnhancedLogger.info(
+          `[${requestId}] Processing Application Type selection (text)`,
+        );
+        // For text input in type selection, we need to handle it differently
+        // First check if it's one of the predefined type IDs
+        const validTypes = APPLICATION_TYPES.map((t) => t.id);
+        if (validTypes.includes(userText.toLowerCase())) {
+          await handleApplicationTypeSelection(
+            formattedPhone,
+            userText.toLowerCase(),
+          );
+        } else {
+          // If it's not a type ID, treat it as text selection
+          // Find type by title or description
+          const matchedType = APPLICATION_TYPES.find(
+            (type) =>
+              type.title.toLowerCase().includes(userText.toLowerCase()) ||
+              type.description.toLowerCase().includes(userText.toLowerCase()),
+          );
+
+          if (matchedType) {
+            await handleApplicationTypeSelection(
+              formattedPhone,
+              matchedType.id,
+            );
+          } else {
+            await sendTextMessage(
+              formattedPhone,
+              "❌ দয়া করে সঠিক Application Type সিলেক্ট করুন।\n\nউদাহরণ: BR, DR, BR_CORRECTION\n\nঅথবা লিস্ট মেনু থেকে সিলেক্ট করুন।",
+            );
+          }
+        }
         return;
       }
 
