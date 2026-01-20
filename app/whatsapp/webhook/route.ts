@@ -202,8 +202,8 @@ const INSTANT_SERVICES = [
     price: 15,
     isActive: true,
     requiresInput: true,
-    inputPrompt: "Application ID এবং DOB (MM/DD/YYYY) পাঠান:",
-    inputExample: "254855436 03/02/1989",
+    inputPrompt: "Application ID, DOB এবং Type আলাদাভাবে ইনপুট নেওয়া হবে",
+    inputExample: "Step-by-step process",
   },
 ];
 
@@ -3709,15 +3709,48 @@ async function handleEditServiceData(phone: string): Promise<void> {
   }
 }
 // Application type options
+// Application type options
 const APPLICATION_TYPES = [
-  { value: "br", label: "জন্ম নিবন্ধনের জন্য আবেদন" },
-  { value: "br_correction", label: "জন্ম তথ্য সংশোধন" },
-  { value: "br_reprint", label: "জন্ম নিবন্ধন প্রতিলিপি" },
-  { value: "br_cancel", label: "জন্ম সনদ বাতিলের আবেদন" },
-  { value: "dr", label: "মৃত্যু নিবন্ধনের জন্য আবেদন" },
-  { value: "dr_correction", label: "মৃত্যু তথ্য সংশোধন" },
-  { value: "dr_reprint", label: "মৃত্যু নিবন্ধন প্রতিলিপি" },
-  { value: "dr_cancel", label: "মৃত্যু সনদ বাতিলের আবেদন" },
+  {
+    id: "br",
+    title: "জন্ম নিবন্ধনের জন্য আবেদন",
+    description: "Birth Registration",
+  },
+  {
+    id: "br_correction",
+    title: "জন্ম তথ্য সংশোধন",
+    description: "Birth Correction",
+  },
+  {
+    id: "br_reprint",
+    title: "জন্ম নিবন্ধন প্রতিলিপি",
+    description: "Birth Reprint",
+  },
+  {
+    id: "br_cancel",
+    title: "জন্ম সনদ বাতিলের আবেদন",
+    description: "Birth Certificate Cancel",
+  },
+  {
+    id: "dr",
+    title: "মৃত্যু নিবন্ধনের জন্য আবেদন",
+    description: "Death Registration",
+  },
+  {
+    id: "dr_correction",
+    title: "মৃত্যু তথ্য সংশোধন",
+    description: "Death Correction",
+  },
+  {
+    id: "dr_reprint",
+    title: "মৃত্যু নিবন্ধন প্রতিলিপি",
+    description: "Death Reprint",
+  },
+  {
+    id: "dr_cancel",
+    title: "মৃত্যু সনদ বাতিলের আবেদন",
+    description: "Death Certificate Cancel",
+  },
 ];
 
 // Start Application PDF Download
@@ -3759,13 +3792,17 @@ async function handleApplicationPdfStart(phone: string): Promise<void> {
     }
 
     await stateManager.setUserState(formattedPhone, {
-      currentState: "awaiting_application_input",
+      currentState: "awaiting_application_id",
       flowType: "application_pdf_download",
       data: {
         applicationData: {
           serviceId: "instant_application_pdf_download",
           price: service.price,
           serviceName: service.name,
+          step: 1,
+          appId: "",
+          dob: "",
+          appType: "",
           attempts: 0,
         },
         lastActivity: Date.now(),
@@ -3773,15 +3810,7 @@ async function handleApplicationPdfStart(phone: string): Promise<void> {
       },
     });
 
-    let message = `📄 *Application PDF Download*\n\n💰 মূল্য: ৳${service.price}\n\n`;
-    message += `${service.inputPrompt}\n\n`;
-    message += `*ফরম্যাট:*\nApplicationID DOB Type\n\n`;
-    message += `*উদাহরণ:*\n254855436 03/02/1989 br\n\n`;
-    message += `*টাইপ অপশন:*\n`;
-    APPLICATION_TYPES.forEach((type, index) => {
-      message += `${index + 1}. ${type.label} (${type.value})\n`;
-    });
-    message += `\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
+    const message = `📄 *Application PDF Download*\n\n💰 মূল্য: ৳${service.price}\n\n✅ *ধাপ ১: Application ID*\n\nদয়া করে আপনার Application ID দিন:\n\n📌 উদাহরণ: 254855436\n\n🚫 বাতিল করতে 'cancel' লিখুন`;
 
     await sendTextWithCancelButton(formattedPhone, message);
     EnhancedLogger.info(
@@ -3800,6 +3829,190 @@ async function handleApplicationPdfStart(phone: string): Promise<void> {
   }
 }
 
+// Step 1: Handle Application ID input
+async function handleApplicationIdInput(
+  phone: string,
+  appId: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Processing Application ID input for ${formattedPhone}`, {
+    appId,
+  });
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const applicationData = state?.data?.applicationData as any;
+
+    if (!applicationData) {
+      await sendTextMessage(formattedPhone, "❌ সেশন শেষ হয়েছে!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (!/^\d+$/.test(appId.trim())) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ Application ID শুধুমাত্র সংখ্যা হতে হবে!\n\nদয়া করে সঠিক Application ID দিন:",
+      );
+      return;
+    }
+
+    await stateManager.updateStateData(formattedPhone, {
+      applicationData: {
+        ...applicationData,
+        step: 2,
+        appId: appId.trim(),
+      },
+      currentState: "awaiting_application_dob",
+    });
+
+    await sendTextWithCancelButton(
+      formattedPhone,
+      `✅ *Application ID সংরক্ষণ করা হয়েছে:* ${appId.trim()}\n\n📄 *ধাপ ২: জন্ম তারিখ (DOB)*\n\nদয়া করে জন্ম তারিখ দিন (MM/DD/YYYY ফরম্যাটে):\n\n📌 উদাহরণ: 03/02/1989\n\n🚫 বাতিল করতে 'cancel' লিখুন`,
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to process Application ID for ${phone}:`, err);
+    await sendTextMessage(
+      formattedPhone,
+      "❌ Application ID প্রসেস করতে সমস্যা হয়েছে!",
+    );
+    await cancelFlow(formattedPhone, false);
+  }
+}
+// Step 2: Handle DOB input
+async function handleApplicationDobInput(
+  phone: string,
+  dob: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(`Processing DOB input for ${formattedPhone}`, { dob });
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const applicationData = state?.data?.applicationData as any;
+
+    if (!applicationData) {
+      await sendTextMessage(formattedPhone, "❌ সেশন শেষ হয়েছে!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const dobRegex = /^(0[1-9]|1[0-2])\/(0[1-9]|[12][0-9]|3[01])\/\d{4}$/;
+    if (!dobRegex.test(dob.trim())) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ DOB ফরম্যাট সঠিক নয়।\nসঠিক ফরম্যাট: MM/DD/YYYY\nউদাহরণ: 03/02/1989\n\nদয়া করে সঠিক DOB দিন:",
+      );
+      return;
+    }
+
+    await stateManager.updateStateData(formattedPhone, {
+      applicationData: {
+        ...applicationData,
+        step: 3,
+        dob: dob.trim(),
+      },
+      currentState: "awaiting_application_type",
+    });
+
+    await sendApplicationTypeMenu(
+      formattedPhone,
+      applicationData.appId,
+      dob.trim(),
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to process DOB for ${phone}:`, err);
+    await sendTextMessage(formattedPhone, "❌ DOB প্রসেস করতে সমস্যা হয়েছে!");
+    await cancelFlow(formattedPhone, false);
+  }
+}
+// Step 3: Show Application Type menu
+async function sendApplicationTypeMenu(
+  phone: string,
+  appId: string,
+  dob: string,
+): Promise<void> {
+  const typeRows = APPLICATION_TYPES.map((type) => ({
+    id: `app_type_${type.id}`,
+    title: type.title,
+    description: type.description,
+  }));
+
+  await sendListMenu(
+    phone,
+    "📄 Application Type",
+    `✅ *Application ID:* ${appId}\n✅ *DOB:* ${dob}\n\n📋 *ধাপ ৩: Application Type*\n\nআপনার Application Type সিলেক্ট করুন:`,
+    typeRows,
+    "Application Types",
+    "Type সিলেক্ট করুন",
+  );
+}
+
+// Step 4: Handle Application Type selection
+async function handleApplicationTypeSelection(
+  phone: string,
+  appType: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(
+    `Processing Application Type selection for ${formattedPhone}`,
+    { appType },
+  );
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const applicationData = state?.data?.applicationData as any;
+
+    if (!applicationData) {
+      await sendTextMessage(formattedPhone, "❌ সেশন শেষ হয়েছে!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const validTypes = APPLICATION_TYPES.map((t) => t.id);
+    if (!validTypes.includes(appType)) {
+      await sendTextMessage(formattedPhone, "❌ টাইপ সঠিক নয়!");
+      await sendApplicationTypeMenu(
+        formattedPhone,
+        applicationData.appId,
+        applicationData.dob,
+      );
+      return;
+    }
+
+    const typeInfo = APPLICATION_TYPES.find((t) => t.id === appType);
+    const typeLabel = typeInfo ? typeInfo.title : appType;
+
+    await stateManager.updateStateData(formattedPhone, {
+      applicationData: {
+        ...applicationData,
+        step: 4,
+        appType: appType,
+      },
+      currentState: "awaiting_application_confirmation",
+    });
+
+    await sendQuickReplyMenu(
+      phone,
+      `📋 *Application তথ্য সমূহ*\n\n✅ *Application ID:* ${applicationData.appId}\n✅ *DOB:* ${applicationData.dob}\n✅ *Type:* ${typeLabel}\n\n💰 *মূল্য:* ৳${applicationData.price}\n\nআপনার তথ্য সঠিক কিনা কনফার্ম করুন:`,
+      [
+        { id: "app_confirm_yes", title: "✅ তথ্য সঠিক" },
+        { id: "app_edit", title: "✏️ তথ্য এডিট" },
+        { id: "app_cancel", title: "🚫 বাতিল করুন" },
+      ],
+    );
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to process Application Type for ${phone}:`,
+      err,
+    );
+    await sendTextMessage(
+      formattedPhone,
+      "❌ Application Type প্রসেস করতে সমস্যা হয়েছে!",
+    );
+    await cancelFlow(formattedPhone, false);
+  }
+}
 // Function to call the API and get PDF
 async function getApplicationPdf(
   appId: string,
@@ -3814,20 +4027,11 @@ async function getApplicationPdf(
   error?: string;
 }> {
   try {
-    EnhancedLogger.info(`Fetching Application PDF`, {
-      appId,
-      dob,
-      appType,
-    });
+    EnhancedLogger.info(`Fetching Application PDF`, { appId, dob, appType });
 
     const apiUrl = `https://api.sheva247.site/test/4.php?appId=${appId}&dob=${dob}&appType=${appType}`;
 
-    EnhancedLogger.debug(`Calling Application PDF API`, {
-      apiUrl,
-      appId,
-      dob,
-      appType,
-    });
+    EnhancedLogger.debug(`Calling Application PDF API`, { apiUrl });
 
     const startTime = Date.now();
     const response = await fetch(apiUrl, {
@@ -3835,7 +4039,6 @@ async function getApplicationPdf(
       headers: {
         "User-Agent": "BirthHelp-Bot/1.0",
         Accept: "*/*",
-        "Content-Type": "application/json",
       },
     });
 
@@ -3853,13 +4056,21 @@ async function getApplicationPdf(
       };
     }
 
-    // Check if response is PDF or JSON
     const contentType = response.headers.get("content-type") || "";
 
-    if (contentType.includes("application/pdf")) {
-      // Direct PDF response
+    if (
+      contentType.includes("application/pdf") ||
+      contentType.includes("application/octet-stream")
+    ) {
       const arrayBuffer = await response.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
+
+      if (buffer.length === 0) {
+        return {
+          status: "error",
+          message: "PDF file is empty",
+        };
+      }
 
       const fileName = `application_${appId}_${Date.now()}.pdf`;
 
@@ -3876,17 +4087,16 @@ async function getApplicationPdf(
         fileData: buffer,
       };
     } else {
-      // Try to parse as JSON for error messages
-      try {
-        const data = await response.json();
-        EnhancedLogger.debug(`JSON response from API`, {
-          appId,
-          data,
-        });
+      const text = await response.text();
 
-        if (data.status === "success" && data.pdf_url) {
-          // API returned a URL, download from that URL
-          const pdfResponse = await fetch(data.pdf_url);
+      try {
+        const data = JSON.parse(text);
+        EnhancedLogger.debug(`JSON response from API`, { appId, data });
+
+        if (data.status === "success" && (data.pdf_url || data.pdf)) {
+          const pdfUrl = data.pdf_url || data.pdf;
+
+          const pdfResponse = await fetch(pdfUrl);
           if (pdfResponse.ok) {
             const arrayBuffer = await pdfResponse.arrayBuffer();
             const buffer = Buffer.from(arrayBuffer);
@@ -3896,26 +4106,19 @@ async function getApplicationPdf(
             return {
               status: "success",
               message: data.message || "PDF downloaded successfully",
-              pdfUrl: data.pdf_url,
+              pdfUrl: pdfUrl,
               fileName: fileName,
               fileData: buffer,
             };
-          } else {
-            return {
-              status: "error",
-              message: data.message || "Could not download PDF from URL",
-            };
           }
-        } else {
-          return {
-            status: "error",
-            message: data.message || data.error || "Failed to get PDF",
-          };
         }
+
+        return {
+          status: "error",
+          message: data.message || data.error || "Failed to get PDF",
+        };
       } catch (jsonError) {
-        // Not JSON, try to read as text
-        const text = await response.text();
-        EnhancedLogger.error(`API returned non-PDF, non-JSON response`, {
+        EnhancedLogger.error(`API returned non-PDF response`, {
           appId,
           contentType,
           textPreview: text.substring(0, 200),
@@ -3923,7 +4126,7 @@ async function getApplicationPdf(
 
         return {
           status: "error",
-          message: "API returned unexpected response format",
+          message: "API did not return a PDF file",
         };
       }
     }
@@ -3954,6 +4157,245 @@ async function getApplicationPdf(
   }
 }
 
+// Handle edit option
+async function handleApplicationEdit(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(
+    `User requested to edit application info for ${formattedPhone}`,
+  );
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const applicationData = state?.data?.applicationData as any;
+
+    if (!applicationData) {
+      await sendTextMessage(formattedPhone, "❌ সেশন শেষ হয়েছে!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const editOptions = [
+      {
+        id: "edit_app_id",
+        title: "✏️ Application ID",
+        description: "Application ID পরিবর্তন করুন",
+      },
+      {
+        id: "edit_dob",
+        title: "✏️ জন্ম তারিখ",
+        description: "DOB পরিবর্তন করুন",
+      },
+      {
+        id: "edit_type",
+        title: "✏️ Application Type",
+        description: "Type পরিবর্তন করুন",
+      },
+    ];
+
+    await sendListMenu(
+      phone,
+      "✏️ তথ্য এডিট করুন",
+      "কোন তথ্য এডিট করতে চান?",
+      editOptions,
+      "এডিট অপশন",
+      "অপশন সিলেক্ট করুন",
+    );
+  } catch (err) {
+    EnhancedLogger.error(`Failed to handle edit for ${phone}:`, err);
+    await sendTextMessage(formattedPhone, "❌ এডিট করতে সমস্যা হয়েছে!");
+    await cancelFlow(formattedPhone, false);
+  }
+}
+
+// Final step: Process Application PDF download
+async function processApplicationPdfDownload(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+
+  try {
+    const state = await stateManager.getUserState(formattedPhone);
+    const applicationData = state?.data?.applicationData as any;
+
+    if (
+      !applicationData ||
+      !applicationData.appId ||
+      !applicationData.dob ||
+      !applicationData.appType
+    ) {
+      await sendTextMessage(formattedPhone, "❌ তথ্য অসম্পূর্ণ!");
+      await cancelFlow(formattedPhone, false);
+      return;
+    }
+
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_application_pdf_download",
+    );
+
+    if (!user || !service) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ ইউজার বা সার্ভিস পাওয়া যায়নি!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await sendTextMessage(
+      formattedPhone,
+      `⏳ *Application PDF ডাউনলোড হচ্ছে...*\n\n🆔 Application ID: ${applicationData.appId}\n📅 DOB: ${applicationData.dob}\n📋 Type: ${applicationData.appType}\n\nদয়া করে অপেক্ষা করুন...`,
+    );
+
+    const result = await getApplicationPdf(
+      applicationData.appId,
+      applicationData.dob,
+      applicationData.appType,
+    );
+
+    const oldBalance = user.balance;
+    user.balance -= service.price;
+    await user.save();
+
+    const transaction = await Transaction.create({
+      trxId: `APP-PDF-${Date.now()}`,
+      amount: service.price,
+      method: "balance",
+      status: result.status === "success" ? "SUCCESS" : "FAILED",
+      number: formattedPhone,
+      user: user._id,
+      metadata: {
+        serviceId: "instant_application_pdf_download",
+        serviceName: service.name,
+        appId: applicationData.appId,
+        dob: applicationData.dob,
+        appType: applicationData.appType,
+        resultStatus: result.status,
+        resultMessage: result.message,
+        processedAt: new Date().toISOString(),
+      },
+      createdAt: new Date(),
+    });
+
+    let resultMessage = `📄 *${service.name} সম্পন্ন*\n\n`;
+    resultMessage += `🆔 Application ID: ${applicationData.appId}\n`;
+    resultMessage += `📅 DOB: ${applicationData.dob}\n`;
+    resultMessage += `📋 Type: ${applicationData.appType}\n`;
+    resultMessage += `💰 সার্ভিস মূল্য: ৳${service.price}\n`;
+    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
+    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
+    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
+
+    if (result.status === "success" && result.fileData) {
+      const uploadsDir = path.join(
+        process.cwd(),
+        "uploads",
+        "application_pdfs",
+      );
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+
+      const fileName =
+        result.fileName ||
+        `application_${applicationData.appId}_${Date.now()}.pdf`;
+      const filePath = path.join(uploadsDir, fileName);
+
+      fs.writeFileSync(filePath, result.fileData);
+
+      const publicUrl = `/uploads/application_pdfs/${fileName}`;
+      const baseUrl = process.env.NEXT_PUBLIC_URL || "http://localhost:3000";
+      const fullUrl = `${baseUrl}${publicUrl}`;
+
+      resultMessage += `✅ *PDF ডাউনলোড সফল!*\n\n`;
+      resultMessage += `📁 ফাইল: ${fileName}\n`;
+      resultMessage += `📊 সাইজ: ${formatFileSize(result.fileData.length)}\n\n`;
+      resultMessage += `⏳ ফাইল পাঠানো হচ্ছে...`;
+
+      await sendTextMessage(formattedPhone, resultMessage);
+
+      try {
+        await sendDeliveryFile(
+          formattedPhone,
+          fullUrl,
+          fileName,
+          "application/pdf",
+          `Application PDF\nID: ${applicationData.appId}\nType: ${applicationData.appType}`,
+        );
+
+        await sendTextMessage(
+          formattedPhone,
+          `✅ *PDF সফলভাবে পাঠানো হয়েছে!*\n\n📄 আপনার Application PDF এখন উপলব্ধ।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+        );
+      } catch (sendError: any) {
+        EnhancedLogger.error(`Failed to send PDF via WhatsApp:`, {
+          error: sendError?.message || sendError,
+          phone: formattedPhone,
+        });
+
+        await sendTextMessage(
+          formattedPhone,
+          `✅ *PDF ডাউনলোড সফল!*\n\n📁 ডাউনলোড লিংক:\n${fullUrl}\n\n📄 PDF ডাউনলোড করতে লিংকে ক্লিক করুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+        );
+      }
+    } else {
+      resultMessage += `❌ *PDF ডাউনলোড ব্যর্থ*\n\n`;
+      resultMessage += `কারণ: ${result.message || "অজানা সমস্যা"}\n\n`;
+      resultMessage += `দয়া পরে চেষ্টা করুন অথবা সাপোর্টে যোগাযোগ করুন।\n\n`;
+      resultMessage += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+      await sendTextMessage(formattedPhone, resultMessage);
+    }
+
+    const typeInfo = APPLICATION_TYPES.find(
+      (t) => t.id === applicationData.appType,
+    );
+    const typeLabel = typeInfo ? typeInfo.title : applicationData.appType;
+
+    await notifyAdmin(
+      `📄 Application PDF Download সম্পন্ন\n\n` +
+        `ব্যবহারকারী: ${formattedPhone}\n` +
+        `সার্ভিস: ${service.name}\n` +
+        `মূল্য: ৳${service.price}\n` +
+        `Application ID: ${applicationData.appId}\n` +
+        `DOB: ${applicationData.dob}\n` +
+        `Type: ${typeLabel}\n` +
+        `স্ট্যাটাস: ${result.status === "success" ? "✅ SUCCESS" : "❌ FAILED"}\n` +
+        `ব্যালেন্স: ${oldBalance} → ${user.balance}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+
+    EnhancedLogger.logFlowCompletion(
+      formattedPhone,
+      "application_pdf_download",
+      {
+        appId: applicationData.appId,
+        dob: applicationData.dob,
+        appType: applicationData.appType,
+        price: service.price,
+        result: result.status,
+        transactionId: transaction._id,
+        oldBalance,
+        newBalance: user.balance,
+      },
+    );
+  } catch (err: any) {
+    EnhancedLogger.error(`Failed to process Application PDF download:`, {
+      error: err?.message || err,
+      stack: err?.stack,
+      phone: formattedPhone,
+    });
+
+    await sendTextMessage(
+      formattedPhone,
+      "❌ Application PDF ডাউনলোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+  }
+}
 // Handle application PDF download
 async function handleApplicationPdfDownload(
   phone: string,
@@ -8734,7 +9176,6 @@ async function handleUserMessage(
     // AUTO FILE DELIVERY FOR ADMIN (MAIN MENU ONLY)
     // ========================================
     if (isAdmin && (message.type === "image" || message.type === "document")) {
-      // Define which states should BLOCK auto delivery (admin is in a flow)
       EnhancedLogger.debug(
         `[${requestId}] Admin sent file, checking for auto delivery conditions`,
         {
@@ -8750,7 +9191,11 @@ async function handleUserMessage(
         "awaiting_service_data",
         "awaiting_service_data_edit",
         "awaiting_service_confirmation",
-
+        // Application PDF flows
+        "awaiting_application_id",
+        "awaiting_application_dob",
+        "awaiting_application_type",
+        "awaiting_application_confirmation",
         // Admin flows
         "admin_add_service_name",
         "admin_add_service_description",
@@ -8776,18 +9221,15 @@ async function handleUserMessage(
         "admin_ban_user_phone",
         "admin_ban_user_confirm",
         "admin_search_user_input",
-
         // Any upload state
         "uploading",
         "awaiting_upload",
         "file_upload",
-
         // Any processing state
         "processing",
         "awaiting_processing",
       ];
 
-      // Auto delivery ONLY triggers when admin is at main menu (no active state)
       const isAtMainMenu =
         !currentState ||
         currentState === "idle" ||
@@ -8808,10 +9250,7 @@ async function handleUserMessage(
           },
         );
 
-        // Clear any existing state
         await stateManager.clearUserState(formattedPhone);
-
-        // Start auto file delivery
         await triggerAutoFileDelivery(formattedPhone, message);
         return;
       } else {
@@ -8823,7 +9262,6 @@ async function handleUserMessage(
             messageType: message.type,
           },
         );
-        // Continue with regular flow handling below
       }
     }
 
@@ -8856,6 +9294,7 @@ async function handleUserMessage(
       // USER STATE HANDLERS
       // ========================================
 
+      // Existing state handlers...
       if (currentState === "awaiting_trx_id") {
         const trxId = userText.trim().toUpperCase();
         if (trxId) {
@@ -8869,32 +9308,25 @@ async function handleUserMessage(
         }
         return;
       }
-      if (currentState === "awaiting_application_input") {
-        EnhancedLogger.info(`[${requestId}] Processing application PDF input`);
-        await handleApplicationPdfDownload(formattedPhone, userText);
-        return;
-      }
+
       if (currentState === "awaiting_ubrn_number") {
         EnhancedLogger.info(`[${requestId}] Processing UBRN input`);
         await handleUbrnInput(formattedPhone, userText);
         return;
       }
+
       if (currentState === "awaiting_dakhila_url") {
         EnhancedLogger.info(`[${requestId}] Processing Dakhila URL input`);
         await handleDakhilaApprovalCheck(formattedPhone, userText);
         return;
       }
+
       if (currentState === "awaiting_payment_link_url") {
         EnhancedLogger.info(`[${requestId}] Processing Payment Link URL input`);
         await handleHoldingPaymentLink(formattedPhone, userText);
         return;
       }
-      if (currentState === "awaiting_instant_input") {
-        EnhancedLogger.info(`[${requestId}] Processing instant service input`);
-        await handleInstantServiceInput(formattedPhone, userText);
-        return;
-      }
-      // In the handleUserMessage function, add this case (around line 3800)
+
       if (currentState === "awaiting_missing_holding_url") {
         EnhancedLogger.info(
           `[${requestId}] Processing Missing Holding URL input`,
@@ -8902,6 +9334,37 @@ async function handleUserMessage(
         await handleMissingHoldingSearch(formattedPhone, userText);
         return;
       }
+
+      if (currentState === "awaiting_instant_input") {
+        EnhancedLogger.info(`[${requestId}] Processing instant service input`);
+        await handleInstantServiceInput(formattedPhone, userText);
+        return;
+      }
+
+      // ========================================
+      // APPLICATION PDF DOWNLOAD STATE HANDLERS
+      // ========================================
+
+      if (currentState === "awaiting_application_id") {
+        EnhancedLogger.info(`[${requestId}] Processing Application ID input`);
+        await handleApplicationIdInput(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "awaiting_application_dob") {
+        EnhancedLogger.info(`[${requestId}] Processing DOB input`);
+        await handleApplicationDobInput(formattedPhone, userText);
+        return;
+      }
+
+      if (currentState === "awaiting_application_type") {
+        EnhancedLogger.info(
+          `[${requestId}] Processing Application Type selection (text)`,
+        );
+        await handleApplicationTypeSelection(formattedPhone, userText);
+        return;
+      }
+
       if (currentState === "awaiting_service_data") {
         EnhancedLogger.info(`[${requestId}] Processing service field input`);
         await handleServiceFieldInput(formattedPhone, userText);
@@ -8917,12 +9380,10 @@ async function handleUserMessage(
       }
 
       if (currentState === "awaiting_service_confirmation") {
-        // Don't process text for confirmation - only use buttons
         await sendTextMessage(
           formattedPhone,
           "ℹ️ দয়া করে উপরের বাটনগুলো ব্যবহার করুন।\n\n✅ কনফার্ম করতে '✅ কনফার্ম করুন' বাটন ক্লিক করুন\n✏️ এডিট করতে '✏️ এডিট করুন' বাটন ক্লিক করুন\n🚫 বাতিল করতে '🚫 বাতিল করুন' বাটন ক্লিক করুন",
         );
-        // Resend the confirmation menu
         const state = await stateManager.getUserState(formattedPhone);
         const serviceOrderData = state?.data
           ?.serviceOrder as ServiceOrderStateData;
@@ -9299,7 +9760,6 @@ async function handleUserMessage(
 
         // Handle user menu options
         if (selectedId.startsWith("user_")) {
-          // Clear state for user menu interactions
           if (
             !currentState ||
             ![
@@ -9309,6 +9769,10 @@ async function handleUserMessage(
               "awaiting_instant_input",
               "awaiting_service_data",
               "awaiting_service_data_edit",
+              "awaiting_application_id",
+              "awaiting_application_dob",
+              "awaiting_application_type",
+              "awaiting_application_confirmation",
             ].includes(currentState)
           ) {
             await stateManager.clearUserState(formattedPhone);
@@ -9358,14 +9822,13 @@ async function handleUserMessage(
               );
               await sendTextMessage(
                 formattedPhone,
-                "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন।",
+                "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন。",
               );
               await showMainMenu(formattedPhone, isAdmin);
           }
         }
         // Handle admin menu options
         else if (selectedId.startsWith("admin_")) {
-          // Clear state for admin menu interactions
           await stateManager.clearUserState(formattedPhone);
 
           switch (selectedId) {
@@ -9569,6 +10032,15 @@ async function handleUserMessage(
                 EnhancedLogger.info(`[${requestId}] User cancelled flow`);
                 await cancelFlow(formattedPhone, isAdmin);
               }
+              // Handle Application PDF Download
+              else if (selectedId.startsWith("app_type_")) {
+                EnhancedLogger.info(
+                  `[${requestId}] User selected application type`,
+                  { selectedId },
+                );
+                const appType = selectedId.replace("app_type_", "");
+                await handleApplicationTypeSelection(formattedPhone, appType);
+              }
               // Handle field editing options
               else if (
                 selectedId.startsWith("edit_field_") ||
@@ -9583,7 +10055,6 @@ async function handleUserMessage(
                   ?.serviceOrder as ServiceOrderStateData;
 
                 if (selectedId === "edit_all_fields") {
-                  // Reset to first field
                   await stateManager.updateStateData(formattedPhone, {
                     serviceOrder: {
                       ...serviceOrderData,
@@ -9592,7 +10063,6 @@ async function handleUserMessage(
                     currentState: "awaiting_service_data",
                   });
                 } else {
-                  // Edit specific field
                   const fieldIndex = parseInt(
                     selectedId.replace("edit_field_", ""),
                   );
@@ -9605,7 +10075,6 @@ async function handleUserMessage(
                   });
                 }
 
-                // Get service info
                 await connectDB();
                 const service = await Service.findById(
                   serviceOrderData?.serviceId,
@@ -9701,6 +10170,15 @@ async function handleUserMessage(
             EnhancedLogger.info(`[${requestId}] User cancelled flow`);
             await cancelFlow(formattedPhone, isAdmin);
           }
+          // Handle Application PDF Download
+          else if (selectedId.startsWith("app_type_")) {
+            EnhancedLogger.info(
+              `[${requestId}] User selected application type`,
+              { selectedId },
+            );
+            const appType = selectedId.replace("app_type_", "");
+            await handleApplicationTypeSelection(formattedPhone, appType);
+          }
           // Handle field editing options
           else if (
             selectedId.startsWith("edit_field_") ||
@@ -9715,7 +10193,6 @@ async function handleUserMessage(
               ?.serviceOrder as ServiceOrderStateData;
 
             if (selectedId === "edit_all_fields") {
-              // Reset to first field
               await stateManager.updateStateData(formattedPhone, {
                 serviceOrder: {
                   ...serviceOrderData,
@@ -9724,7 +10201,6 @@ async function handleUserMessage(
                 currentState: "awaiting_service_data",
               });
             } else {
-              // Edit specific field
               const fieldIndex = parseInt(
                 selectedId.replace("edit_field_", ""),
               );
@@ -9737,7 +10213,6 @@ async function handleUserMessage(
               });
             }
 
-            // Get service info
             await connectDB();
             const service = await Service.findById(serviceOrderData?.serviceId);
             if (service) {
@@ -9756,7 +10231,7 @@ async function handleUserMessage(
             });
             await sendTextMessage(
               formattedPhone,
-              "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন।",
+              "❌ অজানা অপশন। দয়া করে আবার চেষ্টা করুন。",
             );
             await showMainMenu(formattedPhone, isAdmin);
           }
@@ -9768,7 +10243,11 @@ async function handleUserMessage(
           selectedId,
         });
 
-        if (selectedId === "cancel_flow" || selectedId === "order_cancel") {
+        if (
+          selectedId === "cancel_flow" ||
+          selectedId === "order_cancel" ||
+          selectedId === "app_cancel"
+        ) {
           EnhancedLogger.info(`[${requestId}] User cancelled flow via button`);
           await cancelFlow(formattedPhone, isAdmin);
         } else if (selectedId === "order_confirm") {
@@ -9777,6 +10256,47 @@ async function handleUserMessage(
         } else if (selectedId === "order_edit") {
           EnhancedLogger.info(`[${requestId}] User wants to edit order`);
           await handleEditServiceData(formattedPhone);
+        }
+        // Application PDF Download buttons
+        else if (selectedId === "app_confirm_yes") {
+          EnhancedLogger.info(`[${requestId}] User confirmed application info`);
+          await processApplicationPdfDownload(formattedPhone);
+        } else if (selectedId === "app_edit") {
+          EnhancedLogger.info(
+            `[${requestId}] User wants to edit application info`,
+          );
+          await handleApplicationEdit(formattedPhone);
+        }
+        // Edit options for application
+        else if (selectedId === "edit_app_id") {
+          await stateManager.updateStateData(formattedPhone, {
+            currentState: "awaiting_application_id",
+            applicationData: {
+              ...state?.data?.applicationData,
+              step: 1,
+            },
+          });
+          await sendTextWithCancelButton(
+            phone,
+            "✏️ *Application ID এডিট করুন*\n\nনতুন Application ID দিন:\n\n📌 উদাহরণ: 254855436",
+          );
+        } else if (selectedId === "edit_dob") {
+          await stateManager.updateStateData(formattedPhone, {
+            currentState: "awaiting_application_dob",
+            applicationData: {
+              ...state?.data?.applicationData,
+              step: 2,
+            },
+          });
+          await sendTextWithCancelButton(
+            phone,
+            "✏️ *DOB এডিট করুন*\n\nনতুন জন্ম তারিখ দিন (MM/DD/YYYY):\n\n📌 উদাহরণ: 03/02/1989",
+          );
+        } else if (selectedId === "edit_type") {
+          const appData = state?.data?.applicationData;
+          if (appData?.appId && appData?.dob) {
+            await sendApplicationTypeMenu(phone, appData.appId, appData.dob);
+          }
         } else if (selectedId.startsWith("status_")) {
           EnhancedLogger.info(`[${requestId}] Admin selected status`, {
             selectedId,
@@ -9786,25 +10306,19 @@ async function handleUserMessage(
           EnhancedLogger.info(`[${requestId}] Admin selected delivery type`, {
             selectedId,
           });
-          // Call the update function with delivery type
           await handleAdminProcessOrderUpdate(formattedPhone, selectedId);
         } else if (selectedId.startsWith("field_type_")) {
-          // Handle field type selection
           await handleAdminAddServiceStep(formattedPhone, selectedId);
         } else if (selectedId.startsWith("field_required_")) {
-          // Handle required field selection
           await handleAdminAddServiceStep(formattedPhone, selectedId);
         } else if (selectedId.startsWith("add_fields_")) {
-          // Handle add fields decision
           await handleAdminAddServiceStep(formattedPhone, selectedId);
         } else if (
           selectedId.startsWith("add_more_") ||
           selectedId.startsWith("finish_")
         ) {
-          // Handle more fields or finish
           await handleAdminAddServiceStep(formattedPhone, selectedId);
         } else if (selectedId.startsWith("confirm_")) {
-          // Handle confirm actions
           if (selectedId === "confirm_delete") {
             await handleAdminDeleteServiceExecute(formattedPhone, true);
           } else if (selectedId.startsWith("confirm_")) {
@@ -9831,7 +10345,6 @@ async function handleUserMessage(
         }
       }
     } else if (message.type === "image" || message.type === "document") {
-      // Handle file uploads for both user service fields and admin order delivery
       const state = await stateManager.getUserState(formattedPhone);
       const currentState = state?.currentState;
       const flowType = state?.flowType;
@@ -9842,7 +10355,6 @@ async function handleUserMessage(
         flowType,
       });
 
-      // Check if we're in file upload state for user service fields
       if (
         flowType === "service_order" &&
         (currentState === "awaiting_service_data" ||
@@ -9866,7 +10378,6 @@ async function handleUserMessage(
                 { fieldName: field.name, fieldLabel: field.label },
               );
 
-              // Process file upload for service field
               await handleServiceFieldInput(formattedPhone, "", message);
               return;
             }
@@ -9874,7 +10385,6 @@ async function handleUserMessage(
         }
       }
 
-      // Check if we're in file upload state for admin order delivery
       if (
         flowType === "admin_process_order" &&
         (currentState === "admin_process_order_file_upload" ||
@@ -9886,7 +10396,6 @@ async function handleUserMessage(
         );
         await handleAdminFileUpload(formattedPhone, message);
       } else {
-        // If admin uploaded file but not in auto delivery state, it's part of regular flow
         EnhancedLogger.info(
           `[${requestId}] File received in regular flow state`,
           {
@@ -9894,7 +10403,6 @@ async function handleUserMessage(
             flowType,
           },
         );
-        // Continue with regular flow handling
       }
     } else if (message.type === "audio" || message.type === "video") {
       EnhancedLogger.warn(`[${requestId}] Unsupported media type`, {
@@ -9920,7 +10428,6 @@ async function handleUserMessage(
       handlerError,
     );
 
-    // Try to send error message to user
     try {
       await sendTextMessage(
         formattedPhone,
@@ -9933,7 +10440,6 @@ async function handleUserMessage(
       );
     }
 
-    // Clear state and show menu
     try {
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
