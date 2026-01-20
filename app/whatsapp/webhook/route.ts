@@ -3902,11 +3902,11 @@ async function handleApplicationDobInput(
       return;
     }
 
-    const dobRegex = /^(0[1-9]|1[0-2])\/(0[1-9]|[12][0-9]|3[01])\/\d{4}$/;
+    const dobRegex = /^\d{2}\/\d{2}\/\d{4}$/;
     if (!dobRegex.test(dob.trim())) {
       await sendTextMessage(
         formattedPhone,
-        "❌ DOB ফরম্যাট সঠিক নয়।\nসঠিক ফরম্যাট: MM/DD/YYYY\nউদাহরণ: 03/02/1989\n\nদয়া করে সঠিক DOB দিন:",
+        "❌ DOB ফরম্যাট সঠিক নয়।\nসঠিক ফরম্যাট: DD/MM/YYYY\nউদাহরণ: 03/02/1989\n\nদয়া করে সঠিক DOB দিন:",
       );
       return;
     }
@@ -9546,12 +9546,7 @@ async function handleUserMessage(
           }
         }
 
-        // Default response for unrecognized messages
-        EnhancedLogger.info(`[${requestId}] Sending default welcome message`);
-        await sendTextMessage(
-          formattedPhone,
-          "👋 *নমস্কার! Birth Help তে আপনাকে স্বাগতম!*\n\nআমাদের সার্ভিস সম্পর্কে জানতে 'Menu' লিখুন।\n\n📌 *দ্রুত গাইড:*\n• রিচার্জ করতে: 'রিচার্জ'\n• সার্ভিস দেখতে: 'সার্ভিস'\n• অর্ডার দেখতে: 'অর্ডার'\n• অ্যাকাউন্ট দেখতে: 'অ্যাকাউন্ট'\n• সাপোর্ট পেতে: 'সাপোর্ট'\n\n🚫 যেকোন সময় বাতিল করতে 'cancel' লিখুন",
-        );
+    
         await showMainMenu(formattedPhone, isAdmin);
       } else {
         // If in a flow but received unrecognized command
@@ -10298,12 +10293,12 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       entryCount: body.entry?.length || 0,
     });
     // Save webhook body as JSON to server
-    const webhookDir = path.join(process.cwd(), "webhook_logs");
-    const webhookFile = path.join(webhookDir, `${requestId}.json`);
-    if (!fs.existsSync(webhookDir)) {
-      fs.mkdirSync(webhookDir);
-    }
-    fs.writeFileSync(webhookFile, JSON.stringify(body, null, 2));
+    // const webhookDir = path.join(process.cwd(), "webhook_logs");
+    // const webhookFile = path.join(webhookDir, `${requestId}.json`);
+    // if (!fs.existsSync(webhookDir)) {
+    //   fs.mkdirSync(webhookDir);
+    // }
+    // fs.writeFileSync(webhookFile, JSON.stringify(body, null, 2));
     if (body.object === "whatsapp_business_account") {
       const entry = body.entry?.[0];
       const changes = entry?.changes?.[0];
