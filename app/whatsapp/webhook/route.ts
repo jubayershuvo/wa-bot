@@ -195,6 +195,16 @@ const INSTANT_SERVICES = [
     inputExample:
       "https://portal.ldtax.gov.bd/citizen/holding/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   },
+  {
+    id: "instant_application_pdf_download",
+    name: "📄 Application PDF Download",
+    description: "BR/Dob সনদের জন্য আবেদনের PDF ডাউনলোড করুন",
+    price: 15,
+    isActive: true,
+    requiresInput: true,
+    inputPrompt: "Application ID এবং DOB (MM/DD/YYYY) পাঠান:",
+    inputExample: "254855436 03/02/1989",
+  },
 ];
 
 // --- Rate Limiter ---
@@ -2483,7 +2493,10 @@ async function handleInstantServiceSelection(
       await handleUbrnVerificationStart(phone);
       return;
     }
-
+    if (serviceId === "instant_application_pdf_download") {
+      await handleApplicationPdfStart(phone);
+      return;
+    }
     if (serviceId === "instant_dakhila_approval") {
       await handleDakhilaApprovalStart(phone);
       return;
@@ -2611,7 +2624,9 @@ async function handleInstantServiceInput(
     }
 
     // Check if it's Dakhila approval
-    if (serviceOrderData.serviceId === "instant_dakhila_approval") {
+    if (serviceOrderData.serviceId === "instant_application_pdf_download") {
+      await handleApplicationPdfDownload(formattedPhone, input.trim());
+    } else if (serviceOrderData.serviceId === "instant_dakhila_approval") {
       await handleDakhilaApprovalCheck(formattedPhone, input.trim());
     }
     // Handle Payment Link
@@ -2634,8 +2649,6 @@ async function handleInstantServiceInput(
     await showMainMenu(formattedPhone, false);
   }
 }
-
-
 
 async function handleUbrnVerificationStart(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
@@ -2760,7 +2773,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
       const apiEndTime = Date.now();
       const apiDuration = apiEndTime - apiStartTime;
-     
+
       EnhancedLogger.info(`UBRN API response received`, {
         ubrn: trimmedUbrn,
         status: response.status,
@@ -3695,7 +3708,472 @@ async function handleEditServiceData(phone: string): Promise<void> {
     await cancelFlow(formattedPhone, false);
   }
 }
+// Application type options
+const APPLICATION_TYPES = [
+  { value: "br", label: "জন্ম নিবন্ধনের জন্য আবেদন" },
+  { value: "br_correction", label: "জন্ম তথ্য সংশোধন" },
+  { value: "br_reprint", label: "জন্ম নিবন্ধন প্রতিলিপি" },
+  { value: "br_cancel", label: "জন্ম সনদ বাতিলের আবেদন" },
+  { value: "dr", label: "মৃত্যু নিবন্ধনের জন্য আবেদন" },
+  { value: "dr_correction", label: "মৃত্যু তথ্য সংশোধন" },
+  { value: "dr_reprint", label: "মৃত্যু নিবন্ধন প্রতিলিপি" },
+  { value: "dr_cancel", label: "মৃত্যু সনদ বাতিলের আবেদন" },
+];
 
+// Start Application PDF Download
+async function handleApplicationPdfStart(phone: string): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+  EnhancedLogger.info(
+    `Starting Application PDF download for ${formattedPhone}`,
+  );
+
+  try {
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+
+    if (!user) {
+      await sendTextMessage(formattedPhone, "❌ ইউজার পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_application_pdf_download",
+    );
+    if (!service) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ Application PDF service not available!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    await stateManager.setUserState(formattedPhone, {
+      currentState: "awaiting_application_input",
+      flowType: "application_pdf_download",
+      data: {
+        applicationData: {
+          serviceId: "instant_application_pdf_download",
+          price: service.price,
+          serviceName: service.name,
+          attempts: 0,
+        },
+        lastActivity: Date.now(),
+        sessionId: Date.now().toString(36),
+      },
+    });
+
+    let message = `📄 *Application PDF Download*\n\n💰 মূল্য: ৳${service.price}\n\n`;
+    message += `${service.inputPrompt}\n\n`;
+    message += `*ফরম্যাট:*\nApplicationID DOB Type\n\n`;
+    message += `*উদাহরণ:*\n254855436 03/02/1989 br\n\n`;
+    message += `*টাইপ অপশন:*\n`;
+    APPLICATION_TYPES.forEach((type, index) => {
+      message += `${index + 1}. ${type.label} (${type.value})\n`;
+    });
+    message += `\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
+
+    await sendTextWithCancelButton(formattedPhone, message);
+    EnhancedLogger.info(
+      `Application PDF download started for ${formattedPhone}`,
+    );
+  } catch (err) {
+    EnhancedLogger.error(
+      `Failed to start Application PDF download for ${phone}:`,
+      err,
+    );
+    await sendTextMessage(
+      formattedPhone,
+      "❌ Application PDF সার্ভিস শুরু করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।",
+    );
+    await showMainMenu(formattedPhone, false);
+  }
+}
+
+// Function to call the API and get PDF
+async function getApplicationPdf(
+  appId: string,
+  dob: string,
+  appType: string,
+): Promise<{
+  status: string;
+  message?: string;
+  pdfUrl?: string;
+  fileName?: string;
+  fileData?: Buffer;
+  error?: string;
+}> {
+  try {
+    EnhancedLogger.info(`Fetching Application PDF`, {
+      appId,
+      dob,
+      appType,
+    });
+
+    const apiUrl = `https://api.sheva247.site/test/4.php?appId=${appId}&dob=${dob}&appType=${appType}`;
+
+    EnhancedLogger.debug(`Calling Application PDF API`, {
+      apiUrl,
+      appId,
+      dob,
+      appType,
+    });
+
+    const startTime = Date.now();
+    const response = await fetch(apiUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": "BirthHelp-Bot/1.0",
+        Accept: "*/*",
+        "Content-Type": "application/json",
+      },
+    });
+
+    const responseTime = Date.now() - startTime;
+
+    if (!response.ok) {
+      EnhancedLogger.error(`Application PDF API error: ${response.status}`, {
+        status: response.status,
+        statusText: response.statusText,
+        responseTime: `${responseTime}ms`,
+      });
+      return {
+        status: "error",
+        message: `API request failed with status ${response.status}`,
+      };
+    }
+
+    // Check if response is PDF or JSON
+    const contentType = response.headers.get("content-type") || "";
+
+    if (contentType.includes("application/pdf")) {
+      // Direct PDF response
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+
+      const fileName = `application_${appId}_${Date.now()}.pdf`;
+
+      EnhancedLogger.debug(`PDF received successfully`, {
+        appId,
+        fileSize: buffer.length,
+        responseTime: `${responseTime}ms`,
+      });
+
+      return {
+        status: "success",
+        message: "PDF downloaded successfully",
+        fileName: fileName,
+        fileData: buffer,
+      };
+    } else {
+      // Try to parse as JSON for error messages
+      try {
+        const data = await response.json();
+        EnhancedLogger.debug(`JSON response from API`, {
+          appId,
+          data,
+        });
+
+        if (data.status === "success" && data.pdf_url) {
+          // API returned a URL, download from that URL
+          const pdfResponse = await fetch(data.pdf_url);
+          if (pdfResponse.ok) {
+            const arrayBuffer = await pdfResponse.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+
+            const fileName = `application_${appId}_${Date.now()}.pdf`;
+
+            return {
+              status: "success",
+              message: data.message || "PDF downloaded successfully",
+              pdfUrl: data.pdf_url,
+              fileName: fileName,
+              fileData: buffer,
+            };
+          } else {
+            return {
+              status: "error",
+              message: data.message || "Could not download PDF from URL",
+            };
+          }
+        } else {
+          return {
+            status: "error",
+            message: data.message || data.error || "Failed to get PDF",
+          };
+        }
+      } catch (jsonError) {
+        // Not JSON, try to read as text
+        const text = await response.text();
+        EnhancedLogger.error(`API returned non-PDF, non-JSON response`, {
+          appId,
+          contentType,
+          textPreview: text.substring(0, 200),
+        });
+
+        return {
+          status: "error",
+          message: "API returned unexpected response format",
+        };
+      }
+    }
+  } catch (error: any) {
+    EnhancedLogger.error(`Error getting Application PDF:`, {
+      error: error?.message || error,
+      stack: error?.stack,
+      appId,
+      dob,
+      appType,
+    });
+
+    let errorMessage = "Failed to get Application PDF";
+    if (error.message?.includes("timeout")) {
+      errorMessage = "Application PDF API timeout. Please try again later.";
+    } else if (error.message?.includes("network")) {
+      errorMessage = "Network error. Please check your connection.";
+    } else if (error.message?.includes("ENOTFOUND")) {
+      errorMessage = "Cannot connect to Application PDF API server.";
+    } else if (error.message) {
+      errorMessage = `Error: ${error.message}`;
+    }
+
+    return {
+      status: "error",
+      message: errorMessage,
+    };
+  }
+}
+
+// Handle application PDF download
+async function handleApplicationPdfDownload(
+  phone: string,
+  input: string,
+): Promise<void> {
+  const formattedPhone = formatPhoneNumber(phone);
+
+  EnhancedLogger.info(
+    `Processing Application PDF download for ${formattedPhone}`,
+    {
+      input,
+    },
+  );
+
+  try {
+    // Parse input
+    const parts = input.trim().split(/\s+/);
+    if (parts.length < 3) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ দয়া করে Application ID, DOB এবং Type উভয়ই দিন।\n\nফরম্যাট: ApplicationID DOB Type\nউদাহরণ: 254855436 03/02/1989 br",
+      );
+      return;
+    }
+
+    const appId = parts[0].trim();
+    const dob = parts[1].trim();
+    const appType = parts[2].trim();
+
+    // Validate inputs
+    if (!/^\d+$/.test(appId)) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ Application ID শুধুমাত্র সংখ্যা হতে হবে!",
+      );
+      return;
+    }
+
+    const dobRegex = /^(0[1-9]|1[0-2])\/(0[1-9]|[12][0-9]|3[01])\/\d{4}$/;
+    if (!dobRegex.test(dob)) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ DOB ফরম্যাট সঠিক নয়।\nসঠিক ফরম্যাট: MM/DD/YYYY\nউদাহরণ: 03/02/1989",
+      );
+      return;
+    }
+
+    const validTypes = APPLICATION_TYPES.map((t) => t.value);
+    if (!validTypes.includes(appType)) {
+      await sendTextMessage(
+        formattedPhone,
+        `❌ টাইপ সঠিক নয়।\nভ্যালিড টাইপ:\n${validTypes.join(", ")}\n\nউদাহরণ: br, br_correction, dr, ইত্যাদি`,
+      );
+      return;
+    }
+
+    // Get user and service info
+    await connectDB();
+    const user = await User.findOne({ whatsapp: formattedPhone });
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_application_pdf_download",
+    );
+
+    if (!user || !service) {
+      await sendTextMessage(
+        formattedPhone,
+        "❌ ইউজার বা সার্ভিস পাওয়া যায়নি!",
+      );
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    // Send processing message
+    await sendTextMessage(
+      formattedPhone,
+      `⏳ *Application PDF ডাউনলোড হচ্ছে...*\n\nApplication ID: ${appId}\nDOB: ${dob}\nType: ${appType}\n\nদয়া করে অপেক্ষা করুন...`,
+    );
+
+    // Call API to get PDF
+    const result = await getApplicationPdf(appId, dob, appType);
+
+    // Deduct balance
+    const oldBalance = user.balance;
+    user.balance -= service.price;
+    await user.save();
+
+    // Create transaction record
+    const transaction = await Transaction.create({
+      trxId: `APP-PDF-${Date.now()}`,
+      amount: service.price,
+      method: "balance",
+      status: result.status === "success" ? "SUCCESS" : "FAILED",
+      number: formattedPhone,
+      user: user._id,
+      metadata: {
+        serviceId: "instant_application_pdf_download",
+        serviceName: service.name,
+        appId: appId,
+        dob: dob,
+        appType: appType,
+        resultStatus: result.status,
+        resultMessage: result.message,
+        processedAt: new Date().toISOString(),
+      },
+      createdAt: new Date(),
+    });
+
+    let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
+    resultMessage += `🆔 Application ID: ${appId}\n`;
+    resultMessage += `📅 DOB: ${dob}\n`;
+    resultMessage += `📋 Type: ${appType}\n`;
+    resultMessage += `💰 সার্ভিস মূল্য: ৳${service.price}\n`;
+    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
+    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
+    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
+
+    if (result.status === "success" && result.fileData) {
+      // Save PDF to server
+      const uploadsDir = path.join(
+        process.cwd(),
+        "uploads",
+        "application_pdfs",
+      );
+      if (!fs.existsSync(uploadsDir)) {
+        fs.mkdirSync(uploadsDir, { recursive: true });
+      }
+
+      const fileName =
+        result.fileName || `application_${appId}_${Date.now()}.pdf`;
+      const filePath = path.join(uploadsDir, fileName);
+
+      // Save file
+      fs.writeFileSync(filePath, result.fileData);
+
+      // Create public URL
+      const publicUrl = `/uploads/application_pdfs/${fileName}`;
+      const fullUrl = `${process.env.NEXT_PUBLIC_URL || "http://localhost:3000"}${publicUrl}`;
+
+      resultMessage += `✅ *PDF ডাউনলোড সফল!*\n\n`;
+      resultMessage += `📁 ফাইল: ${fileName}\n`;
+      resultMessage += `📊 সাইজ: ${formatFileSize(result.fileData.length)}\n\n`;
+      resultMessage += `⏳ ফাইল পাঠানো হচ্ছে...`;
+
+      await sendTextMessage(formattedPhone, resultMessage);
+
+      // Send PDF file via WhatsApp
+      try {
+        await sendOrderDeliveryTemplate(
+          formattedPhone,
+          service.name,
+          "Birth Help",
+          `APP-${appId}`,
+          fullUrl,
+          fileName,
+          "bn_BD",
+        );
+
+        await sendTextMessage(
+          formattedPhone,
+          `✅ *PDF সফলভাবে পাঠানো হয়েছে!*\n\n📄 আপনার Application PDF এখন উপলব্ধ।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+        );
+      } catch (sendError: any) {
+        EnhancedLogger.error(`Failed to send PDF via WhatsApp:`, {
+          error: sendError?.message || sendError,
+          phone: formattedPhone,
+        });
+
+        // Fallback: Send download link
+        await sendTextMessage(
+          formattedPhone,
+          `✅ *PDF ডাউনলোড সফল!*\n\n📁 ডাউনলোড লিংক:\n${fullUrl}\n\n📄 PDF ডাউনলোড করতে লিংকে ক্লিক করুন।\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`,
+        );
+      }
+    } else {
+      resultMessage += `❌ *PDF ডাউনলোড ব্যর্থ*\n\n`;
+      resultMessage += `কারণ: ${result.message || "অজানা সমস্যা"}\n\n`;
+      resultMessage += `দয়া পরে চেষ্টা করুন অথবা সাপোর্টে যোগাযোগ করুন।\n\n`;
+      resultMessage += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
+
+      await sendTextMessage(formattedPhone, resultMessage);
+    }
+
+    // Notify admin
+    await notifyAdmin(
+      `📄 Application PDF Download সম্পন্ন\n\nব্যবহারকারী: ${formattedPhone}\nসার্ভিস: ${service.name}\nমূল্য: ৳${service.price}\nApplication ID: ${appId}\nDOB: ${dob}\nType: ${appType}\nস্ট্যাটাস: ${result.status === "success" ? "✅ SUCCESS" : "❌ FAILED"}\nব্যালেন্স: ${oldBalance} → ${user.balance}`,
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+
+    EnhancedLogger.logFlowCompletion(
+      formattedPhone,
+      "application_pdf_download",
+      {
+        appId,
+        dob,
+        appType,
+        price: service.price,
+        result: result.status,
+        transactionId: transaction._id,
+        oldBalance,
+        newBalance: user.balance,
+      },
+    );
+  } catch (err: any) {
+    EnhancedLogger.error(`Failed to process Application PDF download:`, {
+      error: err?.message || err,
+      stack: err?.stack,
+      phone: formattedPhone,
+    });
+
+    await sendTextMessage(
+      formattedPhone,
+      "❌ Application PDF ডাউনলোড করতে সমস্যা হয়েছে। দয়া পরে চেষ্টা করুন।\n\n🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন",
+    );
+
+    await stateManager.clearUserState(formattedPhone);
+    await showMainMenu(formattedPhone, false);
+  }
+}
 async function confirmServiceOrder(phone: string): Promise<void> {
   const formattedPhone = formatPhoneNumber(phone);
   EnhancedLogger.info(`Confirming service order for ${formattedPhone}`);
@@ -8391,7 +8869,11 @@ async function handleUserMessage(
         }
         return;
       }
-
+      if (currentState === "awaiting_application_input") {
+        EnhancedLogger.info(`[${requestId}] Processing application PDF input`);
+        await handleApplicationPdfDownload(formattedPhone, userText);
+        return;
+      }
       if (currentState === "awaiting_ubrn_number") {
         EnhancedLogger.info(`[${requestId}] Processing UBRN input`);
         await handleUbrnInput(formattedPhone, userText);
