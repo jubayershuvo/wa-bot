@@ -600,39 +600,20 @@ async function handleDakhilaApprovalCheck(
 
     // Call Dakhila API
     const result = await checkDakhilaApproval(dakhilaUrl);
-    console.log(result);
+
     // Deduct balance
-    const oldBalance = user.balance;
-    user.balance -= service.price;
-    await user.save();
-
-    // Create transaction record
-    const transaction = await Transaction.create({
-      trxId: `DAKHILA-${Date.now()}`,
-      amount: service.price,
-      method: "balance",
-      status: "SUCCESS",
-      number: formattedPhone,
-      user: user._id,
-      metadata: {
-        serviceId: "instant_dakhila_approval",
-        serviceName: service.name,
-        dakhilaUrl: dakhilaUrl,
-        resultStatus: result.status,
-        resultMessage: result.message,
-        processedAt: new Date().toISOString(),
-      },
-      createdAt: new Date(),
-    });
-
+    
     let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
-    resultMessage += `🔗 Dakhila URL: ${dakhilaUrl.substring(0, 60)}${dakhilaUrl.length > 60 ? "..." : ""}\n`;
-    resultMessage += `💰 মূল্য: ৳${service.price}\n`;
-    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
-    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
-    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
-
+    
+    const oldBalance = user.balance;
     if (result.status === "success") {
+      user.balance -= service.price;
+      resultMessage += `🔗 Dakhila URL: ${dakhilaUrl.substring(0, 60)}${dakhilaUrl.length > 60 ? "..." : ""}\n`;
+      resultMessage += `💰 মূল্য: ৳${service.price}\n`;
+      resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
+      resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
+      resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
+      await user.save();
       resultMessage += `🎉 *Dakhila Approval Status:* ✅ **APPROVED**\n\n`;
       resultMessage += `Dakhila URL টি যাচাই করা হয়েছে এবং এটি বৈধ অনুমোদন আছে।\n`;
     } else if (result.status === "error") {
@@ -663,8 +644,6 @@ async function handleDakhilaApprovalCheck(
       url: dakhilaUrl,
       price: service.price,
       result: result.status,
-      transactionId: transaction._id,
-      oldBalance,
       newBalance: user.balance,
     });
   } catch (err: any) {
@@ -746,39 +725,18 @@ async function handleHoldingPaymentLink(
     const result = await generatePaymentLink(dakhilaUrl);
 
     // Deduct balance
-    const oldBalance = user.balance;
-    user.balance -= service.price;
-    await user.save();
-
-    // Create transaction record
-    const transaction = await Transaction.create({
-      trxId: `PAYMENT-LINK-${Date.now()}`,
-      amount: service.price,
-      method: "balance",
-      status: "SUCCESS",
-      number: formattedPhone,
-      user: user._id,
-      metadata: {
-        serviceId: "instant_holding_payment_link",
-        serviceName: service.name,
-        dakhilaUrl: dakhilaUrl,
-        resultStatus: result.status,
-        resultMessage: result.message,
-        paymentUrl: result.paymentUrl,
-        totalDemand: result.totalDemand,
-        processedAt: new Date().toISOString(),
-      },
-      createdAt: new Date(),
-    });
 
     let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
-    resultMessage += `🔗 Dakhila URL: ${dakhilaUrl.substring(0, 60)}${dakhilaUrl.length > 60 ? "..." : ""}\n`;
-    resultMessage += `💰 সার্ভিস মূল্য: ৳${service.price}\n`;
-    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
-    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
-    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
 
+    const oldBalance = user.balance;
     if (result.status === "success" && result.paymentUrl) {
+      user.balance -= service.price;
+      await user.save();
+      resultMessage += `🔗 Dakhila URL: ${dakhilaUrl.substring(0, 60)}${dakhilaUrl.length > 60 ? "..." : ""}\n`;
+      resultMessage += `💰 সার্ভিস মূল্য: ৳${service.price}\n`;
+      resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
+      resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
+      resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
       resultMessage += `🔗 *পেমেন্ট লিংক:* ${result.paymentUrl}\n\n`;
 
       if (result.totalDemand) {
@@ -826,7 +784,6 @@ async function handleHoldingPaymentLink(
       result: result.status,
       paymentUrl: result.paymentUrl,
       totalDemand: result.totalDemand,
-      transactionId: transaction._id,
       oldBalance,
       newBalance: user.balance,
     });
@@ -2272,41 +2229,25 @@ async function handleMissingHoldingSearch(
 
     // Deduct balance
     const oldBalance = user.balance;
-    user.balance -= service.price;
-    await user.save();
+   
 
-    // Create transaction record
-    const transaction = await Transaction.create({
-      trxId: `MISSING-HOLDING-${Date.now()}`,
-      amount: service.price,
-      method: "balance",
-      status: "SUCCESS",
-      number: formattedPhone,
-      user: user._id,
-      metadata: {
-        serviceId: "instant_missing_holding",
-        serviceName: service.name,
-        dakhilaUrl: dakhilaUrl,
-        resultStatus: result.status,
-        resultMessage: result.message,
-        pdfUrls: result.pdfUrls,
-        processedAt: new Date().toISOString(),
-      },
-      createdAt: new Date(),
-    });
+   
 
     let resultMessage = `✅ *${service.name} সম্পন্ন*\n\n`;
-    resultMessage += `🔗 Dakhila URL: ${dakhilaUrl.substring(0, 60)}${dakhilaUrl.length > 60 ? "..." : ""}\n`;
-    resultMessage += `💰 সার্ভিস মূল্য: ৳${service.price}\n`;
-    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
-    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
-    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
+    
 
     if (
       result.status === "success" &&
       result.pdfUrls &&
       result.pdfUrls.length > 0
     ) {
+       user.balance -= service.price;
+    await user.save();
+    resultMessage += `🔗 Dakhila URL: ${dakhilaUrl.substring(0, 60)}${dakhilaUrl.length > 60 ? "..." : ""}\n`;
+    resultMessage += `💰 সার্ভিস মূল্য: ৳${service.price}\n`;
+    resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
+    resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
+    resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
       resultMessage += `✅ *হোল্ডিং পাওয়া গেছে!*\n\n`;
       resultMessage += `📄 *ডাউনলোড লিঙ্কসমূহ:*\n\n`;
 
@@ -2366,7 +2307,6 @@ async function handleMissingHoldingSearch(
       price: service.price,
       result: result.status,
       pdfUrls: result.pdfUrls,
-      transactionId: transaction._id,
       oldBalance,
       newBalance: user.balance,
     });
@@ -2943,23 +2883,8 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
         newBalance: user.balance,
       });
 
-      // Create transaction record
-      const transaction = await Spent.create({
-        user: user._id,
-        amount: CONFIG.ubrnServicePrice,
-        service: "UBRN Search",
-        reference: trimmedUbrn,
-        status: "completed",
-        metadata: {
-          apiStatus,
-          executionTime: apiResponse.execution_time || "N/A",
-          resultFields: resultData ? Object.keys(resultData) : [],
-          timestamp: new Date().toISOString(),
-        },
-      });
 
       EnhancedLogger.info(`Transaction created`, {
-        transactionId: transaction._id,
         userId: user._id,
         amount: CONFIG.ubrnServicePrice,
       });
@@ -3037,14 +2962,12 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
           `💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n` +
           `💳 পুরাতন ব্যালেন্স: ৳${oldBalance}\n` +
           `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n` +
-          `📊 লেনদেন ID: ${transaction._id}\n` +
           `⏱️ সময়: ${new Date().toLocaleString("bn-BD")}`,
       );
 
       EnhancedLogger.logFlowCompletion(formattedPhone, "ubrn_verification", {
         ubrn: trimmedUbrn,
         price: CONFIG.ubrnServicePrice,
-        transactionId: transaction._id,
         oldBalance,
         newBalance: user.balance,
         apiStatus,
@@ -4282,30 +4205,16 @@ async function processApplicationPdfDownload(phone: string): Promise<void> {
     );
 
     const oldBalance = user.balance;
-    user.balance -= service.price;
-    await user.save();
+   
 
-    const transaction = await Transaction.create({
-      trxId: `APP-PDF-${Date.now()}`,
-      amount: service.price,
-      method: "balance",
-      status: result.status === "success" ? "SUCCESS" : "FAILED",
-      number: formattedPhone,
-      user: user._id,
-      metadata: {
-        serviceId: "instant_application_pdf_download",
-        serviceName: service.name,
-        appId: applicationData.appId,
-        dob: applicationData.dob,
-        appType: applicationData.appType,
-        resultStatus: result.status,
-        resultMessage: result.message,
-        processedAt: new Date().toISOString(),
-      },
-      createdAt: new Date(),
-    });
+
 
     let resultMessage = `📄 *${service.name} সম্পন্ন*\n\n`;
+    
+
+    if (result.status === "success" && result.fileData) {
+       user.balance -= service.price;
+    await user.save();
     resultMessage += `🆔 Application ID: ${applicationData.appId}\n`;
     resultMessage += `📅 DOB: ${applicationData.dob}\n`;
     resultMessage += `📋 Type: ${applicationData.appType}\n`;
@@ -4313,8 +4222,6 @@ async function processApplicationPdfDownload(phone: string): Promise<void> {
     resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
     resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
     resultMessage += `📅 সময়: ${new Date().toLocaleString()}\n\n`;
-
-    if (result.status === "success" && result.fileData) {
       resultMessage += `✅ *PDF ডাউনলোড সফল!*\n\n`;
       resultMessage += `📊 সাইজ: ${formatFileSize(result.fileData.length)}\n\n`;
       resultMessage += `⏳ ফাইল পাঠানো হচ্ছে...`;
@@ -4377,7 +4284,6 @@ async function processApplicationPdfDownload(phone: string): Promise<void> {
         appType: applicationData.appType,
         price: service.price,
         result: result.status,
-        transactionId: transaction._id,
         oldBalance,
         newBalance: user.balance,
       },
@@ -8291,7 +8197,6 @@ async function triggerAutoFileDelivery(
       const month = (today.getMonth() + 1).toString().padStart(2, "0");
       const day = today.getDate().toString().padStart(2, "0");
 
-      // Create directory: uploads/auto_delivery/YYYY/MM/DD/
       const deliveryDir = path.join(autoDeliveryBaseDir, year, month, day);
 
       try {
@@ -9546,7 +9451,6 @@ async function handleUserMessage(
           }
         }
 
-    
         await showMainMenu(formattedPhone, isAdmin);
       } else {
         // If in a flow but received unrecognized command
@@ -10110,7 +10014,7 @@ async function handleUserMessage(
           });
           await sendTextWithCancelButton(
             phone,
-            "✏️ *DOB এডিট করুন*\n\nনতুন জন্ম তারিখ দিন (MM/DD/YYYY):\n\n📌 উদাহরণ: 03/02/1989",
+            "✏️ *DOB এডিট করুন*\n\nনতুন জন্ম তারিখ দিন (DD/MM/YYYY):\n\n📌 উদাহরণ: 03/02/1989",
           );
         } else if (selectedId === "edit_type") {
           const state = await stateManager.getUserState(formattedPhone);
