@@ -141,10 +141,9 @@ const CONFIG = {
   dakhilaApiUrl:
     process.env.DAKHILA_API_URL ||
     "https://api.fortest.top/dakhila/secure_fetch_ldtax.php",
-  ubrnServicePrice: 10,
   fileUploadUrl: process.env.FILE_UPLOYAD_URL || "/api/upload",
   maxFileSize: 10 * 1024 * 1024,
-  maxBroadcastUsers: 100, // Limit broadcast to prevent rate limiting
+  maxBroadcastUsers: 1000, // Limit broadcast to prevent rate limiting
   sessionTimeout: 30 * 60 * 1000, // 30 minutes session timeout
   retryAttempts: 3,
   retryDelay: 1000,
@@ -166,7 +165,7 @@ const INSTANT_SERVICES = [
     id: "instant_dakhila_approval",
     name: "✅ দাখিলা অনুমোদন যাচাই",
     description: "Dakhila URL দিয়ে যাচাই করুন",
-    price: 10,
+    price: 0,
     isActive: true,
     requiresInput: true,
     inputPrompt: "Dakhila URL টি পাঠান:",
@@ -2604,10 +2603,20 @@ async function handleUbrnVerificationStart(phone: string): Promise<void> {
       return;
     }
 
-    if (user.balance < CONFIG.ubrnServicePrice) {
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_ubrn_verification",
+    );
+
+    if (!service) {
+      await sendTextMessage(formattedPhone, "❌ UBRN সার্ভিস পাওয়া যায়নি!");
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
+
+    if (user.balance < service.price) {
       await sendTextMessage(
         formattedPhone,
-        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💵 ব্যালেন্স রিচার্জ করতে 'রিচার্জ' লিখুন।`,
       );
       await showMainMenu(formattedPhone, false);
       return;
@@ -2625,7 +2634,7 @@ async function handleUbrnVerificationStart(phone: string): Promise<void> {
       },
     });
 
-    const message = `🔍 *UBRN ভেরিফিকেশন*\n\n💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n\nদয়া করে UBRN নম্বরটি পাঠান:\n\nউদাহরণ: 19862692537094068\n\n📌 নোট:\n• UBRN নম্বরটি সঠিকভাবে লিখুন\n• যাচাই করতে ১-২ মিনিট সময় লাগতে পারে\n• সমস্যা হলে সাপোর্টে যোগাযোগ করুন\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
+    const message = `🔍 *UBRN ভেরিফিকেশন*\n\n💰 মূল্য: ৳${service.price}\n\nদয়া করে UBRN নম্বরটি পাঠান:\n\nউদাহরণ: 19862692537094068\n\n📌 নোট:\n• UBRN নম্বরটি সঠিকভাবে লিখুন\n• যাচাই করতে ১-২ মিনিট সময় লাগতে পারে\n• সমস্যা হলে সাপোর্টে যোগাযোগ করুন\n\n🚫 বাতিল করতে নিচের বাটন ক্লিক করুন`;
 
     await sendTextWithCancelButton(formattedPhone, message);
     EnhancedLogger.info(`UBRN verification started for ${formattedPhone}`);
@@ -2679,17 +2688,27 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     }
 
     EnhancedLogger.debug(`User found: ${user._id}, Balance: ${user.balance}`);
+    const service = INSTANT_SERVICES.find(
+      (s) => s.id === "instant_ubrn_verification",
+    );
+    if (!service) {
+      EnhancedLogger.error(`UBRN service configuration missing`);
+      await sendTextMessage(formattedPhone, "❌ UBRN সার্ভিস পাওয়া যায়নি!");
+      await stateManager.clearUserState(formattedPhone);
+      await showMainMenu(formattedPhone, false);
+      return;
+    }
 
     // Check balance
-    if (user.balance < CONFIG.ubrnServicePrice) {
+    if (user.balance < service.price) {
       EnhancedLogger.warn(`Insufficient balance for ${formattedPhone}`, {
         balance: user.balance,
-        required: CONFIG.ubrnServicePrice,
+        required: service.price,
       });
 
       await sendTextMessage(
         formattedPhone,
-        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${CONFIG.ubrnServicePrice}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💰 ব্যালেন্স রিচার্জ করতে অ্যাডমিনের সাথে যোগাযোগ করুন।`,
+        `❌ *অপর্যাপ্ত ব্যালেন্স*\n\nসার্ভিস মূল্য: ৳${service.price}\nআপনার ব্যালেন্স: ৳${user.balance}\n\n💰 ব্যালেন্স রিচার্জ করতে অ্যাডমিনের সাথে যোগাযোগ করুন।`,
       );
       await stateManager.clearUserState(formattedPhone);
       await showMainMenu(formattedPhone, false);
@@ -2873,26 +2892,26 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
     if (apiStatus === "success" && resultData) {
       // Deduct balance
       const oldBalance = user.balance;
-      user.balance -= CONFIG.ubrnServicePrice;
+      user.balance -= service.price;
       await user.save();
 
       EnhancedLogger.info(`Balance deducted`, {
         userId: user._id,
         oldBalance,
-        deduction: CONFIG.ubrnServicePrice,
+        deduction: service.price,
         newBalance: user.balance,
       });
 
 
       EnhancedLogger.info(`Transaction created`, {
         userId: user._id,
-        amount: CONFIG.ubrnServicePrice,
+        amount: service.price,
       });
 
       // Format and send result message
       let resultMessage = `✅ *UBRN ভেরিফিকেশন সম্পন্ন*\n\n`;
       resultMessage += `🔢 UBRN: ${trimmedUbrn}\n`;
-      resultMessage += `💰 খরচ: ৳${CONFIG.ubrnServicePrice}\n`;
+      resultMessage += `💰 খরচ: ৳${service.price}\n`;
       resultMessage += `💰 পূর্বের ব্যালেন্স: ৳${oldBalance}\n`;
       resultMessage += `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n`;
       resultMessage += `📅 তারিখ: ${new Date().toLocaleDateString("bn-BD")}\n`;
@@ -2959,7 +2978,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
         `🔍 UBRN ভেরিফিকেশন সম্পন্ন\n\n` +
           `📱 ব্যবহারকারী: ${formattedPhone}\n` +
           `🔢 UBRN: ${trimmedUbrn}\n` +
-          `💰 মূল্য: ৳${CONFIG.ubrnServicePrice}\n` +
+          `💰 মূল্য: ৳${service.price}\n` +
           `💳 পুরাতন ব্যালেন্স: ৳${oldBalance}\n` +
           `🆕 নতুন ব্যালেন্স: ৳${user.balance}\n` +
           `⏱️ সময়: ${new Date().toLocaleString("bn-BD")}`,
@@ -2967,7 +2986,7 @@ async function handleUbrnInput(phone: string, ubrn: string): Promise<void> {
 
       EnhancedLogger.logFlowCompletion(formattedPhone, "ubrn_verification", {
         ubrn: trimmedUbrn,
-        price: CONFIG.ubrnServicePrice,
+        price: service.price,
         oldBalance,
         newBalance: user.balance,
         apiStatus,
