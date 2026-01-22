@@ -8392,7 +8392,7 @@ async function triggerAutoFileDelivery(
             deliveryMethod: "whatsapp",
             deliveryType: "file",
             text: `ফাইল ডেলিভারি (ম্যাচ করা: ${order.matchedField})`,
-            fileUrl: relativePath, // Server filepath: auto_delivery/2024/01/19/filename.ext
+            fileUrl: filePath, 
             fileName: originalFileName,
             fileType: mimeType,
             deliveredBy: formattedPhone,
