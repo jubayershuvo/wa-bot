@@ -4421,7 +4421,8 @@ async function showOrderHistory(phone: string): Promise<void> {
     });
 
     message += `📊 মোট অর্ডার: ${orders.length}\n`;
-    message += `💰 মোট খরচ: ৳${orders.reduce((sum, order) => sum + order.totalPrice, 0)}\n\n`;
+    const completedOrders = orders.filter(order => order.status === 'completed');
+    message += `💰 মোট খরচ: ৳${completedOrders.reduce((sum, order) => sum + order.totalPrice, 0)}\n\n`;
     message += `🏠 মেনুতে ফিরে যেতে 'Menu' লিখুন`;
 
     await sendTextMessage(formattedPhone, message);
